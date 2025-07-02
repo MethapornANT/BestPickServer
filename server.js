@@ -3505,9 +3505,431 @@ app.put("/api/admin/update/poststatus", verifyToken, verifyAdmin, (req, res) => 
   });
 });
 
+// API สร้าง Match อัตโนมัติเมื่อมีการ Follow
+app.post('/api/users/:userId/follow/:followingId', (req, res) => {
+    const { userId, followingId } = req.params;
 
+    // เพิ่มข้อมูลการ follow ใน table follower_following
+    const followQuery = `
+        INSERT INTO follower_following (follower_id, following_id, follow_date)
+        VALUES (?, ?, NOW())
+        ON DUPLICATE KEY UPDATE follow_date = follow_date
+    `;
 
+    pool.query(followQuery, [userId, followingId], (err, result) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
 
+        // สร้าง match สำหรับ chat อัตโนมัติ
+        const createMatchQuery = `
+            INSERT INTO matches (user1ID, user2ID, matchDate)
+            VALUES (?, ?, NOW())
+            ON DUPLICATE KEY UPDATE matchDate = matchDate
+        `;
+
+        pool.query(createMatchQuery, [userId, followingId], (err, matchResult) => {
+            if (err) {
+                console.error('Error creating match:', err);
+                // ไม่ return error เพราะการ follow สำเร็จแล้ว
+            }
+            
+            res.status(200).json({ 
+                message: 'Followed successfully',
+                matchID: matchResult ? matchResult.insertId : null
+            });
+        });
+    });
+});
+
+// API สร้าง Match จากการ Follow (เรียกแยกได้ถ้าต้องการ)
+app.post('/api/create-match-on-follow', (req, res) => {
+    const { followerID, followingID } = req.body;
+
+    if (!followerID || !followingID) {
+        return res.status(400).json({ error: 'Missing followerID or followingID' });
+    }
+
+    // ตรวจสอบว่ามีการ follow กันหรือไม่
+    const checkFollowQuery = `
+        SELECT * FROM follower_following 
+        WHERE follower_id = ? AND following_id = ?
+    `;
+
+    pool.query(checkFollowQuery, [followerID, followingID], (err, followResults) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        if (followResults.length === 0) {
+            return res.status(403).json({ error: 'User must follow first before creating chat' });
+        }
+
+        // ตรวจสอบว่ามี match อยู่แล้วหรือไม่
+        const checkMatchQuery = `
+            SELECT matchID FROM matches 
+            WHERE (user1ID = ? AND user2ID = ?) 
+               OR (user1ID = ? AND user2ID = ?)
+        `;
+
+        pool.query(checkMatchQuery, [followerID, followingID, followingID, followerID], (err, results) => {
+            if (err) {
+                console.error('Database error:', err);
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            if (results.length > 0) {
+                return res.status(200).json({ 
+                    success: 'Match already exists', 
+                    matchID: results[0].matchID 
+                });
+            }
+
+            // สร้าง match ใหม่
+            const createMatchQuery = `
+                INSERT INTO matches (user1ID, user2ID, matchDate)
+                VALUES (?, ?, NOW())
+            `;
+
+            pool.query(createMatchQuery, [followerID, followingID], (err, result) => {
+                if (err) {
+                    console.error('Database error:', err);
+                    return res.status(500).json({ error: 'Database error' });
+                }
+
+                res.status(201).json({ 
+                    success: 'Match created successfully', 
+                    matchID: result.insertId 
+                });
+            });
+        });
+    });
+});
+
+// API Get Matches - แสดงรายการ chat ของ user
+app.get('/api/matches/:userID', (req, res) => {
+    const { userID } = req.params;
+
+    const getMatchedUsersWithLastMessageQuery = `
+        SELECT 
+            u.id AS userID,
+            u.username AS nickname,
+            u.picture AS imageFile,
+            (SELECT c.message FROM chats c WHERE c.matchID = m.matchID ORDER BY c.timestamp DESC LIMIT 1) AS lastMessage,
+            m.matchID,
+            DATE_FORMAT(GREATEST(
+                COALESCE((SELECT c.timestamp FROM chats c WHERE c.matchID = m.matchID ORDER BY c.timestamp DESC LIMIT 1), '1970-01-01 00:00:00'), 
+                m.matchDate), '%H:%i') AS lastInteraction,
+            GREATEST(
+                COALESCE((SELECT c.timestamp FROM chats c WHERE c.matchID = m.matchID ORDER BY c.timestamp DESC LIMIT 1), '1970-01-01 00:00:00'), 
+                m.matchDate) AS fullLastInteraction,
+            COALESCE(b.isBlocked, 0) AS isBlocked,
+            CASE 
+                WHEN ff.follower_id IS NOT NULL THEN 1
+                ELSE 0
+            END AS isFollowing
+        FROM matches m
+        JOIN users u ON (m.user1ID = u.id OR m.user2ID = u.id)
+        LEFT JOIN deleted_chats d ON d.matchID = m.matchID AND d.userID = ?
+        LEFT JOIN blocked_chats b ON b.matchID = m.matchID AND (b.userID = ? OR b.user2ID = ?)
+        LEFT JOIN follower_following ff ON ff.follower_id = ? AND ff.following_id = u.id
+        WHERE (m.user1ID = ? OR m.user2ID = ?)
+          AND u.id != ?
+          AND (d.deleted IS NULL OR d.deleted = 0 OR (SELECT COUNT(*) FROM chats c WHERE c.matchID = m.matchID AND c.timestamp > d.deleteTimestamp) > 0) 
+        ORDER BY fullLastInteraction DESC;
+    `;
+
+    pool.query(getMatchedUsersWithLastMessageQuery, [userID, userID, userID, userID, userID, userID, userID], (err, results) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        results.forEach(user => {
+            if (user.imageFile && !user.imageFile.startsWith('http')) {
+                user.imageFile = `${req.protocol}://${req.get('host')}${user.imageFile}`;
+            }
+
+            if (user.lastMessage === null) {
+                user.lastMessage = "Start chatting!";
+            }
+        });
+
+        return res.status(200).json(results);
+    });
+});
+
+app.get('/api/chats/:matchID', (req, res) => {
+    const { matchID } = req.params;
+
+    const getChatQuery = `
+        SELECT 
+            c.senderID, 
+            u.username AS nickname,
+            u.picture AS imageFile,
+            c.message, 
+            c.timestamp 
+        FROM chats c
+        JOIN users u ON c.senderID = u.id
+        WHERE c.matchID = ?
+        ORDER BY c.timestamp ASC;
+    `;
+
+    pool.query(getChatQuery, [matchID], (err, results) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        results.forEach(chat => {
+            if (chat.imageFile) {
+                chat.imageFile = `${req.protocol}://${req.get('host')}${chat.imageFile}`;
+            }
+        });
+
+        // Backend ส่ง JSON ในรูปแบบนี้:
+        return res.status(200).json({ messages: results }); // <--- ตรงนี้
+    });
+});
+
+// API Send Chat Message
+app.post('/api/chats/:matchID', (req, res) => {
+    const { matchID } = req.params;
+    const { senderID, message } = req.body;
+
+    if (!senderID || !message) {
+        return res.status(400).json({ error: 'Missing senderID or message' });
+    }
+
+    // ตรวจสอบว่าผู้ส่งมีสิทธิ์ส่งข้อความใน match นี้หรือไม่
+    const checkUserInMatchQuery = `
+        SELECT * FROM matches 
+        WHERE matchID = ? AND (user1ID = ? OR user2ID = ?)
+    `;
+
+    pool.query(checkUserInMatchQuery, [matchID, senderID, senderID], (err, matchResults) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        if (matchResults.length === 0) {
+            return res.status(403).json({ error: 'User not authorized to send message in this chat' });
+        }
+
+        // ตรวจสอบสถานะการบล็อก
+        const checkBlockQuery = `
+            SELECT * FROM blocked_chats 
+            WHERE matchID = ? AND isBlocked = 1
+        `;
+
+        pool.query(checkBlockQuery, [matchID], (err, blockResults) => {
+            if (err) {
+                console.error('Database error:', err);
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            if (blockResults.length > 0) {
+                return res.status(403).json({ error: 'Cannot send message. This chat has been blocked.' });
+            }
+
+            // บันทึกข้อความ
+            const insertChatQuery = `
+                INSERT INTO chats (matchID, senderID, message, timestamp)
+                VALUES (?, ?, ?, NOW())
+            `;
+
+            pool.query(insertChatQuery, [matchID, senderID, message], (err, result) => {
+                if (err) {
+                    console.error('Database error:', err);
+                    return res.status(500).json({ error: 'Database error' });
+                }
+                
+                res.status(200).json({ 
+                    success: 'Message sent successfully',
+                    messageID: result.insertId
+                });
+            });
+        });
+    });
+});
+
+// API Delete Chat (ซ่อน chat ฝั่งเดียว)
+app.post('/api/delete-chat', (req, res) => {
+    const { userID, matchID } = req.body;
+
+    if (!userID || !matchID) {
+        return res.status(400).json({ error: 'Missing userID or matchID' });
+    }
+
+    const deleteQuery = `
+        INSERT INTO deleted_chats (userID, matchID, deleted, deleteTimestamp)
+        VALUES (?, ?, 1, NOW())
+        ON DUPLICATE KEY UPDATE deleted = 1, deleteTimestamp = NOW();
+    `;
+
+    pool.query(deleteQuery, [userID, matchID], (err, result) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        res.status(200).json({ success: 'Chat deleted successfully' });
+    });
+});
+
+// API Restore All Chats
+app.post('/api/restore-all-chats', (req, res) => {
+    const { userID } = req.body;
+
+    if (!userID) {
+        return res.status(400).json({ error: 'Missing userID' });
+    }
+
+    const restoreAllQuery = `
+        DELETE FROM deleted_chats
+        WHERE userID = ?;
+    `;
+
+    pool.query(restoreAllQuery, [userID], (err, result) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        res.status(200).json({ 
+            success: 'All chats restored successfully',
+            affectedChats: result.affectedRows
+        });
+    });
+});
+
+// API Block Chat
+app.post('/api/block-chat', (req, res) => {
+    const { userID, matchID, isBlocked } = req.body;
+
+    if (!userID || !matchID || isBlocked === undefined) {
+        return res.status(400).json({ error: 'Missing userID, matchID, or isBlocked' });
+    }
+
+    // ตรวจสอบว่า user มีสิทธิ์ block chat นี้หรือไม่
+    const matchQuery = `SELECT user1ID, user2ID FROM matches WHERE matchID = ?`;
+    
+    pool.query(matchQuery, [matchID], (err, results) => {
+        if (err || results.length === 0) {
+            console.error('Database error or match not found');
+            return res.status(500).json({ error: 'Match not found or database error' });
+        }
+
+        const { user1ID, user2ID } = results[0];
+        
+        // ตรวจสอบว่า userID เป็นหนึ่งในผู้ใช้ใน match นี้
+        if (userID != user1ID && userID != user2ID) {
+            return res.status(403).json({ error: 'User not authorized to block this chat' });
+        }
+
+        // กำหนดว่าใครเป็น blocker และใครถูก block
+        const blockerID = userID;
+        const blockedID = (userID == user1ID) ? user2ID : user1ID;
+
+        // ตรวจสอบว่ามี block record อยู่แล้วหรือไม่
+        const checkQuery = `SELECT blockID FROM blocked_chats WHERE matchID = ? AND user1ID = ?`;
+        
+        pool.query(checkQuery, [matchID, blockerID], (err, checkResult) => {
+            if (err) {
+                console.error('Database error:', err);
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            if (checkResult.length > 0) {
+                // อัปเดต block ที่มีอยู่
+                const updateQuery = `
+                    UPDATE blocked_chats 
+                    SET isBlocked = ?, blockTimestamp = NOW() 
+                    WHERE matchID = ? AND user1ID = ?`;
+                    
+                pool.query(updateQuery, [isBlocked ? 1 : 0, matchID, blockerID], (err, result) => {
+                    if (err) {
+                        console.error('Database error:', err);
+                        return res.status(500).json({ error: 'Database error' });
+                    }
+                    res.status(200).json({ 
+                        success: isBlocked ? 'Chat blocked successfully' : 'Chat unblocked successfully' 
+                    });
+                });
+            } else {
+                // สร้าง block record ใหม่
+                const insertQuery = `
+                    INSERT INTO blocked_chats (user1ID, user2ID, matchID, isBlocked, blockTimestamp)
+                    VALUES (?, ?, ?, ?, NOW())`;
+                    
+                pool.query(insertQuery, [blockerID, blockedID, matchID, isBlocked ? 1 : 0], (err, result) => {
+                    if (err) {
+                        console.error('Database error:', err);
+                        return res.status(500).json({ error: 'Database error' });
+                    }
+                    res.status(200).json({ success: 'Chat blocked successfully' });
+                });
+            }
+        });
+    });
+});
+
+// API Unblock Chat
+app.post('/api/unblock-chat', (req, res) => {
+    const { userID, matchID } = req.body;
+
+    if (!userID || !matchID) {
+        return res.status(400).json({ error: 'Missing userID or matchID' });
+    }
+
+    // ปลดบล็อกโดยตั้งค่า isBlocked = 0
+    const unblockQuery = `
+        UPDATE blocked_chats 
+        SET isBlocked = 0, blockTimestamp = NOW()
+        WHERE matchID = ? AND user1ID = ?;
+    `;
+
+    pool.query(unblockQuery, [matchID, userID], (err, result) => {
+        if (err) {
+            console.error("Database error:", err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'No block record found to unblock' });
+        }
+
+        res.status(200).json({ success: 'Chat unblocked successfully' });
+    });
+});
+
+app.post('/api/check-block-status', (req, res) => {
+    const { matchID, userID } = req.body;
+    
+    const query = `
+        SELECT 
+            CASE WHEN EXISTS (
+                SELECT 1 FROM blocked_chats 
+                WHERE matchID = ? AND user1ID = ? AND isBlocked = 1
+            ) THEN 1 ELSE 0 END as blockedByMe,
+            CASE WHEN EXISTS (
+                SELECT 1 FROM blocked_chats 
+                WHERE matchID = ? AND user2ID = ? AND isBlocked = 1
+            ) THEN 1 ELSE 0 END as blockedByOther
+    `;
+    
+    pool.query(query, [matchID, userID, matchID, userID], (err, results) => {
+        if (err) {
+            return res.status(500).json({ error: 'Database error' });
+        }
+        
+        res.json({
+            blockedByMe: results[0].blockedByMe === 1,
+            blockedByOther: results[0].blockedByOther === 1
+        });
+    });
+});
 
 // Start the server
 const PORT = process.env.PORT || 3000;
