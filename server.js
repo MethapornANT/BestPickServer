@@ -3633,7 +3633,7 @@ app.get('/api/matches/:userID', (req, res) => {
         FROM matches m
         JOIN users u ON (m.user1ID = u.id OR m.user2ID = u.id)
         LEFT JOIN deleted_chats d ON d.matchID = m.matchID AND d.userID = ?
-        LEFT JOIN blocked_chats b ON b.matchID = m.matchID AND (b.userID = ? OR b.user2ID = ?)
+        LEFT JOIN blocked_chats b ON b.matchID = m.matchID AND (b.user1ID = ? OR b.user2ID = ?)
         LEFT JOIN follower_following ff ON ff.follower_id = ? AND ff.following_id = u.id
         WHERE (m.user1ID = ? OR m.user2ID = ?)
           AND u.id != ?
