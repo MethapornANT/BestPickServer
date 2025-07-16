@@ -17,6 +17,8 @@ const path = require("path");
 const JWT_SECRET = process.env.JWT_SECRET;
 const app = express();
 const { PythonShell } = require('python-shell');
+const promptpay = require('promptpay-qr');
+const QRCode = require('qrcode');
 
 
 // Middleware
@@ -3930,6 +3932,164 @@ app.post('/api/check-block-status', (req, res) => {
         });
     });
 });
+
+
+
+// GET /api/ad-packages
+app.get('/api/ad-packages', (req, res) => {
+  console.log('[INFO] Received GET /api/ad-packages request');
+  const sql = 'SELECT * FROM ad_packages ORDER BY duration_days ASC';
+  pool.query(sql, (err, results) => {
+      if (err) {
+          console.error('[ERROR] Database error fetching ad packages:', err);
+          return res.status(500).json({ error: 'Database error' });
+      }
+      console.log(`[INFO] Fetched ${results.length} ad packages.`);
+      res.json(results);
+  });
+});
+
+// POST /api/orders
+// body: { user_id, package_id, title, content, link, image }
+app.post('/api/orders', (req, res) => {
+  console.log('[INFO] Received POST /api/orders request');
+  const { user_id, package_id, title, content, link, image } = req.body;
+  if (!user_id || !package_id || !title || !content) {
+      console.warn('[WARN] Missing required fields for order creation.');
+      return res.status(400).json({ error: 'Missing required fields' });
+  }
+  // ดึงข้อมูล package
+  pool.query('SELECT * FROM ad_packages WHERE package_id = ?', [package_id], (err, pkg) => {
+      if (err) {
+          console.error('[ERROR] Database error fetching package:', err);
+          return res.status(500).json({ error: 'Database error' });
+      }
+      if (pkg.length === 0) {
+          console.warn(`[WARN] Invalid package_id: ${package_id}`);
+          return res.status(400).json({ error: 'Invalid package' });
+      }
+      const amount = pkg[0].price;
+      const duration = pkg[0].duration_days;
+      // สร้าง order
+      const sql = `
+          INSERT INTO orders (user_id, amount, order_status, created_at, updated_at)
+          VALUES (?, ?, 'pending', NOW(), NOW())
+      `;
+      pool.query(sql, [user_id, amount], (err, result) => {
+          if (err) {
+              console.error('[ERROR] Database error creating order:', err);
+              return res.status(500).json({ error: 'Database error' });
+          }
+          const order_id = result.insertId;
+          console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);
+          // สร้างโฆษณาแบบ pending (รอจ่ายเงิน)
+          const adSql = `
+              INSERT INTO ads (user_id, order_id, title, content, link, image, status, created_at, expiration_date)
+              VALUES (?, ?, ?, ?, ?, ?, 'pending', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))
+          `;
+          pool.query(adSql, [user_id, order_id, title, content, link || '', image || '', duration], (err2) => {
+              if (err2) {
+                  console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
+                  return res.status(500).json({ error: 'Database error (ads)' });
+              }
+              console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
+              res.status(201).json({ order_id, amount, duration });
+          });
+      });
+  });
+});
+
+// GET /api/orders/:orderId
+app.get('/api/orders/:orderId', (req, res) => {
+  const { orderId } = req.params;
+  console.log(`[INFO] Received GET /api/orders/${orderId} request`);
+  const sql = `
+      SELECT o.*, a.title, a.content, a.link, a.image, a.status AS ad_status
+      FROM orders o
+      LEFT JOIN ads a ON o.id = a.order_id
+      WHERE o.id = ?
+  `;
+  pool.query(sql, [orderId], (err, results) => {
+      if (err) {
+          console.error(`[ERROR] Database error fetching order ${orderId}:`, err);
+          return res.status(500).json({ error: 'Database error' });
+      }
+      if (results.length === 0) {
+          console.warn(`[WARN] Order ID ${orderId} not found.`);
+          return res.status(404).json({ error: 'Order not found' });
+      }
+      console.log(`[INFO] Order ID ${orderId} fetched successfully.`);
+      res.json(results[0]);
+  });
+});
+
+// POST /api/orders/:orderId/upload-slip
+// ใช้ multer รับไฟล์ image
+app.post('/api/orders/:orderId/upload-slip', upload.single('slip_image'), (req, res) => { // เปลี่ยน 'slip' เป็น 'slip_image'
+  const { orderId } = req.params;
+  console.log(`[INFO] Received POST /api/orders/${orderId}/upload-slip request.`);
+  if (!req.file) {
+      console.warn(`[WARN] No slip_image file uploaded for order ID ${orderId}.`);
+      return res.status(400).json({ error: 'No slip file uploaded' });
+  }
+  // สมมติบันทึก path ไว้ใน orders (เพิ่มฟิลด์ slip_image ใน orders ถ้ายังไม่มี)
+  const sql = 'UPDATE orders SET slip_image = ? WHERE id = ?';
+  pool.query(sql, [req.file.path, orderId], (err, result) => {
+      if (err) {
+          console.error(`[ERROR] Database error updating slip_image for order ${orderId}:`, err);
+          return res.status(500).json({ error: 'Database error' });
+      }
+      console.log(`[INFO] Slip image for order ID ${orderId} uploaded and path saved: ${req.file.path}`);
+      res.json({ message: 'Slip uploaded', slip_path: req.file.path });
+  });
+});
+
+// POST /api/orders/:orderId/verify-slip
+// **Endpoint นี้ซ้ำซ้อนกับ Slip.py ในการดำเนินการตรวจสอบสลิปและการอัปเดตสถานะ จึงถูกนำออกไป**
+
+// PUT /api/ads/:adId/approve
+app.put('/api/ads/:adId/approve', (req, res) => {
+  const { adId } = req.params;
+  console.log(`[INFO] Received PUT /api/ads/${adId}/approve request.`);
+  // เปลี่ยน status เป็น 'approved' ตามที่แนะนำ
+  pool.query('UPDATE ads SET status = "approved" WHERE id = ?', [adId], (err, result) => {
+      if (err) {
+          console.error(`[ERROR] Database error approving ad ${adId}:`, err);
+          return res.status(500).json({ error: 'Database error' });
+      }
+      console.log(`[INFO] Ad ID ${adId} approved successfully.`);
+      res.json({ message: 'Ad approved' });
+  });
+});
+
+// PUT /api/ads/:adId/reject
+app.put('/api/ads/:adId/reject', (req, res) => {
+  const { adId } = req.params;
+  console.log(`[INFO] Received PUT /api/ads/${adId}/reject request.`);
+  // เปลี่ยน status เป็น 'rejected' ตามที่แนะนำ
+  pool.query('UPDATE ads SET status = "rejected" WHERE id = ?', [adId], (err, result) => {
+      if (err) {
+          console.error(`[ERROR] Database error rejecting ad ${adId}:`, err);
+          return res.status(500).json({ error: 'Database error' });
+      }
+      console.log(`[INFO] Ad ID ${adId} rejected successfully.`);
+      res.json({ message: 'Ad rejected' });
+  });
+});
+
+// GET /api/ads
+app.get('/api/ads', (req, res) => {
+  console.log('[INFO] Received GET /api/ads request.');
+  pool.query('SELECT * FROM ads ORDER BY created_at DESC', (err, results) => {
+      if (err) {
+          console.error('[ERROR] Database error fetching ads:', err);
+          return res.status(500).json({ error: 'Database error' });
+      }
+      console.log(`[INFO] Fetched ${results.length} ads.`);
+      res.json(results);
+  });
+});
+
 
 // Start the server
 const PORT = process.env.PORT || 3000;
