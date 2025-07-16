@@ -100,7 +100,7 @@ driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
 
 # ==================== DATABASE SETUP ====================
 # Configure your database URI
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://bestpick_user:bestpick7890@localhost/reviewapp'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:1234@localhost/reviewapptest'
 
 # Initialize the SQLAlchemy object
 db = SQLAlchemy(app)
@@ -513,8 +513,8 @@ def create_post():
         try:
             # สร้าง SQL query สำหรับเพิ่มโพสต์ใหม่
             insert_query = text("""
-                INSERT INTO posts (user_id, Title, content, ProductName, CategoryID, photo_url, video_url, status, created_at, updated_at)
-                VALUES (:user_id, :title, :content, :product_name, :category_id, :photo_urls, :video_urls, 'active', NOW(), NOW())
+                INSERT INTO posts (user_id, Title, content, ProductName, CategoryID, photo_url, video_url, status, updated_at)
+                VALUES (:user_id, :title, :content, :product_name, :category_id, :photo_urls, :video_urls, 'active', NOW())
             """)
             
             # Execute query
@@ -804,4 +804,4 @@ def recommend():
         return jsonify({"error": "Internal Server Error"}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5005) 
+    app.run(host='0.0.0.0', port=5005)
