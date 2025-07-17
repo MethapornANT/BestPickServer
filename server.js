@@ -16,6 +16,7 @@ require("dotenv").config();
 const path = require("path");
 const JWT_SECRET = process.env.JWT_SECRET;
 const app = express();
+
 const { PythonShell } = require('python-shell');
 const promptpay = require('promptpay-qr');
 const QRCode = require('qrcode');
@@ -184,6 +185,36 @@ function sendOtpEmail(email, otp, callback) {
     callback(null, info); // Proceed if the email was successfully sent
   });
 }
+
+// --- Middleware for JWT verification ---
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (token == null) {
+      console.log('Access Denied: No token provided.');
+      return res.sendStatus(401); // No token
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+      if (err) {
+          console.log('Forbidden: Invalid token.', err.message);
+          return res.sendStatus(403); // Invalid token
+      }
+      req.user = user; // Attach user payload to request (contains id, role)
+      next();
+  });
+};
+
+// --- Middleware for Admin role check ---
+const authorizeAdmin = (req, res, next) => {
+  if (req.user && req.user.role === 'admin') {
+      next();
+  } else {
+      console.log('Forbidden: Admin access required. User role:', req.user ? req.user.role : 'N/A');
+      res.status(403).json({ message: "Forbidden: Admin access required" });
+  }
+};
 
 // Register a new email user or reactivate if deactivated
 app.post("/api/register/email", async (req, res) => {
@@ -2807,703 +2838,1027 @@ app.get('/api/bookmarks/:post_id', verifyToken, (req, res) => {
 
 
 // ########################################################## admin #################################################
-// Admin Login Route
+// Admin Login API
 app.post("/api/admin/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+      const { email, password } = req.body;
 
-    // Get the user's IP address (optional)
-    const ipAddress = req.headers["x-forwarded-for"] || req.connection.remoteAddress;
+      const ipAddress = req.headers["x-forwarded-for"] || req.socket.remoteAddress; // Use req.socket.remoteAddress for more direct IP
 
-    const sql = "SELECT * FROM users WHERE email = ? AND status = 'active' AND role = 'admin'";
-    pool.query(sql, [email], (err, results) => {
-      if (err) throw new Error("Database error during admin login");
-      if (results.length === 0) {
-        return res.status(404).json({ message: "No admin user found" });
-      }
+      const sql = "SELECT id, email, password, username, picture, role, status, failed_attempts FROM users WHERE email = ? AND status = 'active' AND role = 'admin'";
+      pool.query(sql, [email], (err, results) => {
+          if (err) {
+              console.error("Database error during admin login:", err);
+              return res.status(500).json({ error: "Database error during admin login" });
+          }
+          if (results.length === 0) {
+              return res.status(404).json({ message: "No admin user found with that email or user is inactive/not admin." });
+          }
 
-      const user = results[0];
+          const user = results[0];
 
-      // Compare the entered password with the stored hashed password
-      bcrypt.compare(password, user.password, (err, isMatch) => {
-        if (err) throw new Error("Password comparison error");
-        if (!isMatch) {
-          // Increment failed attempts and update last_failed_attempt
-          const updateFailSql =
-            "UPDATE users SET failed_attempts = failed_attempts + 1, last_failed_attempt = NOW() WHERE id = ?";
-          pool.query(updateFailSql, [user.id], (err) => {
-            if (err) console.error("Error logging failed login attempt:", err);
+          bcrypt.compare(password, user.password, (err, isMatch) => {
+              if (err) {
+                  console.error("Password comparison error:", err);
+                  return res.status(500).json({ error: "Password comparison error" });
+              }
+              if (!isMatch) {
+                  const updateFailSql =
+                      "UPDATE users SET failed_attempts = failed_attempts + 1, last_failed_attempt = NOW() WHERE id = ?";
+                  pool.query(updateFailSql, [user.id], (err) => {
+                      if (err) console.error("Error logging failed login attempt:", err);
+                  });
+
+                  const remainingAttempts = Math.max(0, 5 - (user.failed_attempts + 1)); // Ensure it doesn't go below 0
+                  let message = `Email or Password is incorrect.`;
+                  if (remainingAttempts > 0) {
+                      message += ` You have ${remainingAttempts} attempts left.`;
+                  } else {
+                      message += ` Your account might be locked.`;
+                  }
+                  return res.status(401).json({ message });
+              }
+
+              // Reset failed attempts after a successful login
+              const resetFailSql =
+                  "UPDATE users SET failed_attempts = 0, last_login = NOW(), last_login_ip = ? WHERE id = ?";
+              pool.query(resetFailSql, [ipAddress, user.id], (err) => {
+                  if (err) {
+                      console.error("Error resetting failed attempts or updating login time:", err);
+                      return res.status(500).json({ error: "Error updating login details." });
+                  }
+
+                  const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '1h' }); // Token expires in 1 hour
+
+                  res.status(200).json({
+                      message: "Admin authentication successful",
+                      token,
+                      user: {
+                          id: user.id,
+                          email,
+                          username: user.username,
+                          picture: user.picture,
+                          role: user.role,
+                          last_login: new Date(),
+                          last_login_ip: ipAddress,
+                      },
+                  });
+              });
           });
-
-          const remainingAttempts = 5 - (user.failed_attempts + 1); // +1 for current attempt
-          return res
-            .status(401)
-            .json({ message: `Email or Password is incorrect. You have ${remainingAttempts} attempts left.` });
-        }
-
-        // Reset failed attempts after a successful login
-        const resetFailSql =
-          "UPDATE users SET failed_attempts = 0, last_login = NOW(), last_login_ip = ? WHERE id = ?";
-        pool.query(resetFailSql, [ipAddress, user.id], (err) => {
-          if (err)
-            throw new Error("Error resetting failed attempts or updating login time.");
-
-          // Generate JWT token for admin
-          const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
-
-          // Return successful login response with token and admin data
-          res.status(200).json({
-            message: "Admin authentication successful",
-            token,
-            user: {
-              id: user.id,
-              email,
-              username: user.username,
-              picture: user.picture,
-              role: user.role,
-              last_login: new Date(),
-              last_login_ip: ipAddress,
-            },
-          });
-        });
       });
-    });
   } catch (error) {
-    console.error("Internal error:", error.message);
-    res.status(500).json({ error: "Internal server error" });
+      console.error("Internal error during admin login:", error.message);
+      res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // Admin Dashboard: New Users per Day and Total Posts per Day
-app.get("/api/admin/dashboard", verifyToken, (req, res) => {
-  // Check if the logged-in user is an admin
-  if (req.role !== "admin") {
-    return res.status(403).json({ error: "Unauthorized access" });
-  }
-
+app.get("/api/admin/dashboard", authenticateToken, authorizeAdmin, (req, res) => {
   // Query to get new users count per day and total users
   const newUsersQuery = `
-    SELECT 
-      DATE(created_at) AS date, 
-      COUNT(*) AS new_users 
-    FROM users 
-    WHERE role = 'user'
-    GROUP BY DATE(created_at)
-    ORDER BY DATE(created_at) DESC;
+      SELECT 
+          DATE(created_at) AS date, 
+          COUNT(*) AS new_users 
+      FROM users 
+      WHERE role = 'user'
+      GROUP BY DATE(created_at)
+      ORDER BY DATE(created_at) DESC;
   `;
 
   // Query to get total posts per day and total posts
   const totalPostsQuery = `
-    SELECT 
-      DATE(updated_at) AS date, 
-      COUNT(*) AS total_posts 
-    FROM posts
-    GROUP BY DATE(updated_at)
-    ORDER BY DATE(updated_at) DESC;
+      SELECT 
+          DATE(updated_at) AS date, 
+          COUNT(*) AS total_posts 
+      FROM posts
+      GROUP BY DATE(updated_at)
+      ORDER BY DATE(updated_at) DESC;
   `;
 
   // Execute both queries in parallel
   pool.query(newUsersQuery, (newUsersError, newUsersResults) => {
-    if (newUsersError) {
-      console.error("Database error fetching new users:", newUsersError);
-      return res.status(500).json({ error: "Error fetching new users data" });
-    }
-
-    pool.query(totalPostsQuery, (totalPostsError, totalPostsResults) => {
-      if (totalPostsError) {
-        console.error("Database error fetching total posts:", totalPostsError);
-        return res.status(500).json({ error: "Error fetching total posts data" });
+      if (newUsersError) {
+          console.error("Database error fetching new users:", newUsersError);
+          return res.status(500).json({ error: "Error fetching new users data" });
       }
 
-      // Send the response with both sets of data
-      res.json({
-        new_users_per_day: newUsersResults,
-        total_posts_per_day: totalPostsResults,
+      pool.query(totalPostsQuery, (totalPostsError, totalPostsResults) => {
+          if (totalPostsError) {
+              console.error("Database error fetching total posts:", totalPostsError);
+              return res.status(500).json({ error: "Error fetching total posts data" });
+          }
+
+          res.json({
+              new_users_per_day: newUsersResults,
+              total_posts_per_day: totalPostsResults,
+          });
       });
-    });
   });
 });
 
 // Fetch All Active Ads in Random Order
 app.get("/api/ads/random", (req, res) => {
   const fetchRandomAdsSql = `
-    SELECT * FROM ads 
-    WHERE status = 'active'
-    ORDER BY RAND();
+      SELECT * FROM ads 
+      WHERE status = 'active'
+      ORDER BY RAND();
   `;
 
   pool.query(fetchRandomAdsSql, (err, results) => {
-    if (err) {
-      console.error("Database error during fetching random ads:", err);
-      return res.status(500).json({ error: "Error fetching random ads" });
-    }
+      if (err) {
+          console.error("Database error during fetching random ads:", err);
+          return res.status(500).json({ error: "Error fetching random ads" });
+      }
 
-    res.json(results);
+      res.json(results);
   });
 });
 
 
+// --- NEW: Admin API for Ad Approval/Rejection ---
+app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, (req, res) => {
+  const adId = req.params.adId;
+  const { action, admin_notes, package_duration_days } = req.body; // package_duration_days สำหรับ 'approve'
 
-
-// Middleware to verify admin role
-const verifyAdmin = (req, res, next) => {
-  if (req.role !== "admin") {
-    return res.status(403).json({ error: "Unauthorized access" });
+  if (!action || (action !== 'approve' && action !== 'reject')) {
+      return res.status(400).json({ message: "Invalid action. Must be 'approve' or 'reject'." });
   }
-  next();
-};
+
+  pool.getConnection((err, connection) => {
+      if (err) {
+          console.error('Error getting DB connection:', err);
+          return res.status(500).json({ error: 'Database connection error.' });
+      }
+
+      connection.beginTransaction(err => {
+          if (err) {
+              connection.release();
+              console.error('Error starting transaction:', err);
+              return res.status(500).json({ error: 'Failed to start transaction.' });
+          }
+
+          const fetchAdSql = "SELECT id, order_id, status FROM ads WHERE id = ?";
+          connection.query(fetchAdSql, [adId], (err, adResults) => {
+              if (err) {
+                  return connection.rollback(() => {
+                      connection.release();
+                      console.error('Error fetching ad:', err);
+                      res.status(500).json({ error: 'Failed to fetch ad details.' });
+                  });
+              }
+              if (adResults.length === 0) {
+                  return connection.rollback(() => {
+                      connection.release();
+                      res.status(404).json({ message: 'Ad not found.' });
+                  });
+              }
+
+              const ad = adResults[0];
+
+              if (ad.status !== 'paid') {
+                  return connection.rollback(() => {
+                      connection.release();
+                      res.status(400).json({ message: `Ad status is '${ad.status}'. Only 'paid' ads can be processed.` });
+                  });
+              }
+
+              let updateAdSql = "";
+              let updateAdParams = [];
+              let adNewStatus = "";
+
+              if (action === 'approve') {
+                  if (!package_duration_days || typeof package_duration_days !== 'number' || package_duration_days <= 0) {
+                      return connection.rollback(() => {
+                          connection.release();
+                          res.status(400).json({ message: 'package_duration_days is required and must be a positive number for approval.' });
+                      });
+                  }
+                  adNewStatus = 'active'; // เปลี่ยนเป็น 'active' เมื่ออนุมัติ
+                  // expiration_date จะนับจากวันที่อนุมัติ (CURRENT_DATE()) + จำนวนวันของ package
+                  const expirationDateSql = `DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY)`;
+                  updateAdSql = `UPDATE ads SET status = ?, expiration_date = ${expirationDateSql}, updated_at = NOW(), admin_notes = ? WHERE id = ?`;
+                  updateAdParams = [adNewStatus, package_duration_days, admin_notes || null, adId];
+
+              } else if (action === 'reject') {
+                  if (!admin_notes) {
+                      return connection.rollback(() => {
+                          connection.release();
+                          res.status(400).json({ message: 'admin_notes are required for rejection.' });
+                      });
+                  }
+                  adNewStatus = 'rejected';
+                  updateAdSql = "UPDATE ads SET status = ?, expiration_date = NULL, updated_at = NOW(), admin_notes = ? WHERE id = ?";
+                  updateAdParams = [adNewStatus, admin_notes, adId];
+              }
+
+              connection.query(updateAdSql, updateAdParams, (err, adUpdateResult) => {
+                  if (err) {
+                      return connection.rollback(() => {
+                          connection.release();
+                          console.error('Error updating ad status:', err);
+                          res.status(500).json({ error: 'Failed to update ad status.' });
+                      });
+                  }
+
+                  // Also update the order status if the ad is approved/rejected.
+                  // For simplicity, let's assume 'approved' leads to 'completed' and 'rejected' leads to 'refund_pending' or similar.
+                  // You might need to adjust these statuses based on your exact business flow.
+                  let orderNewStatus;
+                  if (action === 'approve') {
+                      orderNewStatus = 'completed'; // หรือ 'ad_approved'
+                  } else if (action === 'reject') {
+                      orderNewStatus = 'ad_rejected'; // หรือ 'refund_pending'
+                  }
+
+                  const updateOrderStatusSql = "UPDATE orders SET order_status = ?, updated_at = NOW() WHERE id = ?";
+                  const updateOrderStatusParams = [orderNewStatus, ad.order_id];
+
+                  connection.query(updateOrderStatusSql, updateOrderStatusParams, (err, orderUpdateResult) => {
+                      if (err) {
+                          return connection.rollback(() => {
+                              connection.release();
+                              console.error('Error updating order status after ad action:', err);
+                              res.status(500).json({ error: 'Failed to update order status.' });
+                          });
+                      }
+                      
+                      connection.commit(commitErr => {
+                          if (commitErr) {
+                              connection.rollback(() => {
+                                  connection.release();
+                                  console.error('Error committing transaction:', commitErr);
+                                  res.status(500).json({ error: 'Transaction commit failed.' });
+                              });
+                          } else {
+                              connection.release();
+                              res.status(200).json({ message: `Ad ID ${adId} ${action} successfully.`, new_status: adNewStatus });
+                          }
+                      });
+                  });
+              });
+          });
+      });
+  });
+});
 
 // Serve images from the uploads directory
 app.use('/api/uploads', express.static('uploads'));
 
 // Create an Ad (Admin only)
-app.post("/api/ads", verifyToken, verifyAdmin, upload.single("image"), (req, res) => {
+app.post("/api/ads", authenticateToken, authorizeAdmin, upload.single("image"), (req, res) => {
   const { title, content, link, status, expiration_date } = req.body;
   const image = req.file ? `/uploads/${req.file.filename}` : null;
+  const userId = req.user.id; // ดึง user_id จาก token ที่ authenticateToken ใส่ไว้
 
-  // ตรวจสอบให้แน่ใจว่าข้อมูลที่จำเป็นทั้งหมดถูกส่งมา
-  if (!title || !content || !link || !image || !status || !expiration_date) {
-    return res.status(400).json({ error: "All fields (title, content, link, image, status, expiration_date) are required" });
+  if (!title || !content || !link || !image || !status || !expiration_date || !userId) {
+      if (req.file) {
+          require('fs').unlink(req.file.path, (err) => {
+              if (err) console.error("Error deleting incomplete ad image:", err);
+          });
+      }
+      return res.status(400).json({ error: "All required fields (title, content, link, image, status, expiration_date, user_id) are required" });
   }
 
-  const createAdSql = `INSERT INTO ads (title, content, link, image, status, expiration_date) VALUES (?, ?, ?, ?, ?, ?)`;
-  pool.query(createAdSql, [title, content, link, image, status, expiration_date], (err, results) => {
-    if (err) {
-      console.error("Database error during ad creation:", err);
-      return res.status(500).json({ error: "Error creating ad" });
-    }
+  const createAdSql = `INSERT INTO ads (title, content, link, image, status, expiration_date, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)`; // เพิ่ม user_id
+  pool.query(createAdSql, [title, content, link, image, status, expiration_date, userId], (err, results) => { // เพิ่ม userId
+      if (err) {
+          console.error("Database error during ad creation:", err);
+          if (req.file) {
+              require('fs').unlink(req.file.path, (unlinkErr) => {
+                  if (unlinkErr) console.error("Error deleting ad image after DB error:", unlinkErr);
+              });
+          }
+          return res.status(500).json({ error: "Error creating ad" });
+      }
 
-    res.status(201).json({ message: "Ad created successfully", ad_id: results.insertId });
+      res.status(201).json({ message: "Ad created successfully", ad_id: results.insertId });
   });
 });
 
 // สร้าง API สำหรับอัปเดตข้อมูล
-app.put('/api/ads/:id',verifyToken,verifyAdmin,upload.single('image'), (req, res) => {
+app.put('/api/ads/:id', authenticateToken, authorizeAdmin, upload.single('image'), (req, res) => {
   const { id } = req.params;
-  const { title, content, link, created_at, updated_at, status, expiration_date } = req.body;
+  const { title, content, link, status, expiration_date } = req.body; // created_at, updated_at ไม่ควรอนุญาตให้อัปเดตจากภายนอก
   const image = req.file ? `/uploads/${req.file.filename}` : null;
 
   const updateFields = [];
   const updateValues = [];
 
-  if (title) {
-    updateFields.push('title = ?');
-    updateValues.push(title);
+  if (title !== undefined) { updateFields.push('title = ?'); updateValues.push(title); }
+  if (content !== undefined) { updateFields.push('content = ?'); updateValues.push(content); }
+  if (link !== undefined) { updateFields.push('link = ?'); updateValues.push(link); }
+  if (image) { // ถ้ามีการอัปโหลดรูปใหม่
+      updateFields.push('image = ?');
+      updateValues.push(image);
+      // TODO: ควรลบรูปเก่าออกด้วยหากมีการอัปโหลดรูปใหม่ เพื่อไม่ให้มีไฟล์ขยะ
   }
-  if (content) {
-    updateFields.push('content = ?');
-    updateValues.push(content);
-  }
-  if (link) {
-    updateFields.push('link = ?');
-    updateValues.push(link);
-  }
-  if (image) {
-    updateFields.push('image = ?');
-    updateValues.push(image);
-  }
-  if (status) {
-    updateFields.push('status = ?'); // แก้ไขการเพิ่มสถานะ
-    updateValues.push(status); // แทรกค่า status
-  }
-  if (created_at) {
-    updateFields.push('created_at = ?');
-    updateValues.push(created_at);
-  }
-  if (updated_at) {
-    updateFields.push('updated_at = ?');
-    updateValues.push(updated_at);
-  }
-  if (expiration_date) {
-    updateFields.push('expiration_date = ?'); // เพิ่มการจัดการ expiration_date
-    updateValues.push(expiration_date); // แทรกค่า expiration_date
-  }
+  if (status !== undefined) { updateFields.push('status = ?'); updateValues.push(status); }
+  if (expiration_date !== undefined) { updateFields.push('expiration_date = ?'); updateValues.push(expiration_date); }
 
-  if (updateFields.length === 0) {
-    return res.status(400).json({ error: 'No fields to update' });
+  updateFields.push('updated_at = NOW()'); // อัปเดต updated_at เสมอ
+
+  if (updateFields.length === 1 && updateFields[0] === 'updated_at = NOW()') { // ถ้ามีแค่อัปเดต updated_at
+      return res.status(400).json({ error: 'No meaningful fields to update besides updated_at' });
   }
 
   const sql = `UPDATE ads SET ${updateFields.join(', ')} WHERE id = ?`;
   updateValues.push(id);
 
   pool.query(sql, updateValues, (err, results) => {
-    if (err) {
-      console.error('Database error during ad update:', err);
-      return res.status(500).json({ error: 'Error updating ad' });
-    }
+      if (err) {
+          console.error('Database error during ad update:', err);
+          // ถ้า update ไม่สำเร็จ และมีการอัปโหลดไฟล์ใหม่ ควรลบไฟล์นั้นทิ้ง
+          if (req.file) {
+              require('fs').unlink(req.file.path, (unlinkErr) => {
+                  if (unlinkErr) console.error("Error deleting new ad image after DB update error:", unlinkErr);
+              });
+          }
+          return res.status(500).json({ error: 'Error updating ad' });
+      }
 
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ error: 'Ad not found' });
-    }
+      if (results.affectedRows === 0) {
+          // ถ้าไม่พบ ad และมีการอัปโหลดไฟล์ใหม่ ควรลบไฟล์นั้นทิ้ง
+          if (req.file) {
+              require('fs').unlink(req.file.path, (unlinkErr) => {
+                  if (unlinkErr) console.error("Error deleting new ad image for not found ad:", unlinkErr);
+              });
+          }
+          return res.status(404).json({ error: 'Ad not found' });
+      }
 
-    res.json({ message: 'Ad updated successfully' });
+      res.json({ message: 'Ad updated successfully' });
   });
 });
-
-
-
-
 
 // Delete an Ad (Admin only)
-app.delete("/api/ads/:id", verifyToken, verifyAdmin, (req, res) => {
+app.delete("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
 
-  const deleteAdSql = `DELETE FROM ads WHERE id = ?`;
-  pool.query(deleteAdSql, [id], (err, results) => {
-    if (err) {
-      console.error("Database error during ad deletion:", err);
-      return res.status(500).json({ error: "Error deleting ad" });
-    }
+  // ก่อนลบ ad ควรดึง path รูปภาพมาลบออกจาก server ด้วย
+  const fetchImagePathSql = `SELECT image FROM ads WHERE id = ?`;
+  pool.query(fetchImagePathSql, [id], (fetchErr, fetchResults) => {
+      if (fetchErr) {
+          console.error("Database error during fetching ad image for deletion:", fetchErr);
+          return res.status(500).json({ error: "Error deleting ad (failed to fetch image path)" });
+      }
 
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ error: "Ad not found" });
-    }
+      const imagePathToDelete = fetchResults.length > 0 ? fetchResults[0].image : null;
 
-    res.json({ message: "Ad deleted successfully" });
+      const deleteAdSql = `DELETE FROM ads WHERE id = ?`;
+      pool.query(deleteAdSql, [id], (err, results) => {
+          if (err) {
+              console.error("Database error during ad deletion:", err);
+              return res.status(500).json({ error: "Error deleting ad" });
+          }
+
+          if (results.affectedRows === 0) {
+              return res.status(404).json({ error: "Ad not found" });
+          }
+
+          // ลบไฟล์ภาพออกจาก server หลังจากลบข้อมูลใน DB สำเร็จ
+          if (imagePathToDelete) {
+              const fullPath = path.join(__dirname, imagePathToDelete); // Assuming imagePathToDelete is /uploads/filename.ext
+              require('fs').unlink(fullPath, (unlinkErr) => {
+                  if (unlinkErr) console.error("Error deleting ad image file from disk:", unlinkErr);
+              });
+          }
+
+          res.json({ message: "Ad deleted successfully" });
+      });
   });
 });
 
-// Get All Ads
-app.get("/api/ads",verifyToken,verifyAdmin, (req, res) => {
+// Get All Ads (Admin only) - ควรใช้ authenticateToken, authorizeAdmin
+app.get("/api/ads", authenticateToken, authorizeAdmin, (req, res) => {
   const fetchAdsSql = `SELECT * FROM ads ORDER BY created_at DESC`;
 
   pool.query(fetchAdsSql, (err, results) => {
-    if (err) {
-      console.error("Database error during fetching ads:", err);
-      return res.status(500).json({ error: "Error fetching ads" });
-    }
+      if (err) {
+          console.error("Database error during fetching ads:", err);
+          return res.status(500).json({ error: "Error fetching ads" });
+      }
 
-    res.json(results);
+      res.json(results);
   });
 });
 
-// Get Ad by ID
-app.get("/api/ads/:id",verifyToken,verifyAdmin, (req, res) => {
+// Get Ad by ID (Admin only) - ควรใช้ authenticateToken, authorizeAdmin
+app.get("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
 
   const fetchAdSql = `SELECT * FROM ads WHERE id = ?`;
   pool.query(fetchAdSql, [id], (err, results) => {
-    if (err) {
-      console.error("Database error during fetching ad:", err);
-      return res.status(500).json({ error: "Error fetching ad" });
-    }
+      if (err) {
+          console.error("Database error during fetching ad:", err);
+          return res.status(500).json({ error: "Error fetching ad" });
+      }
 
-    if (results.length === 0) {
-      return res.status(404).json({ error: "Ad not found" });
-    }
+      if (results.length === 0) {
+          return res.status(404).json({ error: "Ad not found" });
+      }
 
-    res.json(results[0]);
+      res.json(results[0]);
   });
 });
 
-// Serve Ad Image by ID
-app.get("/api/ads/:id/image",verifyToken,verifyAdmin, (req, res) => {
+// Serve Ad Image by ID (Admin only) - ควรใช้ authenticateToken, authorizeAdmin
+app.get("/api/ads/:id/image", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
 
   const fetchAdImageSql = `SELECT image FROM ads WHERE id = ?`;
   pool.query(fetchAdImageSql, [id], (err, results) => {
-    if (err) {
-      console.error("Database error during fetching ad image:", err);
-      return res.status(500).json({ error: "Error fetching ad image" });
-    }
-
-    if (results.length === 0) {
-      return res.status(404).json({ error: "Ad not found" });
-    }
-
-    const imagePath = results[0].image;
-    if (imagePath) {
-      res.json({ imageUrl: `${req.protocol}://${req.get('host')}${imagePath}` });
-    } else {
-      res.status(404).json({ error: "Image not found" });
-    }
-  });
-});
-
-
-// ดึงข้อมูลผู้ใช้ทั้งหมด
-app.get("/api/admin/users",verifyToken,verifyAdmin, (req, res) => {
-  const fetchUsersSql = "SELECT * FROM users"; // คำสั่ง SQL สำหรับดึงข้อมูลผู้ใช้
-
-  pool.query(fetchUsersSql, (err, results) => {
-    if (err) {
-      console.error("Database error during fetching users:", err);
-      return res.status(500).json({ error: "Error fetching users" });
-    }
-
-    res.json(results); // ส่งผลลัพธ์ที่ดึงได้กลับไป
-  });
-});
-
-// ดึงข้อมูลผู้ใช้โดย ID
-app.get("/api/admin/users/:id",verifyToken,verifyAdmin, (req, res) => {
-  const { id } = req.params;
-
-
-  const fetchUserSql = "SELECT * FROM users WHERE id = ?";
-  pool.query(fetchUserSql, [id], (err, results) => {
-    if (err) {
-      console.error("Database error during fetching user:", err);
-      return res.status(500).json({ error: "Error fetching user" });
-    }
-
-    if (results.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    res.json(results[0]); // ส่งข้อมูลผู้ใช้ที่ถูกดึงได้กลับไป
-  });
-});
-
-// Edit user status by admin
-app.put("/api/admin/users/:id/status", verifyToken, verifyAdmin, (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
-
-  
-  // Validate that the status field is provided
-  if (!status) {
-    return res.status(400).json({ error: "Status is required" });
-  }
-  const updateStatusSql = "UPDATE users SET status = ? WHERE id = ?";
-  pool.query(updateStatusSql, [status, id], (err, results) => {
-    if (err) {
-      console.error("Database error during user status update:", err);
-      return res.status(500).json({ error: "Error updating user status" });
-    }
-
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    res.json({ message: "User status updated successfully" });
-  });
-});
-
-
-// Soft Delete a User, Hard Delete their Posts, and Delete Follows (Admin-Only)
-app.delete("/api/admin/users/:id", verifyToken, (req, res) => {
-  const { id } = req.params;
-
-  // Only allow admins to delete users
-  if (req.role !== "admin") {
-    return res.status(403).json({ error: "Only admins are allowed to delete users." });
-  }
-
-  // First, delete all posts of the user (hard delete)
-  const deletePostsSql = "DELETE FROM posts WHERE user_id = ?";
-  pool.query(deletePostsSql, [id], (postErr, postResults) => {
-    if (postErr) {
-      console.error("Database error during post deletion:", postErr);
-      return res.status(500).json({ error: "Database error during post deletion" });
-    }
-
-    // Next, delete all follows of the user (both following and followers)
-    const deleteFollowsSql = "DELETE FROM follower_following WHERE follower_id = ? OR following_id = ?";
-    pool.query(deleteFollowsSql, [id, id], (followErr, followResults) => {
-      if (followErr) {
-        console.error("Database error during follow deletion:", followErr);
-        return res.status(500).json({ error: "Database error during follow deletion" });
+      if (err) {
+          console.error("Database error during fetching ad image:", err);
+          return res.status(500).json({ error: "Error fetching ad image" });
       }
 
-      // Now, soft delete the user (update status to 'deactivated')
-      const softDeleteUserSql = "UPDATE users SET status = 'deactivated' WHERE id = ?";
-      pool.query(softDeleteUserSql, [id], (userErr, userResults) => {
-        if (userErr) {
-          console.error("Database error during user soft deletion:", userErr);
-          return res.status(500).json({ error: "Database error during user soft deletion" });
-        }
+      if (results.length === 0) {
+          return res.status(404).json({ error: "Ad not found" });
+      }
 
-        if (userResults.affectedRows === 0) {
+      const imagePath = results[0].image;
+      if (imagePath) {
+          res.json({ imageUrl: `${req.protocol}://${req.get('host')}${imagePath}` });
+      } else {
+          res.status(404).json({ error: "Image not found" });
+      }
+  });
+});
+
+// ดึงข้อมูลผู้ใช้ทั้งหมด (Admin only)
+app.get("/api/admin/users", authenticateToken, authorizeAdmin, (req, res) => {
+  const fetchUsersSql = "SELECT * FROM users";
+  pool.query(fetchUsersSql, (err, results) => {
+      if (err) {
+          console.error("Database error during fetching users:", err);
+          return res.status(500).json({ error: "Error fetching users" });
+      }
+      res.json(results);
+  });
+});
+
+// ดึงข้อมูลผู้ใช้โดย ID (Admin only)
+app.get("/api/admin/users/:id", authenticateToken, authorizeAdmin, (req, res) => {
+  const { id } = req.params;
+  const fetchUserSql = "SELECT * FROM users WHERE id = ?";
+  pool.query(fetchUserSql, [id], (err, results) => {
+      if (err) {
+          console.error("Database error during fetching user:", err);
+          return res.status(500).json({ error: "Error fetching user" });
+      }
+      if (results.length === 0) {
           return res.status(404).json({ error: "User not found" });
+      }
+      res.json(results[0]);
+  });
+});
+
+// Edit user status by admin (Admin only)
+app.put("/api/admin/users/:id/status", authenticateToken, authorizeAdmin, (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body;
+  
+    if (!status) {
+        return res.status(400).json({ error: "Status is required" });
+    }
+    // Removed updated_at from the SQL query
+    const updateStatusSql = "UPDATE users SET status = ? WHERE id = ?";
+    pool.query(updateStatusSql, [status, id], (err, results) => {
+        if (err) {
+            console.error("Database error during user status update:", err);
+            return res.status(500).json({ error: "Error updating user status" });
+        }
+        if (results.affectedRows === 0) {
+            return res.status(404).json({ error: "User not found" });
+        }
+        res.json({ message: "User status updated successfully" });
+    });
+  });
+
+// Soft Delete a User, Hard Delete their Posts, and Delete Follows (Admin-Only)
+app.delete("/api/admin/users/:id", authenticateToken, authorizeAdmin, (req, res) => {
+  const { id } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error getting DB connection:', err);
+      return res.status(500).json({ error: 'Database connection error.' });
+    }
+
+    connection.beginTransaction((err) => {
+      if (err) {
+        connection.release();
+        console.error('Error starting transaction:', err);
+        return res.status(500).json({ error: 'Failed to start transaction.' });
+      }
+
+      // Delete all posts of the user (hard delete)
+      const deletePostsSql = "DELETE FROM posts WHERE user_id = ?";
+      connection.query(deletePostsSql, [id], (err, postResults) => {
+        if (err) {
+          return connection.rollback(() => {
+            connection.release();
+            console.error("Error deleting posts:", err);
+            res.status(500).json({ error: "Failed to delete user's posts." });
+          });
         }
 
-        res.json({
-          message: "User soft-deleted, their posts and follows deleted successfully",
-          deletedPostsCount: postResults.affectedRows, // Return the number of posts deleted
-          deletedFollowsCount: followResults.affectedRows // Return the number of follows deleted
+        // Delete all follows of the user (both following and followers)
+        const deleteFollowsSql = "DELETE FROM follower_following WHERE follower_id = ? OR following_id = ?";
+        connection.query(deleteFollowsSql, [id, id], (err, followResults) => {
+          if (err) {
+            return connection.rollback(() => {
+              connection.release();
+              console.error("Error deleting follows:", err);
+              res.status(500).json({ error: "Failed to delete user's follows." });
+            });
+          }
+
+          // Soft delete the user (update status to 'deactivated')
+          // ไม่มี updated_at ในคำสั่ง SQL นี้แล้ว
+          const softDeleteUserSql = "UPDATE users SET status = 'deactivated' WHERE id = ?";
+          connection.query(softDeleteUserSql, [id], (err, userResults) => {
+            if (err) {
+              return connection.rollback(() => {
+                connection.release();
+                console.error("Error soft-deleting user:", err);
+                res.status(500).json({ error: "Failed to soft-delete user." });
+              });
+            }
+
+            if (userResults.affectedRows === 0) {
+              return connection.rollback(() => {
+                connection.release();
+                res.status(404).json({ error: "User not found" });
+              });
+            }
+
+            connection.commit((err) => {
+              if (err) {
+                return connection.rollback(() => {
+                  connection.release();
+                  console.error("Error committing transaction:", err);
+                  res.status(500).json({ error: "Transaction failed." });
+                });
+              }
+              connection.release();
+              res.json({
+                message: "User soft-deleted, their posts and follows deleted successfully",
+                deletedPostsCount: postResults.affectedRows,
+                deletedFollowsCount: followResults.affectedRows
+              });
+            });
+          });
         });
       });
     });
   });
 });
 
-// Get all posts
-app.get("/api/admin/posts", verifyToken, verifyAdmin, (req, res) => {
-  const fetchPostsSql = "SELECT * FROM posts"; // ดึงข้อมูลโพสต์ทั้งหมด
+// Get all posts (Admin only)
+app.get("/api/admin/posts", authenticateToken, authorizeAdmin, (req, res) => {
+  const fetchPostsSql = "SELECT * FROM posts ORDER BY created_at DESC"; // เพิ่ม ORDER BY
   pool.query(fetchPostsSql, (err, results) => {
-    if (err) {
-      console.error("Database error during fetching posts:", err);
-      return res.status(500).json({ error: "Error fetching posts" });
-    }
-
-    res.json(results);
+      if (err) {
+          console.error("Database error during fetching posts:", err);
+          return res.status(500).json({ error: "Error fetching posts" });
+      }
+      res.json(results);
   });
 });
 
-// Get post by ID
-app.get("/api/admin/posts/:id", verifyToken, verifyAdmin, (req, res) => {
+// Get post by ID (Admin only)
+app.get("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
-
   const fetchPostSql = "SELECT * FROM posts WHERE id = ?";
   pool.query(fetchPostSql, [id], (err, results) => {
-    if (err) {
-      console.error("Database error during fetching post:", err);
-      return res.status(500).json({ error: "Error fetching post" });
-    }
-
-    if (results.length === 0) {
-      return res.status(404).json({ error: "Post not found" });
-    }
-
-    res.json(results[0]);
+      if (err) {
+          console.error("Database error during fetching post:", err);
+          return res.status(500).json({ error: "Error fetching post" });
+      }
+      if (results.length === 0) {
+          return res.status(404).json({ error: "Post not found" });
+      }
+      res.json(results[0]);
   });
 });
 
-
-// Update post status by admin
-app.put("/api/admin/posts/:id", verifyToken, verifyAdmin, (req, res) => {
+// Update post status by admin (Admin only)
+app.put("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
   const { Title, content, status, ProductName } = req.body;
 
+  // Build dynamic update query
+  const updateFields = [];
+  const updateValues = [];
+
+  if (Title !== undefined) { updateFields.push('Title = ?'); updateValues.push(Title); }
+  if (content !== undefined) { updateFields.push('content = ?'); updateValues.push(content); }
+  if (status !== undefined) { updateFields.push('status = ?'); updateValues.push(status); }
+  if (ProductName !== undefined) { updateFields.push('ProductName = ?'); updateValues.push(ProductName); }
+
+  updateFields.push('updated_at = NOW()'); // Always update updated_at
+
+  if (updateFields.length === 1 && updateFields[0] === 'updated_at = NOW()') {
+      return res.status(400).json({ error: 'No meaningful fields to update besides updated_at' });
+  }
+
   const updatePostSql = `
-    UPDATE posts 
-    SET Title = ?, content = ?, status = ?, ProductName = ? 
-    WHERE id = ?`;
-
-  pool.query(updatePostSql, [Title, content, status, ProductName, id], (err, results) => {
-    if (err) {
-      console.error("Database error during updating post:", err);
-      return res.status(500).json({ error: "Error updating post" });
-    }
-
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ error: "Post not found" });
-    }
-
-    res.json({ message: "Post updated successfully" });
-  });
-});
-
-
-// Delete post by admin
-app.delete("/api/admin/posts/:id", verifyToken, verifyAdmin, (req, res) => {
-  const { id } = req.params;
-
-  const deletePostSql = "DELETE FROM posts WHERE id = ?";
-  pool.query(deletePostSql, [id], (err, results) => {
-    if (err) {
-      console.error("Database error during post deletion:", err);
-      return res.status(500).json({ error: "Error deleting post" });
-    }
-
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ error: "Post not found" });
-    }
-
-    res.json({ message: "Post deleted successfully" });
-  });
-});
-
-// API สำหรับแอดมินในการดูโพสต์ที่ถูกรีพอร์ต
-app.get("/api/admin/reported-posts", verifyToken, (req, res) => {
-  // ตรวจสอบว่า role ของผู้ใช้คือแอดมินหรือไม่
-  if (req.role !== "admin") {
-    return res.status(403).json({ error: "Unauthorized access" });
-  }
-
-  const fetchReportedPostsSql = `
-    SELECT 
-      r.id AS report_id,
-      r.post_id,
-      r.user_id AS reported_by_user_id,
-      r.reason,
-      r.reported_at,
-      p.title AS post_title,
-      p.content AS post_content,
-      r.status,
-      u.username AS reported_by_username,
-      u.picture AS reported_by_user_profile,
-      pu.username AS post_owner_username,
-      pu.picture AS post_owner_profile
-    FROM reports r
-    JOIN posts p ON r.post_id = p.id
-    JOIN users u ON r.user_id = u.id
-    JOIN users pu ON p.user_id = pu.id
-    WHERE r.status = 'pending'
-    ORDER BY r.reported_at DESC;
-  `;
-
-  pool.query(fetchReportedPostsSql, (error, results) => {
-    if (error) {
-      console.error("Database error during fetching reported posts:", error);
-      return res.status(500).json({ error: "Error fetching reported posts" });
-    }
-
-    res.json(results);
-  });
-});
-
-app.put("/api/admin/reports/:reportId", verifyToken, async (req, res) => {
-  const { status } = req.body; // รับสถานะจาก Body
-  const reportId = req.params.reportId; // รับ reportId จากพารามิเตอร์
-
-  // ตรวจสอบว่า role ของผู้ใช้คือแอดมินหรือไม่
-  if (req.role !== "admin") {
-      return res.status(403).json({ error: "Unauthorized access" });
-  }
-
-  // ตรวจสอบว่าสถานะมีค่าหรือไม่
-  if (!status) {
-      return res.status(400).json({ error: "Status is required" });
-  }
-
-  // สร้างคำสั่ง SQL สำหรับการอัปเดตสถานะ
-  const updateReportSql = `
-      UPDATE reports
-      SET status = ?
-      WHERE id = ?;
-  `;
-
-  // ทำการอัปเดตสถานะในฐานข้อมูล
-  pool.query(updateReportSql, [status, reportId], (error, results) => {
-      if (error) {
-          console.error("Database error during updating report:", error);
-          return res.status(500).json({ error: "Error updating report" });
-      }
-      
-      if (results.affectedRows === 0) {
-          return res.status(404).json({ error: "Report not found" });
-      }
-
-      res.json({ message: "Report updated successfully" });
-  });
-});
-
-// Get All Categories
-app.get('/api/categories', verifyToken, verifyAdmin, (req, res) => {
-  const fetchCategoriesSql = 'SELECT * FROM category ORDER BY CategoryID ASC';
-  
-  pool.query(fetchCategoriesSql, (err, results) => {
-    if (err) {
-      console.error("Database error during fetching categories:", err);
-      return res.status(500).json({ error: "Error fetching categories" });
-    }
-    res.json(results);
-  });
-});
-
-// Create a Category
-app.post('/api/categories', verifyToken, verifyAdmin, (req, res) => {
-  const { CategoryName } = req.body;
-
-  if (!CategoryName) {
-    return res.status(400).json({ error: "CategoryName is required" });
-  }
-
-  const createCategorySql = 'INSERT INTO category (CategoryName) VALUES (?)'; // แก้ไขที่นี่
-  pool.query(createCategorySql, [CategoryName], (err, results) => {
-    if (err) {
-      console.error("Database error during category creation:", err);
-      return res.status(500).json({ error: "Error creating category" });
-    }
-    res.status(201).json({ message: "Category created successfully", categoryId: results.insertId });
-  });
-});
-
-// Update a Category
-app.put('/api/categories/:id', verifyToken, verifyAdmin, (req, res) => {
-  const { id } = req.params;
-  const { CategoryName } = req.body;
-
-  if (!CategoryName) {
-    return res.status(400).json({ error: "CategoryName is required" });
-  }
-
-  const updateCategorySql = 'UPDATE category SET CategoryName = ? WHERE CategoryID = ?'; // แก้ไขที่นี่
-  pool.query(updateCategorySql, [CategoryName, id], (err, results) => {
-    if (err) {
-      console.error("Database error during category update:", err);
-      return res.status(500).json({ error: "Error updating category" });
-    }
-
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ error: "Category not found" });
-    }
-
-    res.json({ message: "Category updated successfully" });
-  });
-});
-
-// Delete a Category
-app.delete('/api/categories/:id', verifyToken, verifyAdmin, (req, res) => {
-  const { id } = req.params;
-
-  const deleteCategorySql = 'DELETE FROM category WHERE CategoryID = ?'; // แก้ไขที่นี่
-  pool.query(deleteCategorySql, [id], (err, results) => {
-    if (err) {
-      console.error("Database error during category deletion:", err);
-      return res.status(500).json({ error: "Error deleting category" });
-    }
-
-    if (results.affectedRows === 0) {
-      return res.status(404).json({ error: "Category not found" });
-    }
-
-    res.json({ message: "Category deleted successfully" });
-  });
-});
-
-
-app.put("/api/admin/update/poststatus", verifyToken, verifyAdmin, (req, res) => {
-  const { id } = req.body; // รับ id จาก Body
-
-  // ตรวจสอบว่ามีการส่ง id มาหรือไม่
-  if (!id) {
-    return res.status(400).json({ error: "Post ID is required" });
-  }
-
-  // ตรวจสอบว่าโพสต์มีอยู่ในตาราง reports หรือไม่
-  const checkPostInReportsSql = "SELECT * FROM reports WHERE post_id = ?";
-  pool.query(checkPostInReportsSql, [id], (checkErr, checkResults) => {
-    if (checkErr) {
-      console.error("Database error during checking post in reports:", checkErr);
-      return res.status(500).json({ error: "Error checking post in reports" });
-    }
-
-    if (checkResults.length === 0) {
-      return res.status(404).json({ error: "Post not found in reports" });
-    }
-
-    // สร้างคำสั่ง SQL สำหรับการอัปเดตสถานะโพสต์เป็น 'deactivate'
-    const updatePostStatusSql = `
       UPDATE posts 
-      SET status = 'deactivate' 
-      WHERE id = ?;
-    `;
+      SET ${updateFields.join(', ')} 
+      WHERE id = ?`;
+  updateValues.push(id);
 
-    // ทำการอัปเดตสถานะในฐานข้อมูล
-    pool.query(updatePostStatusSql, [id], (err, results) => {
+  pool.query(updatePostSql, updateValues, (err, results) => {
       if (err) {
-        console.error("Database error during updating post status:", err);
-        return res.status(500).json({ error: "Error updating post status" });
+          console.error("Database error during updating post:", err);
+          return res.status(500).json({ error: "Error updating post" });
       }
-
       if (results.affectedRows === 0) {
-        return res.status(404).json({ error: "Post not found" });
+          return res.status(404).json({ error: "Post not found" });
+      }
+      res.json({ message: "Post updated successfully" });
+  });
+});
+
+// Delete post by admin (Admin only)
+app.delete("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) => {
+  const { id } = req.params;
+
+  // เริ่มต้น Transaction (Optional แต่แนะนำสำหรับ Multiple Operations)
+  pool.getConnection((err, connection) => {
+      if (err) {
+          console.error("Error getting database connection:", err);
+          return res.status(500).json({ error: "Database connection error" });
       }
 
-      // ลบโพสต์จากตาราง reports
-      const deleteReportSql = "DELETE FROM reports WHERE post_id = ?";
-      pool.query(deleteReportSql, [id], (deleteErr) => {
-        if (deleteErr) {
-          console.error("Database error during deleting report:", deleteErr);
-          return res.status(500).json({ error: "Error deleting report" });
-        }
+      connection.beginTransaction(err => {
+          if (err) {
+              connection.release();
+              console.error("Error starting transaction:", err);
+              return res.status(500).json({ error: "Failed to start transaction" });
+          }
 
-        res.json({ message: "Post status updated to deactivate successfully and report deleted" });
+          // 1. ลบรายงานทั้งหมดที่เกี่ยวข้องกับ post_id นี้ก่อน
+          const deleteReportsSql = "DELETE FROM reports WHERE post_id = ?";
+          connection.query(deleteReportsSql, [id], (err, reportsResults) => {
+              if (err) {
+                  return connection.rollback(() => {
+                      connection.release();
+                      console.error("Database error during reports deletion:", err);
+                      res.status(500).json({ error: "Error deleting related reports" });
+                  });
+              }
+
+              // 2. เมื่อลบรายงานแล้ว ค่อยลบโพสต์
+              const deletePostSql = "DELETE FROM posts WHERE id = ?";
+              connection.query(deletePostSql, [id], (err, postResults) => {
+                  if (err) {
+                      return connection.rollback(() => {
+                          connection.release();
+                          console.error("Database error during post deletion:", err);
+                          res.status(500).json({ error: "Error deleting post" });
+                      });
+                  }
+
+                  if (postResults.affectedRows === 0) {
+                      return connection.rollback(() => {
+                          connection.release();
+                          res.status(404).json({ error: "Post not found" });
+                      });
+                  }
+
+                  // Commit Transaction หากทุกอย่างสำเร็จ
+                  connection.commit(err => {
+                      if (err) {
+                          return connection.rollback(() => {
+                              connection.release();
+                              console.error("Error committing transaction:", err);
+                              res.status(500).json({ error: "Failed to commit transaction" });
+                          });
+                      }
+                      connection.release();
+                      res.json({ message: "Post and related reports deleted successfully" });
+                  });
+              });
+          });
       });
-    });
+  });
+});
+
+// Get all reported posts (Admin only)
+app.get("/api/admin/reported-posts", authenticateToken, authorizeAdmin, (req, res) => {
+  pool.getConnection((err, connection) => {
+      if (err) {
+          console.error("Error getting database connection:", err);
+          return res.status(500).json({ error: "Failed to connect to database." });
+      }
+
+      const sql = `
+          SELECT
+              r.id AS report_id,
+              r.post_id,
+              r.user_id,
+              r.reason,
+              r.reported_at,
+              r.status,
+              p.id AS actual_post_id,
+              p.title AS post_title,
+              p.content AS post_content,
+              p.photo_url AS post_image_url,
+              u.username AS reported_by_username
+          FROM
+              reports r
+          JOIN
+              posts p ON r.post_id = p.id
+          JOIN
+              users u ON r.user_id = u.id
+          ORDER BY
+              CASE r.status
+                  WHEN 'pending' THEN 1
+                  WHEN 'normally' THEN 2
+                  WHEN 'block' THEN 3
+                  ELSE 99
+              END,
+              r.reported_at DESC;
+      `;
+
+      connection.query(sql, (error, results) => {
+          connection.release(); // Always release the connection
+          if (error) {
+              console.error("Error fetching reported posts:", error);
+              return res.status(500).json({ error: "Error fetching reported posts: " + error.message });
+          }
+          console.log("Fetched Reported Posts:", results);
+          res.json(results);
+      });
+  });
+});
+
+
+// Update report status (Admin only)
+app.put("/api/admin/reports/:reportId", authenticateToken, authorizeAdmin, (req, res) => {
+  const { reportId } = req.params;
+  const { status: newStatus } = req.body; // newStatus can be 'pending', 'block', 'normally'
+
+  pool.getConnection((err, connection) => {
+      if (err) {
+          console.error("Error getting database connection:", err);
+          return res.status(500).json({ error: "Failed to connect to database." });
+      }
+
+      connection.beginTransaction((err) => {
+          if (err) {
+              connection.release();
+              console.error("Error starting transaction:", err);
+              return res.status(500).json({ error: "Failed to start database transaction." });
+          }
+
+          // 1. Get the post_id associated with this specific reportId
+          connection.query('SELECT post_id FROM reports WHERE id = ?', [reportId], (error, reportRows) => {
+              if (error) {
+                  return connection.rollback(() => {
+                      connection.release();
+                      console.error("Error fetching report for update:", error);
+                      res.status(500).json({ error: 'Failed to fetch report details: ' + error.message });
+                  });
+              }
+              if (reportRows.length === 0) {
+                  return connection.rollback(() => {
+                      connection.release();
+                      res.status(404).json({ error: 'Report not found.' });
+                  });
+              }
+              const postId = reportRows[0].post_id;
+
+              // 2. Conditional Update Logic based on newStatus
+              if (newStatus === 'block') {
+                  // Update ALL reports for this post_id to 'block'
+                  connection.query('UPDATE reports SET status = ? WHERE post_id = ?', ['block', postId], (errReports) => {
+                      if (errReports) {
+                          return connection.rollback(() => {
+                              connection.release();
+                              console.error('Error updating reports to block:', errReports);
+                              res.status(500).json({ error: 'Failed to update reports: ' + errReports.message });
+                          });
+                      }
+                      // Update the post status in 'posts' table to 'deactivate'
+                      connection.query('UPDATE posts SET status = ? WHERE id = ?', ['deactivate', postId], (errPosts) => {
+                          if (errPosts) {
+                              return connection.rollback(() => {
+                                  connection.release();
+                                  console.error('Error deactivating post:', errPosts);
+                                  res.status(500).json({ error: 'Failed to deactivate post: ' + errPosts.message });
+                              });
+                          }
+                          connection.commit((errCommit) => {
+                              if (errCommit) {
+                                  return connection.rollback(() => {
+                                      connection.release();
+                                      console.error('Error committing transaction (block):', errCommit);
+                                      res.status(500).json({ error: 'Transaction failed during commit: ' + errCommit.message });
+                                  });
+                              }
+                              connection.release();
+                              res.json({ message: 'Report status and related post status updated successfully to block/deactivate.' });
+                          });
+                      });
+                  });
+              } else if (newStatus === 'normally') {
+                  // Update ALL reports for this post_id to 'normally'
+                  connection.query('UPDATE reports SET status = ? WHERE post_id = ?', ['normally', postId], (errReports) => {
+                      if (errReports) {
+                          return connection.rollback(() => {
+                              connection.release();
+                              console.error('Error updating reports to normally:', errReports);
+                              res.status(500).json({ error: 'Failed to update reports: ' + errReports.message });
+                          });
+                      }
+                      // Update the post status in 'posts' table to 'active'
+                      connection.query('UPDATE posts SET status = ? WHERE id = ?', ['active', postId], (errPosts) => {
+                          if (errPosts) {
+                              return connection.rollback(() => {
+                                  connection.release();
+                                  console.error('Error activating post:', errPosts);
+                                  res.status(500).json({ error: 'Failed to activate post: ' + errPosts.message });
+                              });
+                          }
+                          connection.commit((errCommit) => {
+                              if (errCommit) {
+                                  return connection.rollback(() => {
+                                      connection.release();
+                                      console.error('Error committing transaction (normally):', errCommit);
+                                      res.status(500).json({ error: 'Transaction failed during commit: ' + errCommit.message });
+                                  });
+                              }
+                              connection.release();
+                              res.json({ message: 'Report status and related post status updated successfully to normally/active.' });
+                          });
+                      });
+                  });
+              } else if (newStatus === 'pending') {
+                  // <<< CORRECTED: Update ALL reports for this post_id to 'pending'
+                  connection.query('UPDATE reports SET status = ? WHERE post_id = ?', ['pending', postId], (errReports) => {
+                      if (errReports) {
+                          return connection.rollback(() => {
+                              connection.release();
+                              console.error('Error updating reports to pending:', errReports);
+                              res.status(500).json({ error: 'Failed to update reports to pending: ' + errReports.message });
+                          });
+                      }
+                      connection.commit((errCommit) => {
+                          if (errCommit) {
+                              return connection.rollback(() => {
+                                  connection.release();
+                                  console.error('Error committing transaction (pending):', errCommit);
+                                  res.status(500).json({ error: 'Transaction failed during commit: ' + errCommit.message });
+                              });
+                          }
+                          connection.release();
+                          res.json({ message: 'All related report statuses updated to pending.' });
+                      });
+                  });
+              } else {
+                  return connection.rollback(() => {
+                      connection.release();
+                      res.status(400).json({ error: 'Invalid status provided.' });
+                  });
+              }
+          });
+      });
+  });
+});
+
+// Get All Categories (Admin only)
+app.get('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
+  const fetchCategoriesSql = 'SELECT * FROM category ORDER BY CategoryID ASC';
+  pool.query(fetchCategoriesSql, (err, results) => {
+      if (err) {
+          console.error("Database error during fetching categories:", err);
+          return res.status(500).json({ error: "Error fetching categories" });
+      }
+      res.json(results);
+  });
+});
+
+// Create a Category (Admin only)
+app.post('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
+  const { CategoryName } = req.body;
+
+  if (!CategoryName) {
+      return res.status(400).json({ error: "CategoryName is required" });
+  }
+
+  const createCategorySql = 'INSERT INTO category (CategoryName, created_at, updated_at) VALUES (?, NOW(), NOW())'; // เพิ่ม created_at, updated_at
+  pool.query(createCategorySql, [CategoryName], (err, results) => {
+      if (err) {
+          console.error("Database error during category creation:", err);
+          return res.status(500).json({ error: "Error creating category" });
+      }
+      res.status(201).json({ message: "Category created successfully", categoryId: results.insertId });
+  });
+});
+
+// Update a Category (Admin only)
+app.put('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) => {
+  const { id } = req.params;
+  const { CategoryName } = req.body;
+
+  if (!CategoryName) {
+      return res.status(400).json({ error: "CategoryName is required" });
+  }
+
+  const updateCategorySql = 'UPDATE category SET CategoryName = ?, updated_at = NOW() WHERE CategoryID = ?'; // เพิ่ม updated_at
+  pool.query(updateCategorySql, [CategoryName, id], (err, results) => {
+      if (err) {
+          console.error("Database error during category update:", err);
+          return res.status(500).json({ error: "Error updating category" });
+      }
+      if (results.affectedRows === 0) {
+          return res.status(404).json({ error: "Category not found" });
+      }
+      res.json({ message: "Category updated successfully" });
+  });
+});
+
+// Delete a Category (Admin only)
+app.delete('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) => {
+  const { id } = req.params;
+
+  const deleteCategorySql = 'DELETE FROM category WHERE CategoryID = ?';
+  pool.query(deleteCategorySql, [id], (err, results) => {
+      if (err) {
+          console.error("Database error during category deletion:", err);
+          return res.status(500).json({ error: "Error deleting category" });
+      }
+      if (results.affectedRows === 0) {
+          return res.status(404).json({ error: "Category not found" });
+      }
+      res.json({ message: "Category deleted successfully" });
+  });
+});
+
+// API สำหรับแอดมินในการอัปเดตสถานะโพสต์เป็น 'deactivate' และลบรายงานที่เกี่ยวข้อง
+app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req, res) => {
+  const { id } = req.body;
+
+  if (!id) {
+      return res.status(400).json({ error: "Post ID is required" });
+  }
+
+  pool.getConnection((err, connection) => {
+      if (err) {
+          console.error('Error getting DB connection:', err);
+          return res.status(500).json({ error: 'Database connection error.' });
+      }
+
+      connection.beginTransaction(async (err) => {
+          if (err) {
+              connection.release();
+              console.error('Error starting transaction:', err);
+              return res.status(500).json({ error: 'Failed to start transaction.' });
+          }
+
+          try {
+              // Check if the post exists in the 'reports' table and its status (optional, but good for logic)
+              const checkPostInReportsSql = "SELECT * FROM reports WHERE post_id = ?";
+              const [checkResults] = await connection.execute(checkPostInReportsSql, [id]);
+
+              if (checkResults.length === 0) {
+                  await connection.rollback();
+                  connection.release();
+                  return res.status(404).json({ error: "Post not found in pending reports (or already handled)" });
+              }
+
+              // Update post status to 'deactivate'
+              const updatePostStatusSql = `
+                  UPDATE posts 
+                  SET status = 'deactivate', updated_at = NOW()
+                  WHERE id = ?;
+              `;
+              const [postUpdateResults] = await connection.execute(updatePostStatusSql, [id]);
+
+              if (postUpdateResults.affectedRows === 0) {
+                  await connection.rollback();
+                  connection.release();
+                  return res.status(404).json({ error: "Post not found or already deactivated" });
+              }
+
+              // Delete the related report(s)
+              const deleteReportSql = "DELETE FROM reports WHERE post_id = ?";
+              const [reportDeleteResults] = await connection.execute(deleteReportSql, [id]);
+
+              await connection.commit();
+              connection.release();
+              res.json({ message: "Post status updated to deactivate successfully and associated reports deleted", deletedReportsCount: reportDeleteResults.affectedRows });
+
+          } catch (transactionErr) {
+              await connection.rollback();
+              connection.release();
+              console.error("Transaction failed during post status update and report deletion:", transactionErr);
+              res.status(500).json({ error: "Transaction failed during post status update and report deletion" });
+          }
+      });
   });
 });
 
