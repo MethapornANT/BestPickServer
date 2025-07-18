@@ -82,15 +82,15 @@ def find_ad_by_order_id(order_id, conn=None):
         if close_conn and conn.is_connected():
             conn.close()
 
-def update_order_status_and_slip_info(order_id, new_status, slip_image_path, slip_transaction_id, conn):
+def update_order_status_and_slip_info(order_id, new_status, slip_image_path, conn):
     cursor = conn.cursor()
     try:
         query = """
             UPDATE orders
-            SET order_status = %s, slip_image = %s, slip_transaction_id = %s, updated_at = NOW()
+            SET order_status = %s, slip_image = %s, updated_at = NOW()
             WHERE id = %s
         """
-        cursor.execute(query, (new_status, slip_image_path, slip_transaction_id, order_id))
+        cursor.execute(query, (new_status, slip_image_path, order_id))
         print(f"✅ Order ID: {order_id} status updated to '{new_status}' with slip info.")
         return True
     except mysql.connector.Error as err:
@@ -145,21 +145,22 @@ def create_advertisement_db(order_data, conn):
     cursor = conn.cursor()
     try:
         now = datetime.now()
-        # สถานะเริ่มต้นของโฆษณาเมื่อสร้างคือ 'paid' (รอ Admin Approve)
         query = """
             INSERT INTO ads
-            (user_id, order_id, title, content, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            (user_id, order_id, title, content, link, image, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         default_title = f"Advertisement for Order {order_data['id']}"
         default_content = "This is a new advertisement pending admin approval after payment."
-
         cursor.execute(query, (
             order_data['user_id'],
             order_data['id'],
             default_title,
             default_content,
-            'paid', # สถานะเริ่มต้นเป็น 'paid' รอ Admin Approve
+            "",  # link
+            "",  # image
+            'paid',
+            now,
             now
         ))
         ad_id = cursor.lastrowid
