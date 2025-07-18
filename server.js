@@ -1141,12 +1141,6 @@ app.get("/api/posts/:id", verifyToken, (req, res) => {
   }
 });
 
-
-
-
-
-
-
 // Create a Post
 app.post(
   "/api/posts/create",
@@ -1281,11 +1275,6 @@ app.put("/api/posts/:id", verifyToken, upload.fields([
       res.status(500).json({ error: "Internal server error" });
   }
 });
-
-
-
-
-
 
 // Delete a Post
 app.delete("/api/posts/:id", verifyToken, (req, res) => {
@@ -1783,8 +1772,6 @@ app.get("/api/users/:userId/view-profile", verifyToken, (req, res) => {
   });
 });
 
-
-
 app.put(
   "/api/users/:userId/profile",
   verifyToken,
@@ -1867,9 +1854,6 @@ function formatDateForSQL(dateString) {
   const day = String(dateObj.getDate()).padStart(2, '0'); // Ensure 2 digits
   return `${year}-${month}-${day}`;
 }
-
-
-
 
 // API endpoint to follow or unfollow another user
 app.post("/api/users/:userId/follow/:followingId", verifyToken, (req, res) => {
@@ -2077,8 +2061,6 @@ app.delete("/api/posts/:postId/comment/:commentId", verifyToken, (req, res) => {
   });
 });
 
-
-
 app.post("/api/posts/:postId/bookmark", verifyToken, (req, res) => {
   const { postId } = req.params; // Extract postId from URL parameters
   const userId = req.userId; // Extract userId from the verified token
@@ -2220,7 +2202,7 @@ ORDER BY b.created_at DESC;
 
 
 
-
+//########################################################   Notification API  #######################################################
 
 
 
@@ -2304,10 +2286,6 @@ app.post("/api/notifications", verifyToken, (req, res) => {
   }
 });
 
-
-
-
-
 app.get("/api/notifications", verifyToken, (req, res) => {
   const userId = req.userId;
 
@@ -2343,9 +2321,6 @@ app.get("/api/notifications", verifyToken, (req, res) => {
     res.json(results);
   });
 });
-
-
-
 
 // API สำหรับอัปเดตสถานะการอ่านของ Notification ตาม ID
 app.put("/api/notifications/:id/read", verifyToken, (req, res) => {
@@ -2573,6 +2548,8 @@ app.get("/api/following/posts", verifyToken, (req, res) => {
   });
 });
 
+//########################################################   Report API  ########################################################
+
 
 
 // API for reporting a post
@@ -2601,11 +2578,6 @@ app.post("/api/posts/:postId/report", verifyToken, (req, res) => {
     res.status(201).json({ message: "Post reported successfully" });
   });
 });
-
-
-
-
-
 
 // API for retrieving all reported posts (admin-only)
 app.get("/api/reports", verifyToken, (req, res) => {
@@ -2683,6 +2655,9 @@ app.delete("/api/users/:id", verifyToken, (req, res) => {
     });
   });
 });
+
+
+//########################################################   Follow API  ########################################################
 
 
 app.get("/api/users/following/:userId", (req, res) => {
@@ -2837,7 +2812,7 @@ app.get('/api/bookmarks/:post_id', verifyToken, (req, res) => {
 });
 
 
-// ########################################################## admin #################################################
+//########################################################   Admin API  ########################################################
 // Admin Login API
 app.post("/api/admin/login", async (req, res) => {
   try {
@@ -3862,6 +3837,10 @@ app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req,
   });
 });
 
+
+//########################################################   Message  API  ########################################################
+
+
 // API สร้าง Match อัตโนมัติเมื่อมีการ Follow
 app.post('/api/users/:userId/follow/:followingId', (req, res) => {
     const { userId, followingId } = req.params;
@@ -4289,6 +4268,8 @@ app.post('/api/check-block-status', (req, res) => {
 });
 
 
+//########################################################   Ads API  ########################################################
+
 
 // GET /api/ad-packages
 app.get('/api/ad-packages', (req, res) => {
@@ -4305,7 +4286,6 @@ app.get('/api/ad-packages', (req, res) => {
 });
 
 // POST /api/orders
-// body: { user_id, package_id, title, content, link, image }
 app.post('/api/orders', (req, res) => {
   console.log('[INFO] Received POST /api/orders request');
   const { user_id, package_id, title, content, link, image } = req.body;
@@ -4379,7 +4359,6 @@ app.get('/api/orders/:orderId', (req, res) => {
 });
 
 // POST /api/orders/:orderId/upload-slip
-// ใช้ multer รับไฟล์ image
 app.post('/api/orders/:orderId/upload-slip', upload.single('slip_image'), (req, res) => { // เปลี่ยน 'slip' เป็น 'slip_image'
   const { orderId } = req.params;
   console.log(`[INFO] Received POST /api/orders/${orderId}/upload-slip request.`);
@@ -4398,9 +4377,6 @@ app.post('/api/orders/:orderId/upload-slip', upload.single('slip_image'), (req, 
       res.json({ message: 'Slip uploaded', slip_path: req.file.path });
   });
 });
-
-// POST /api/orders/:orderId/verify-slip
-// **Endpoint นี้ซ้ำซ้อนกับ Slip.py ในการดำเนินการตรวจสอบสลิปและการอัปเดตสถานะ จึงถูกนำออกไป**
 
 // PUT /api/ads/:adId/approve
 app.put('/api/ads/:adId/approve', (req, res) => {
@@ -4445,6 +4421,8 @@ app.get('/api/ads', (req, res) => {
   });
 });
 
+
+//########################################################   End API  ########################################################
 
 // Start the server
 const PORT = process.env.PORT || 3000;
