@@ -3846,7 +3846,6 @@ app.get('/api/admin/search/ads', authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
   if (!query) {
-    // ถ้าไม่มี searchTerm ให้ส่ง 400 Bad Request
     return res.status(400).json({ error: 'Search query is required' });
   }
 
@@ -3883,24 +3882,227 @@ app.get('/api/admin/search/ads', authenticateToken, (req, res) => {
         return res.status(500).json({ error: "Internal server error" });
       }
 
-      // *** แก้ไขตรงนี้ ***
-      // ถ้าไม่พบผลลัพธ์ (results.length === 0)
       if (results.length === 0) {
-        // ให้ส่งสถานะ 200 OK พร้อมข้อความบอกว่าไม่พบข้อมูล
         return res.status(200).json({ message: "No advertisements found", results: [] });
       }
 
-      // ถ้าพบผลลัพธ์ ให้แปลงข้อมูลและส่งกลับไปพร้อมสถานะ 200 OK
+      // ส่ง image ตรงๆ ไม่เติม path
       const adsWithImagePaths = results.map(ad => ({
         ...ad,
-        image: ad.image ? `/uploads/${ad.image}` : null
+        image: ad.image ? ad.image : null
       }));
 
-      res.status(200).json(adsWithImagePaths); // ส่งผลลัพธ์กลับพร้อมสถานะ 200 OK
+      res.status(200).json(adsWithImagePaths);
     }
   );
 });
 
+app.get('/api/admin/search/users', authenticateToken, (req, res) => {
+  const { q: query } = req.query;
+
+  if (!query) {
+    return res.status(400).json({ error: 'Search query is required' });
+  }
+
+  const searchValue = `%${query.trim().toLowerCase()}%`;
+
+  const searchSql = `
+    SELECT
+      id,
+      email,
+      username,
+      picture,
+      created_at,
+      last_login,
+      last_login_ip,
+      gender,
+      bio,
+      status,
+      role,
+      birthday,
+      age
+    FROM users
+    WHERE (
+      LOWER(email) LIKE ? OR
+      LOWER(username) LIKE ? OR
+      LOWER(gender) LIKE ? OR
+      LOWER(bio) LIKE ? OR
+      LOWER(status) LIKE ? OR
+      LOWER(role) LIKE ? OR
+      id LIKE ?
+    )
+    ORDER BY created_at DESC;
+  `;
+
+  const queryParams = [
+    searchValue, searchValue, searchValue, searchValue,
+    searchValue, searchValue, searchValue
+  ];
+
+  pool.query(
+    searchSql,
+    queryParams,
+    (err, results) => {
+      if (err) {
+        console.error("Database error during users search:", err);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+
+      // map picture ให้เป็น path เสมอ (กันกรณี picture เป็น string ว่าง/null)
+      const usersWithImagePaths = results.map(user => ({
+        ...user,
+        picture: user.picture && user.picture.trim() !== ''
+          ? `${user.picture}`
+          : null
+      }));
+
+      // log ข้อมูลที่ส่งกลับ
+      console.log("search results:", usersWithImagePaths);
+
+      if (usersWithImagePaths.length === 0) {
+        return res.status(200).json({ message: "No users found", results: [] });
+      }
+
+      res.status(200).json(usersWithImagePaths);
+    }
+  );
+});
+
+app.get('/api/admin/search/posts', authenticateToken, (req, res) => {
+  const { q: query } = req.query;
+
+  if (!query) {
+    return res.status(400).json({ error: 'Search query is required' });
+  }
+
+  const searchValue = `%${query.trim().toLowerCase()}%`;
+
+  const searchSql = `
+    SELECT
+      id,
+      user_id,
+      content,
+      video_url,
+      photo_url,
+      Title,
+      CategoryID,
+      ProductName,
+      created_at,
+      updated_at,
+      status
+    FROM posts
+    WHERE (
+      LOWER(content) LIKE ? OR
+      LOWER(Title) LIKE ? OR
+      LOWER(ProductName) LIKE ? OR
+      LOWER(status) LIKE ? OR
+      id LIKE ? OR
+      user_id LIKE ?
+    )
+    ORDER BY created_at DESC;
+  `;
+
+  const queryParams = [
+    searchValue, // content
+    searchValue, // Title
+    searchValue, // ProductName
+    searchValue, // status
+    searchValue, // id
+    searchValue  // user_id
+  ];
+
+  pool.query(
+    searchSql,
+    queryParams,
+    (err, results) => {
+      if (err) {
+        console.error("Database error during posts search:", err);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+
+      if (results.length === 0) {
+        return res.status(200).json({ message: "No posts found", results: [] });
+      }
+
+      // ส่งข้อมูลตรงๆ ไม่เติม path ใดๆ
+      res.status(200).json(results);
+    }
+  );
+});
+
+app.get('/api/admin/search/reports', authenticateToken, (req, res) => {
+  const { q: query } = req.query;
+
+  if (!query) {
+    return res.status(400).json({ error: 'Search query is required' });
+  }
+
+  const searchValue = `%${query.trim().toLowerCase()}%`;
+
+  // JOIN post และ user เพื่อดึงข้อมูลที่ UI ต้องการ
+  const searchSql = `
+    SELECT
+      r.id AS report_id,
+      r.user_id AS reported_by_user_id,
+      u.username AS reported_by_username,
+      r.post_id AS actual_post_id,
+      p.Title AS post_title,
+      p.photo_url AS post_image_url,
+      r.reason,
+      r.reported_at,
+      r.status
+    FROM reports r
+    LEFT JOIN users u ON r.user_id = u.id
+    LEFT JOIN posts p ON r.post_id = p.id
+    WHERE (
+      LOWER(r.reason) LIKE ? OR
+      LOWER(r.status) LIKE ? OR
+      r.id LIKE ? OR
+      r.user_id LIKE ? OR
+      r.post_id LIKE ? OR
+      LOWER(u.username) LIKE ? OR
+      LOWER(p.Title) LIKE ?
+    )
+    ORDER BY r.reported_at DESC;
+  `;
+
+  const queryParams = [
+    searchValue, // reason
+    searchValue, // status
+    searchValue, // report id
+    searchValue, // user id
+    searchValue, // post id
+    searchValue, // username
+    searchValue  // post title
+  ];
+
+  pool.query(
+    searchSql,
+    queryParams,
+    (err, results) => {
+      if (err) {
+        console.error("Database error during reports search:", err);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+
+      // แปลง photo_url จาก string เป็น array ถ้าเก็บเป็น JSON string
+      const mapped = results.map(row => ({
+        ...row,
+        post_image_url: row.post_image_url
+          ? (typeof row.post_image_url === 'string'
+              ? JSON.parse(row.post_image_url)
+              : row.post_image_url)
+          : undefined
+      }));
+
+      if (mapped.length === 0) {
+        return res.status(200).json({ message: "No reports found", results: [] });
+      }
+
+      res.status(200).json(mapped);
+    }
+  );
+});
 
 //########################################################   Message  API  ########################################################
 
