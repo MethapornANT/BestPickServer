@@ -1459,9 +1459,6 @@ app.post("/api/posts/like/:id", verifyToken, (req, res) => {
 // Serve static files (uploaded images and videos)
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-//แก้5 ยังไม่ได้เช็ค
-
-// Search API with grouped results by username, and include only the first photo_url
 // Search API with grouped results by username, and include only the first photo_url
 app.get("/api/search", (req, res) => {
   const { query } = req.query;
@@ -3205,15 +3202,19 @@ app.delete("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
 
 // Get All Ads (Admin only) - ควรใช้ authenticateToken, authorizeAdmin
 app.get("/api/ads", authenticateToken, authorizeAdmin, (req, res) => {
-  const fetchAdsSql = `SELECT * FROM ads ORDER BY created_at DESC`;
-
+  const fetchAdsSql = `
+      SELECT id, user_id, order_id, title, content, link, image, status, created_at, updated_at, expiration_date, admin_notes
+      FROM ads
+      ORDER BY
+          FIELD(status, 'pending', 'paid', 'active', 'rejected'), -- Custom order for status
+          created_at ASC; -- Oldest created_at first
+  `;
   pool.query(fetchAdsSql, (err, results) => {
-      if (err) {
-          console.error("Database error during fetching ads:", err);
-          return res.status(500).json({ error: "Error fetching ads" });
-      }
-
-      res.json(results);
+    if (err) {
+      console.error("Database error during fetching ads:", err);
+      return res.status(500).json({ error: "Error fetching ads" });
+    }
+    res.json(results);
   });
 });
 
@@ -3835,6 +3836,69 @@ app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req,
           }
       });
   });
+});
+
+
+//########################################################   Admin Search API  ########################################################
+
+
+app.get('/api/admin/search/ads', authenticateToken, (req, res) => {
+  const { q: query } = req.query;
+
+  if (!query) {
+    // ถ้าไม่มี searchTerm ให้ส่ง 400 Bad Request
+    return res.status(400).json({ error: 'Search query is required' });
+  }
+
+  const searchValue = `%${query.trim().toLowerCase()}%`;
+
+  const searchSql = `
+    SELECT
+      id,
+      title,
+      content,
+      link,
+      status,
+      expiration_date,
+      image,
+      created_at,
+      updated_at
+    FROM ads
+    WHERE (
+      LOWER(title) LIKE ? OR
+      LOWER(content) LIKE ? OR
+      LOWER(link) LIKE ? OR
+      LOWER(status) LIKE ? OR
+      id LIKE ?
+    )
+    ORDER BY created_at DESC;
+  `;
+
+  pool.query(
+    searchSql,
+    [searchValue, searchValue, searchValue, searchValue, searchValue],
+    (err, results) => {
+      if (err) {
+        console.error("Database error during ads search:", err);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+
+      // *** แก้ไขตรงนี้ ***
+      // ถ้าไม่พบผลลัพธ์ (results.length === 0)
+      if (results.length === 0) {
+        // ให้ส่งสถานะ 200 OK พร้อมข้อความบอกว่าไม่พบข้อมูล
+        return res.status(200).json({ message: "No advertisements found", results: [] });
+      }
+
+      // ถ้าพบผลลัพธ์ ให้แปลงข้อมูลและส่งกลับไปพร้อมสถานะ 200 OK
+      const adsWithImagePaths = results.map(ad => ({
+        ...ad,
+        image: ad.image ? `/uploads/${ad.image}` : null
+      }));
+
+      res.status(200).json(adsWithImagePaths); // ส่งผลลัพธ์กลับพร้อมสถานะ 200 OK
+    }
+  );
 });
 
 
