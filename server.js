@@ -4669,8 +4669,8 @@ app.post('/api/orders', (req, res) => {
       console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);
       // สร้างโฆษณาแบบ pending (รอจ่ายเงิน)
       const adSql = `
-            INSERT INTO ads (user_id, order_id, title, content, link, image, status, created_at, expiration_date)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, DATE_ADD(?, INTERVAL ? DAY))
+            INSERT INTO ads (user_id, order_id, title, content, link, image, status, show_at, created_at, expiration_date)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW(), DATE_ADD(?, INTERVAL ? DAY))
         `;
       pool.query(adSql, [user_id, order_id, title, content, link || '', image || '', ad_start_date, ad_start_date, duration], (err2) => {
         if (err2) {
