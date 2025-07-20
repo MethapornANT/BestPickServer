@@ -21,7 +21,6 @@ const { PythonShell } = require('python-shell');
 const promptpay = require('promptpay-qr');
 const QRCode = require('qrcode');
 
-
 // Middleware
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -51,7 +50,6 @@ const pool = mysql.createPool({
     ca: fs.readFileSync("./certs/isrgrootx1.pem"), // เพิ่มไฟล์ใบรับรอง
   },
 });
-
 
 // ฟังก์ชันสำหรับการเชื่อมต่อใหม่อัตโนมัติ
 function reconnect() {
@@ -216,6 +214,10 @@ const authorizeAdmin = (req, res, next) => {
   }
 };
 
+
+//########################################################   Register API  #######################################################
+
+
 // Register a new email user or reactivate if deactivated
 app.post("/api/register/email", async (req, res) => {
   try {
@@ -332,6 +334,7 @@ app.post("/api/register/verify-otp", async (req, res) => {
   }
 });
 
+
 // Register User
 app.post("/api/register/set-password", async (req, res) => {
   try {
@@ -353,6 +356,7 @@ app.post("/api/register/set-password", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 // Resend OTP for Registration
 app.post("/api/resend-otp/register", async (req, res) => {
@@ -396,6 +400,7 @@ app.post("/api/resend-otp/register", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 // Forgot Password
 app.post("/api/forgot-password", async (req, res) => {
@@ -445,6 +450,7 @@ app.post("/api/forgot-password", async (req, res) => {
   }
 });
 
+
 // Verify Reset OTP
 app.post("/api/verify-reset-otp", async (req, res) => {
   try {
@@ -476,6 +482,7 @@ app.post("/api/verify-reset-otp", async (req, res) => {
   }
 });
 
+
 // Reset Password
 app.post("/api/reset-password", async (req, res) => {
   try {
@@ -499,6 +506,7 @@ app.post("/api/reset-password", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 // Resend OTP for Reset Password
 app.post("/api/resent-otp/reset-password", async (req, res) => {
@@ -538,6 +546,10 @@ app.post("/api/resent-otp/reset-password", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+
+//########################################################   Login API  #######################################################
+
 
 // Login
 app.post("/api/login", async (req, res) => {
@@ -664,7 +676,6 @@ app.post("/api/set-profile", verifyToken, upload.single('picture'), (req, res) =
 });
 
 
-
 // Google Sign-In with soft delete handling
 app.post("/api/google-signin", async (req, res) => {
   try {
@@ -777,6 +788,8 @@ app.post("/api/google-signin", async (req, res) => {
 });
 
 
+//########################################################   Interactions API  #######################################################
+
 
 // POST /api/interactions - บันทึกการโต้ตอบใหม่
 app.post("/api/interactions", verifyToken, async (req, res) => {
@@ -812,6 +825,7 @@ app.post("/api/interactions", verifyToken, async (req, res) => {
   });
 });
 
+
 // GET /api/interactions - ดึงข้อมูลการโต้ตอบทั้งหมด
 app.get("/api/interactions", verifyToken, async (req, res) => {
   const fetchSql = `
@@ -836,6 +850,7 @@ app.get("/api/interactions", verifyToken, async (req, res) => {
     res.json(results);
   });
 });
+
 
 // GET /api/interactions/user/:userId - ดึงข้อมูลการโต้ตอบของผู้ใช้แต่ละคน
 app.get("/api/interactions/user/:userId", verifyToken, async (req, res) => {
@@ -873,6 +888,7 @@ app.get("/api/interactions/user/:userId", verifyToken, async (req, res) => {
   });
 });
 
+
 // DELETE /api/interactions/:id - ลบข้อมูลการโต้ตอบตาม ID
 app.delete("/api/interactions/:id", verifyToken, async (req, res) => {
   const { id } = req.params;
@@ -897,6 +913,7 @@ app.delete("/api/interactions/:id", verifyToken, async (req, res) => {
     res.json({ message: "Interaction deleted successfully" });
   });
 });
+
 
 // PUT /api/interactions/:id - อัปเดตข้อมูลการโต้ตอบตาม ID
 app.put("/api/interactions/:id", verifyToken, async (req, res) => {
@@ -929,6 +946,7 @@ app.put("/api/interactions/:id", verifyToken, async (req, res) => {
   });
 });
 
+
 function isValidJson(str) {
   try {
     JSON.parse(str);
@@ -937,6 +955,7 @@ function isValidJson(str) {
     return false;
   }
 }
+
 
 // API สำหรับตรวจสอบสถานะการกดไลค์ของผู้ใช้
 app.get("/api/checkLikeStatus/:postId/:userId", verifyToken, (req, res) => {
@@ -977,6 +996,7 @@ app.get("/api/checkLikeStatus/:postId/:userId", verifyToken, (req, res) => {
     res.json({ isLiked });
   });
 });
+
 
 // View All Posts with Token Verification
 app.get("/api/posts", verifyToken, (req, res) => {
@@ -1030,6 +1050,7 @@ app.get("/api/posts", verifyToken, (req, res) => {
   }
 });
 
+
 //update status posts
 app.put("/api/posts/:id/status", verifyToken, (req, res) => {
   const postId = req.params.id;
@@ -1059,7 +1080,6 @@ app.put("/api/posts/:id/status", verifyToken, (req, res) => {
   });
 });
 
-//1 แก้
 
 // View a Single Post with Like and Comment Count and Show Comments
 app.get("/api/posts/:id", verifyToken, (req, res) => {
@@ -1140,6 +1160,7 @@ app.get("/api/posts/:id", verifyToken, (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 // Create a Post
 app.post(
@@ -1276,6 +1297,7 @@ app.put("/api/posts/:id", verifyToken, upload.fields([
   }
 });
 
+
 // Delete a Post
 app.delete("/api/posts/:id", verifyToken, (req, res) => {
   const { id } = req.params;
@@ -1342,7 +1364,6 @@ app.get("/api/type", verifyToken, (req, res) => {
     });
   });
 });
-
 
 
 // API สำหรับกด like หรือ unlike โพสต์
@@ -1456,8 +1477,10 @@ app.post("/api/posts/like/:id", verifyToken, (req, res) => {
   }
 });
 
+
 // Serve static files (uploaded images and videos)
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
 
 // Search API with grouped results by username, and include only the first photo_url
 app.get("/api/search", (req, res) => {
@@ -1769,6 +1792,8 @@ app.get("/api/users/:userId/view-profile", verifyToken, (req, res) => {
   });
 });
 
+
+//update profile
 app.put(
   "/api/users/:userId/profile",
   verifyToken,
@@ -1843,6 +1868,7 @@ app.put(
   }
 );
 
+
 // Helper function to format the birthday for SQL (YYYY-MM-DD)
 function formatDateForSQL(dateString) {
   const dateObj = new Date(dateString);
@@ -1851,6 +1877,7 @@ function formatDateForSQL(dateString) {
   const day = String(dateObj.getDate()).padStart(2, '0'); // Ensure 2 digits
   return `${year}-${month}-${day}`;
 }
+
 
 // API endpoint to follow or unfollow another user
 app.post("/api/users/:userId/follow/:followingId", verifyToken, (req, res) => {
@@ -2058,6 +2085,8 @@ app.delete("/api/posts/:postId/comment/:commentId", verifyToken, (req, res) => {
   });
 });
 
+
+//bookmark
 app.post("/api/posts/:postId/bookmark", verifyToken, (req, res) => {
   const { postId } = req.params; // Extract postId from URL parameters
   const userId = req.userId; // Extract userId from the verified token
@@ -2100,7 +2129,6 @@ app.post("/api/posts/:postId/bookmark", verifyToken, (req, res) => {
   });
 });
 
-//แก้3 ยังไม่ได้เช็ค
 
 // API for fetching user's bookmarked posts
 app.get("/api/bookmarks", verifyToken, (req, res) => {
@@ -2134,8 +2162,6 @@ WHERE b.user_id = ?
 ORDER BY b.created_at DESC;
 
   `;
-
-//แก้3
 
   pool.query(fetchBookmarksSql, [user_id, user_id], (err, results) => {
     if (err) {
@@ -2198,9 +2224,7 @@ ORDER BY b.created_at DESC;
 });
 
 
-
 //########################################################   Notification API  #######################################################
-
 
 
 app.post("/api/notifications", verifyToken, (req, res) => {
@@ -2283,6 +2307,7 @@ app.post("/api/notifications", verifyToken, (req, res) => {
   }
 });
 
+
 app.get("/api/notifications", verifyToken, (req, res) => {
   const userId = req.userId;
 
@@ -2296,6 +2321,7 @@ app.get("/api/notifications", verifyToken, (req, res) => {
     n.content, 
     n.read_status,
     n.created_at,
+    n.ads_id, -- เพิ่มตรงนี้
     s.username AS sender_name,
     s.picture AS sender_picture, 
     p_owner.username AS receiver_name,
@@ -2305,12 +2331,16 @@ app.get("/api/notifications", verifyToken, (req, res) => {
   LEFT JOIN posts p ON n.post_id = p.id
   LEFT JOIN users p_owner ON p.user_id = p_owner.id
   LEFT JOIN comments c ON n.post_id = c.post_id AND n.action_type = 'comment' 
-  WHERE n.action_type IN ('comment', 'like', 'follow')
-    AND p_owner.id = ?
+  WHERE n.action_type IN ('comment', 'like', 'follow', 'ads_status_change')
+    AND (
+      (n.action_type = 'ads_status_change' AND n.user_id = ?) -- สำหรับ noti โฆษณา
+      OR
+      (n.action_type IN ('comment', 'like', 'follow') AND p_owner.id = ?) -- สำหรับ noti โพสต์
+    )
   ORDER BY n.created_at DESC;
   `;
 
-  pool.query(fetchActionNotificationsSql, [userId], (error, results) => {
+  pool.query(fetchActionNotificationsSql, [userId, userId], (error, results) => {
     if (error) {
       console.error("Database error during fetching notifications:", error);
       return res.status(500).json({ error: "Error fetching notifications" });
@@ -2318,6 +2348,7 @@ app.get("/api/notifications", verifyToken, (req, res) => {
     res.json(results);
   });
 });
+
 
 // API สำหรับอัปเดตสถานะการอ่านของ Notification ตาม ID
 app.put("/api/notifications/:id/read", verifyToken, (req, res) => {
@@ -2358,8 +2389,6 @@ app.put("/api/notifications/:id/read", verifyToken, (req, res) => {
 });
 
 
-
-
 // API สำหรับลบ Notification
 app.delete("/api/notifications", verifyToken, (req, res) => {
   const { user_id, post_id, action_type } = req.body;
@@ -2385,6 +2414,9 @@ app.delete("/api/notifications", verifyToken, (req, res) => {
 });
 
 
+//########################################################   Bookmark API  #######################################################
+
+
 // API สำหรับเพิ่มบุ๊คมาร์ค
 app.post("/api/bookmarks", verifyToken, (req, res) => {
   const { post_id } = req.body; // ดึง post_id จาก request body
@@ -2406,6 +2438,7 @@ app.post("/api/bookmarks", verifyToken, (req, res) => {
     res.status(201).json({ message: "Post bookmarked successfully" });
   });
 });
+
 
 // API สำหรับลบบุ๊คมาร์ค
 app.delete("/api/bookmarks", verifyToken, (req, res) => {
@@ -2432,6 +2465,7 @@ app.delete("/api/bookmarks", verifyToken, (req, res) => {
     res.json({ message: "Bookmark deleted successfully" });
   });
 });
+
 
 // API สำหรับดึงรายการบุ๊คมาร์คของผู้ใช้
 app.get("/api/bookmarks", verifyToken, (req, res) => {
@@ -2463,6 +2497,7 @@ app.get("/api/bookmarks", verifyToken, (req, res) => {
   });
 });
 
+//check bookmark status
 app.get("/api/posts/:postId/bookmark/status", verifyToken, (req, res) => {
   const { postId } = req.params; // Extract postId from URL parameters
   const userId = req.userId; // Extract userId from the verified token
@@ -2486,8 +2521,6 @@ app.get("/api/posts/:postId/bookmark/status", verifyToken, (req, res) => {
 // API to get posts from followed users
 app.get("/api/following/posts", verifyToken, (req, res) => {
   const userId = req.userId; // The logged-in user who is following others
-
-//แก้4
 
   const getFollowedPostsSql = `
     SELECT 
@@ -2545,8 +2578,8 @@ app.get("/api/following/posts", verifyToken, (req, res) => {
   });
 });
 
-//########################################################   Report API  ########################################################
 
+//########################################################   Report API  ########################################################
 
 
 // API for reporting a post
@@ -2575,6 +2608,7 @@ app.post("/api/posts/:postId/report", verifyToken, (req, res) => {
     res.status(201).json({ message: "Post reported successfully" });
   });
 });
+
 
 // API for retrieving all reported posts (admin-only)
 app.get("/api/reports", verifyToken, (req, res) => {
@@ -2657,6 +2691,7 @@ app.delete("/api/users/:id", verifyToken, (req, res) => {
 //########################################################   Follow API  ########################################################
 
 
+//get following
 app.get("/api/users/following/:userId", (req, res) => {
   // ดึง userId จาก request parameter
   const { userId } = req.params;
@@ -2692,6 +2727,7 @@ app.get("/api/users/following/:userId", (req, res) => {
   });
 });
 
+//get followers
 app.get("/api/users/followers/:userId", (req, res) => {
   // ดึง userId จาก request parameter
   const { userId } = req.params;
@@ -2729,6 +2765,7 @@ app.get("/api/users/followers/:userId", (req, res) => {
 });
 
 
+//search following
 app.get("/api/users/search/following", verifyToken, (req, res) => {
   const { query } = req.query; // รับคำค้นหาจาก query parameter
   const followerId = req.userId; // รับ follower_id จาก token ของผู้ใช้ที่ล็อกอิน
@@ -2759,7 +2796,6 @@ app.get("/api/users/search/following", verifyToken, (req, res) => {
     res.status(200).json(results || []);
   });
 });
-
 
 
 app.get("/api/users/search/followers", verifyToken, (req, res) => {
@@ -2884,6 +2920,7 @@ app.post("/api/admin/login", async (req, res) => {
   }
 });
 
+
 // Admin Dashboard: New Users per Day and Total Posts per Day
 app.get("/api/admin/dashboard", authenticateToken, authorizeAdmin, (req, res) => {
   // Query to get new users count per day and total users
@@ -2928,6 +2965,7 @@ app.get("/api/admin/dashboard", authenticateToken, authorizeAdmin, (req, res) =>
   });
 });
 
+
 // Fetch All Active Ads in Random Order
 app.get("/api/ads/random", (req, res) => {
   const fetchRandomAdsSql = `
@@ -2948,9 +2986,9 @@ app.get("/api/ads/random", (req, res) => {
 
 
 // --- NEW: Admin API for Ad Approval/Rejection ---
-app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, (req, res) => {
+app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, upload.single('admin_slip'), (req, res) => {
   const adId = req.params.adId;
-  const { action, admin_notes, package_duration_days } = req.body; // package_duration_days สำหรับ 'approve'
+  const { action, admin_notes } = req.body; // ไม่ต้องใช้ package_duration_days แล้ว
 
   if (!action || (action !== 'approve' && action !== 'reject')) {
       return res.status(400).json({ message: "Invalid action. Must be 'approve' or 'reject'." });
@@ -2969,7 +3007,7 @@ app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, (req,
               return res.status(500).json({ error: 'Failed to start transaction.' });
           }
 
-          const fetchAdSql = "SELECT id, order_id, status FROM ads WHERE id = ?";
+          const fetchAdSql = "SELECT id, order_id, status, user_id FROM ads WHERE id = ?";
           connection.query(fetchAdSql, [adId], (err, adResults) => {
               if (err) {
                   return connection.rollback(() => {
@@ -2987,40 +3025,26 @@ app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, (req,
 
               const ad = adResults[0];
 
-              if (ad.status !== 'paid') {
-                  return connection.rollback(() => {
-                      connection.release();
-                      res.status(400).json({ message: `Ad status is '${ad.status}'. Only 'paid' ads can be processed.` });
-                  });
-              }
-
               let updateAdSql = "";
               let updateAdParams = [];
               let adNewStatus = "";
+              let admin_slip = null;
 
               if (action === 'approve') {
-                  if (!package_duration_days || typeof package_duration_days !== 'number' || package_duration_days <= 0) {
-                      return connection.rollback(() => {
-                          connection.release();
-                          res.status(400).json({ message: 'package_duration_days is required and must be a positive number for approval.' });
-                      });
-                  }
-                  adNewStatus = 'active'; // เปลี่ยนเป็น 'active' เมื่ออนุมัติ
-                  // expiration_date จะนับจากวันที่อนุมัติ (CURRENT_DATE()) + จำนวนวันของ package
-                  const expirationDateSql = `DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY)`;
-                  updateAdSql = `UPDATE ads SET status = ?, expiration_date = ${expirationDateSql}, updated_at = NOW(), admin_notes = ? WHERE id = ?`;
-                  updateAdParams = [adNewStatus, package_duration_days, admin_notes || null, adId];
-
+                  adNewStatus = 'active';
+                  updateAdSql = `UPDATE ads SET status = ?, updated_at = NOW(), admin_notes = ? WHERE id = ?`;
+                  updateAdParams = [adNewStatus, admin_notes || null, adId];
               } else if (action === 'reject') {
-                  if (!admin_notes) {
+                  admin_slip = req.file ? req.file.filename : null;
+                  if (!admin_notes || !admin_slip) {
                       return connection.rollback(() => {
                           connection.release();
-                          res.status(400).json({ message: 'admin_notes are required for rejection.' });
+                          res.status(400).json({ message: 'กรุณาแนบเหตุผลและสลิปคืนเงิน' });
                       });
                   }
                   adNewStatus = 'rejected';
-                  updateAdSql = "UPDATE ads SET status = ?, expiration_date = NULL, updated_at = NOW(), admin_notes = ? WHERE id = ?";
-                  updateAdParams = [adNewStatus, admin_notes, adId];
+                  updateAdSql = "UPDATE ads SET status = ?, updated_at = NOW(), admin_notes = ?, admin_slip = ? WHERE id = ?";
+                  updateAdParams = [adNewStatus, admin_notes, admin_slip, adId];
               }
 
               connection.query(updateAdSql, updateAdParams, (err, adUpdateResult) => {
@@ -3032,17 +3056,10 @@ app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, (req,
                       });
                   }
 
-                  // Also update the order status if the ad is approved/rejected.
-                  // For simplicity, let's assume 'approved' leads to 'completed' and 'rejected' leads to 'refund_pending' or similar.
-                  // You might need to adjust these statuses based on your exact business flow.
-                  let orderNewStatus;
-                  if (action === 'approve') {
-                      orderNewStatus = 'completed'; // หรือ 'ad_approved'
-                  } else if (action === 'reject') {
-                      orderNewStatus = 'ad_rejected'; // หรือ 'refund_pending'
-                  }
+                  // update order status ให้ตรงกับ ads status
+                  let orderNewStatus = adNewStatus;
 
-                  const updateOrderStatusSql = "UPDATE orders SET order_status = ?, updated_at = NOW() WHERE id = ?";
+                  const updateOrderStatusSql = "UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?";
                   const updateOrderStatusParams = [orderNewStatus, ad.order_id];
 
                   connection.query(updateOrderStatusSql, updateOrderStatusParams, (err, orderUpdateResult) => {
@@ -3053,8 +3070,21 @@ app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, (req,
                               res.status(500).json({ error: 'Failed to update order status.' });
                           });
                       }
-                      
-                      connection.commit(commitErr => {
+
+                      // --- แจ้งเตือน user ---
+                      let notifyContent = '';
+                      if (action === 'approve') {
+                        notifyContent = 'โฆษณาของคุณได้รับการอนุมัติแล้ว';
+                      } else if (action === 'reject') {
+                        notifyContent = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${admin_notes}`;
+                      }
+                      const insertNotificationSql = `INSERT INTO notifications (user_id, action_type, content, ads_id) VALUES (?, 'ads_status_change', ?, ?)`;
+                      connection.query(insertNotificationSql, [ad.user_id, notifyContent, ad.id], (notifyErr) => {
+                        if (notifyErr) {
+                          // log error แต่ไม่ rollback transaction หลัก
+                          console.error('Notification error:', notifyErr);
+                        }
+                        connection.commit(commitErr => {
                           if (commitErr) {
                               connection.rollback(() => {
                                   connection.release();
@@ -3065,6 +3095,7 @@ app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, (req,
                               connection.release();
                               res.status(200).json({ message: `Ad ID ${adId} ${action} successfully.`, new_status: adNewStatus });
                           }
+                        });
                       });
                   });
               });
@@ -3073,8 +3104,10 @@ app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, (req,
   });
 });
 
+
 // Serve images from the uploads directory
 app.use('/api/uploads', express.static('uploads'));
+
 
 // Create an Ad (Admin only)
 app.post("/api/ads", authenticateToken, authorizeAdmin, upload.single("image"), (req, res) => {
@@ -3106,6 +3139,7 @@ app.post("/api/ads", authenticateToken, authorizeAdmin, upload.single("image"), 
       res.status(201).json({ message: "Ad created successfully", ad_id: results.insertId });
   });
 });
+
 
 // สร้าง API สำหรับอัปเดตข้อมูล
 app.put('/api/ads/:id', authenticateToken, authorizeAdmin, upload.single('image'), (req, res) => {
@@ -3162,6 +3196,7 @@ app.put('/api/ads/:id', authenticateToken, authorizeAdmin, upload.single('image'
   });
 });
 
+
 // Delete an Ad (Admin only)
 app.delete("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
@@ -3200,6 +3235,7 @@ app.delete("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
   });
 });
 
+
 // Get All Ads (Admin only) - ควรใช้ authenticateToken, authorizeAdmin
 app.get("/api/ads", authenticateToken, authorizeAdmin, (req, res) => {
   const fetchAdsSql = `
@@ -3217,6 +3253,7 @@ app.get("/api/ads", authenticateToken, authorizeAdmin, (req, res) => {
     res.json(results);
   });
 });
+
 
 // Get Ad by ID (Admin only) - ควรใช้ authenticateToken, authorizeAdmin
 app.get("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3236,6 +3273,7 @@ app.get("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
       res.json(results[0]);
   });
 });
+
 
 // Serve Ad Image by ID (Admin only) - ควรใช้ authenticateToken, authorizeAdmin
 app.get("/api/ads/:id/image", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3261,6 +3299,7 @@ app.get("/api/ads/:id/image", authenticateToken, authorizeAdmin, (req, res) => {
   });
 });
 
+
 // ดึงข้อมูลผู้ใช้ทั้งหมด (Admin only)
 app.get("/api/admin/users", authenticateToken, authorizeAdmin, (req, res) => {
   const fetchUsersSql = "SELECT * FROM users";
@@ -3272,6 +3311,7 @@ app.get("/api/admin/users", authenticateToken, authorizeAdmin, (req, res) => {
       res.json(results);
   });
 });
+
 
 // ดึงข้อมูลผู้ใช้โดย ID (Admin only)
 app.get("/api/admin/users/:id", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3289,27 +3329,29 @@ app.get("/api/admin/users/:id", authenticateToken, authorizeAdmin, (req, res) =>
   });
 });
 
+
 // Edit user status by admin (Admin only)
 app.put("/api/admin/users/:id/status", authenticateToken, authorizeAdmin, (req, res) => {
-    const { id } = req.params;
-    const { status } = req.body;
+   const { id } = req.params;
+   const { status } = req.body;
   
-    if (!status) {
-        return res.status(400).json({ error: "Status is required" });
-    }
-    // Removed updated_at from the SQL query
-    const updateStatusSql = "UPDATE users SET status = ? WHERE id = ?";
-    pool.query(updateStatusSql, [status, id], (err, results) => {
-        if (err) {
-            console.error("Database error during user status update:", err);
-            return res.status(500).json({ error: "Error updating user status" });
-        }
-        if (results.affectedRows === 0) {
-            return res.status(404).json({ error: "User not found" });
-        }
-        res.json({ message: "User status updated successfully" });
-    });
-  });
+   if (!status) {
+       return res.status(400).json({ error: "Status is required" });
+   }
+   // Removed updated_at from the SQL query
+   const updateStatusSql = "UPDATE users SET status = ? WHERE id = ?";
+   pool.query(updateStatusSql, [status, id], (err, results) => {
+       if (err) {
+           console.error("Database error during user status update:", err);
+           return res.status(500).json({ error: "Error updating user status" });
+       }
+       if (results.affectedRows === 0) {
+           return res.status(404).json({ error: "User not found" });
+       }
+       res.json({ message: "User status updated successfully" });
+   });
+});
+
 
 // Soft Delete a User, Hard Delete their Posts, and Delete Follows (Admin-Only)
 app.delete("/api/admin/users/:id", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3391,6 +3433,7 @@ app.delete("/api/admin/users/:id", authenticateToken, authorizeAdmin, (req, res)
   });
 });
 
+
 // Get all posts (Admin only)
 app.get("/api/admin/posts", authenticateToken, authorizeAdmin, (req, res) => {
   const fetchPostsSql = "SELECT * FROM posts ORDER BY created_at DESC"; // เพิ่ม ORDER BY
@@ -3402,6 +3445,7 @@ app.get("/api/admin/posts", authenticateToken, authorizeAdmin, (req, res) => {
       res.json(results);
   });
 });
+
 
 // Get post by ID (Admin only)
 app.get("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3418,6 +3462,7 @@ app.get("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) =>
       res.json(results[0]);
   });
 });
+
 
 // Update post status by admin (Admin only)
 app.put("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3456,6 +3501,7 @@ app.put("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) =>
       res.json({ message: "Post updated successfully" });
   });
 });
+
 
 // Delete post by admin (Admin only)
 app.delete("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3521,6 +3567,7 @@ app.delete("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res)
       });
   });
 });
+
 
 // Get all reported posts (Admin only)
 app.get("/api/admin/reported-posts", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3705,6 +3752,7 @@ app.put("/api/admin/reports/:reportId", authenticateToken, authorizeAdmin, (req,
   });
 });
 
+
 // Get All Categories (Admin only)
 app.get('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
   const fetchCategoriesSql = 'SELECT * FROM category ORDER BY CategoryID ASC';
@@ -3716,6 +3764,7 @@ app.get('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
       res.json(results);
   });
 });
+
 
 // Create a Category (Admin only)
 app.post('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
@@ -3734,6 +3783,7 @@ app.post('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
       res.status(201).json({ message: "Category created successfully", categoryId: results.insertId });
   });
 });
+
 
 // Update a Category (Admin only)
 app.put('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) => {
@@ -3757,6 +3807,7 @@ app.put('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) => 
   });
 });
 
+
 // Delete a Category (Admin only)
 app.delete('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
@@ -3773,6 +3824,7 @@ app.delete('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) 
       res.json({ message: "Category deleted successfully" });
   });
 });
+
 
 // API สำหรับแอดมินในการอัปเดตสถานะโพสต์เป็น 'deactivate' และลบรายงานที่เกี่ยวข้อง
 app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req, res) => {
@@ -3842,6 +3894,7 @@ app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req,
 //########################################################   Admin Search API  ########################################################
 
 
+//search ads
 app.get('/api/admin/search/ads', authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
@@ -3897,6 +3950,8 @@ app.get('/api/admin/search/ads', authenticateToken, (req, res) => {
   );
 });
 
+
+//search users
 app.get('/api/admin/search/users', authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
@@ -3968,6 +4023,8 @@ app.get('/api/admin/search/users', authenticateToken, (req, res) => {
   );
 });
 
+
+//search posts
 app.get('/api/admin/search/posts', authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
@@ -4030,6 +4087,8 @@ app.get('/api/admin/search/posts', authenticateToken, (req, res) => {
   );
 });
 
+
+//search reports
 app.get('/api/admin/search/reports', authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
@@ -4104,6 +4163,7 @@ app.get('/api/admin/search/reports', authenticateToken, (req, res) => {
   );
 });
 
+
 //########################################################   Message  API  ########################################################
 
 
@@ -4144,6 +4204,7 @@ app.post('/api/users/:userId/follow/:followingId', (req, res) => {
         });
     });
 });
+
 
 // API สร้าง Match จากการ Follow (เรียกแยกได้ถ้าต้องการ)
 app.post('/api/create-match-on-follow', (req, res) => {
@@ -4210,6 +4271,7 @@ app.post('/api/create-match-on-follow', (req, res) => {
     });
 });
 
+
 // API Get Matches - แสดงรายการ chat ของ user
 app.get('/api/matches/:userID', (req, res) => {
     const { userID } = req.params;
@@ -4263,6 +4325,8 @@ app.get('/api/matches/:userID', (req, res) => {
     });
 });
 
+
+//get chats
 app.get('/api/chats/:matchID', (req, res) => {
     const { matchID } = req.params;
 
@@ -4295,6 +4359,7 @@ app.get('/api/chats/:matchID', (req, res) => {
         return res.status(200).json({ messages: results }); // <--- ตรงนี้
     });
 });
+
 
 // API Send Chat Message
 app.post('/api/chats/:matchID', (req, res) => {
@@ -4358,6 +4423,7 @@ app.post('/api/chats/:matchID', (req, res) => {
     });
 });
 
+
 // API Delete Chat (ซ่อน chat ฝั่งเดียว)
 app.post('/api/delete-chat', (req, res) => {
     const { userID, matchID } = req.body;
@@ -4380,6 +4446,7 @@ app.post('/api/delete-chat', (req, res) => {
         res.status(200).json({ success: 'Chat deleted successfully' });
     });
 });
+
 
 // API Restore All Chats
 app.post('/api/restore-all-chats', (req, res) => {
@@ -4405,6 +4472,7 @@ app.post('/api/restore-all-chats', (req, res) => {
         });
     });
 });
+
 
 // API Block Chat
 app.post('/api/block-chat', (req, res) => {
@@ -4477,6 +4545,7 @@ app.post('/api/block-chat', (req, res) => {
     });
 });
 
+
 // API Unblock Chat
 app.post('/api/unblock-chat', (req, res) => {
     const { userID, matchID } = req.body;
@@ -4506,6 +4575,8 @@ app.post('/api/unblock-chat', (req, res) => {
     });
 });
 
+
+//check block status
 app.post('/api/check-block-status', (req, res) => {
     const { matchID, userID } = req.body;
     
@@ -4551,13 +4622,25 @@ app.get('/api/ad-packages', (req, res) => {
   });
 });
 
+
 // POST /api/orders
 app.post('/api/orders', (req, res) => {
   console.log('[INFO] Received POST /api/orders request');
-  const { user_id, package_id, title, content, link, image, prompay_number } = req.body; // Add prompay_number
+  const { user_id, package_id, title, content, link, image, prompay_number, ad_start_date } = req.body; // Add prompay_number
   if (!user_id || !package_id || !title || !content || !prompay_number) { // Make prompay_number mandatory
     console.warn('[WARN] Missing required fields for order creation.');
     return res.status(400).json({ error: 'Missing required fields (user_id, package_id, title, content, prompay_number)' });
+  }
+  // ตรวจสอบ ad_start_date
+  if (!ad_start_date) {
+    return res.status(400).json({ error: 'กรุณาเลือกวันที่ต้องการลงโฆษณา' });
+  }
+  const today = new Date();
+  const minDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 2);
+  const userDate = new Date(ad_start_date);
+
+  if (userDate < minDate) {
+    return res.status(400).json({ error: 'วันที่เริ่มโฆษณาต้องถัดจากวันนี้อย่างน้อย 2 วัน' });
   }
   // ดึงข้อมูล package
   pool.query('SELECT * FROM ad_packages WHERE package_id = ?', [package_id], (err, pkg) => {
@@ -4574,7 +4657,7 @@ app.post('/api/orders', (req, res) => {
     // สร้าง order
     // เพิ่ม prompay_number ใน SQL query และ VALUES
     const sql = `
-          INSERT INTO orders (user_id, amount, order_status, created_at, updated_at, prompay_number)
+          INSERT INTO orders (user_id, amount, status, created_at, updated_at, prompay_number)
           VALUES (?, ?, 'pending', NOW(), NOW(), ?)
       `;
     pool.query(sql, [user_id, amount, prompay_number], (err, result) => { // เพิ่ม prompay_number ที่นี่
@@ -4587,9 +4670,9 @@ app.post('/api/orders', (req, res) => {
       // สร้างโฆษณาแบบ pending (รอจ่ายเงิน)
       const adSql = `
             INSERT INTO ads (user_id, order_id, title, content, link, image, status, created_at, expiration_date)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, DATE_ADD(?, INTERVAL ? DAY))
         `;
-      pool.query(adSql, [user_id, order_id, title, content, link || '', image || '', duration], (err2) => {
+      pool.query(adSql, [user_id, order_id, title, content, link || '', image || '', ad_start_date, ad_start_date, duration], (err2) => {
         if (err2) {
           console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
           return res.status(500).json({ error: 'Database error (ads)' });
@@ -4600,6 +4683,7 @@ app.post('/api/orders', (req, res) => {
     });
   });
 });
+
 
 // GET /api/orders/:orderId
 app.get('/api/orders/:orderId', (req, res) => {
@@ -4625,6 +4709,7 @@ app.get('/api/orders/:orderId', (req, res) => {
   });
 });
 
+
 // POST /api/orders/:orderId/upload-slip
 app.post('/api/orders/:orderId/upload-slip', upload.single('slip_image'), (req, res) => { // เปลี่ยน 'slip' เป็น 'slip_image'
   const { orderId } = req.params;
@@ -4645,35 +4730,6 @@ app.post('/api/orders/:orderId/upload-slip', upload.single('slip_image'), (req, 
   });
 });
 
-// PUT /api/ads/:adId/approve
-app.put('/api/ads/:adId/approve', (req, res) => {
-  const { adId } = req.params;
-  console.log(`[INFO] Received PUT /api/ads/${adId}/approve request.`);
-  // เปลี่ยน status เป็น 'approved' ตามที่แนะนำ
-  pool.query('UPDATE ads SET status = "approved" WHERE id = ?', [adId], (err, result) => {
-      if (err) {
-          console.error(`[ERROR] Database error approving ad ${adId}:`, err);
-          return res.status(500).json({ error: 'Database error' });
-      }
-      console.log(`[INFO] Ad ID ${adId} approved successfully.`);
-      res.json({ message: 'Ad approved' });
-  });
-});
-
-// PUT /api/ads/:adId/reject
-app.put('/api/ads/:adId/reject', (req, res) => {
-  const { adId } = req.params;
-  console.log(`[INFO] Received PUT /api/ads/${adId}/reject request.`);
-  // เปลี่ยน status เป็น 'rejected' ตามที่แนะนำ
-  pool.query('UPDATE ads SET status = "rejected" WHERE id = ?', [adId], (err, result) => {
-      if (err) {
-          console.error(`[ERROR] Database error rejecting ad ${adId}:`, err);
-          return res.status(500).json({ error: 'Database error' });
-      }
-      console.log(`[INFO] Ad ID ${adId} rejected successfully.`);
-      res.json({ message: 'Ad rejected' });
-  });
-});
 
 // GET /api/ads
 app.get('/api/ads', (req, res) => {
@@ -4691,8 +4747,75 @@ app.get('/api/ads', (req, res) => {
 
 //########################################################   End API  ########################################################
 
+
 // Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
+
+app.post("/api/ads/:id/notify-status-change", verifyToken, (req, res) => {
+  const adId = req.params.id;
+  const { new_status, admin_notes } = req.body;
+
+  // ดึงข้อมูล ads
+  const getAdSql = `SELECT * FROM ads WHERE id = ?`;
+  pool.query(getAdSql, [adId], (adErr, adResults) => {
+    if (adErr || adResults.length === 0) {
+      return res.status(404).json({ error: "ไม่พบโฆษณานี้" });
+    }
+    const ad = adResults[0];
+
+    // สร้างข้อความแจ้งเตือน
+    let content = `โฆษณาของคุณ (${ad.title}) มีการเปลี่ยนสถานะเป็น "${new_status}"`;
+    if (new_status === "rejected" && admin_notes) {
+      content += `\nเหตุผลที่ถูกปฏิเสธ: ${admin_notes}`;
+    }
+
+    // เพิ่ม notification
+    const insertNotificationSql = `
+      INSERT INTO notifications (user_id, action_type, content)
+      VALUES (?, ?, ?)
+    `;
+    pool.query(
+      insertNotificationSql,
+      [ad.user_id, "ads_status_change", content],
+      (notiErr, notiResults) => {
+        if (notiErr) {
+          return res.status(500).json({ error: "บันทึกแจ้งเตือนไม่สำเร็จ" });
+        }
+        res.status(201).json({ message: "แจ้งเตือนสถานะโฆษณาสำเร็จ" });
+      }
+    );
+  });
+});
+
+// ฟังก์ชันสำหรับสร้าง notification เมื่อ ads เปลี่ยนสถานะ
+function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
+  pool.query('SELECT user_id FROM ads WHERE id = ?', [adId], (err, results) => {
+    if (err || results.length === 0) return callback(err || new Error('Ad not found'));
+    const { user_id } = results[0];
+    let content = '';
+    switch (newStatus) {
+      case 'approved':
+        content = 'โฆษณาของคุณได้รับการอนุมัติแล้ว';
+        break;
+      case 'rejected':
+        content = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${adminNotes || '-'}`;
+        break;
+      case 'paid':
+        content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว';
+        break;
+      case 'expired':
+        content = 'โฆษณาของคุณหมดอายุแล้ว';
+        break;
+      default:
+        content = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${newStatus}`;
+    }
+    pool.query(
+      `INSERT INTO notifications (user_id, action_type, content) VALUES (?, 'ads_status_change', ?)`,
+      [user_id, content],
+      callback
+    );
+  });
+}
