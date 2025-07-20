@@ -64,7 +64,7 @@ def find_order_by_id(order_id, conn=None):
         'id': order.id,
         'user_id': order.user_id,
         'amount': order.amount,
-        'order_status': order.order_status,
+        'status': order.status,
         'promptpay_qr_payload': order.promptpay_qr_payload
     }
 
@@ -78,11 +78,11 @@ def find_ad_by_order_id(order_id, conn=None):
         'expiration_date': ad.expiration_date
     }
 
-def update_order_status_and_slip_info(order_id, new_status, slip_image_path, slip_transaction_id, conn=None):
+def update_status_and_slip_info(order_id, new_status, slip_image_path, slip_transaction_id, conn=None):
     order = Order.query.filter_by(id=order_id).first()
     if not order:
         return False
-    order.order_status = new_status
+    order.status = new_status
     order.slip_image = slip_image_path
     order.updated_at = datetime.now()
     try:
@@ -192,8 +192,8 @@ def verify_payment_and_update_status(order_id, slip_image_path, payload_from_cli
         if not order:
             print(f"❌ Error: Order ID {order_id} not found.")
             return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
-        if order["order_status"] != 'pending':
-            print(f"❌ Error: Order ID {order_id} is not pending. Current status: {order['order_status']}.")
+        if order["status"] != 'pending':
+            print(f"❌ Error: Order ID {order_id} is not pending. Current status: {order['status']}.")
             return {"success": False, "message": "คำสั่งซื้อนี้ดำเนินการไปแล้วหรือสถานะไม่ถูกต้อง"}
         # Check if an Ad already exists and its status
         ad = find_ad_by_order_id(order_id)
@@ -262,7 +262,7 @@ def verify_payment_and_update_status(order_id, slip_image_path, payload_from_cli
     # --- เริ่มต้น Transaction เพื่ออัปเดตฐานข้อมูล ---
     try:
         # 1. อัปเดตสถานะ Order เป็น 'paid' พร้อมบันทึก Slip ID
-        if not update_order_status_and_slip_info(order_id, "paid", slip_image_path, slip_transaction_id_from_api):
+        if not update_status_and_slip_info(order_id, "paid", slip_image_path, slip_transaction_id_from_api):
             raise Exception("Failed to update order status and slip info.")
         # 2. สร้างหรืออัปเดต Ad
         ad_id = None
@@ -352,7 +352,7 @@ class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, nullable=False)
     amount = db.Column(db.Numeric(10,2), nullable=False)
-    order_status = db.Column(db.Enum('pending', 'paid', 'cancelled'), nullable=False, default='pending')
+    status = db.Column(db.Enum('pending', 'paid', 'cancelled'), nullable=False, default='pending')
     slip_image = db.Column(db.String(255))
     created_at = db.Column(db.DateTime)
     updated_at = db.Column(db.DateTime)
