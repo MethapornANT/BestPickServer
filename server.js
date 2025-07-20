@@ -4554,49 +4554,50 @@ app.get('/api/ad-packages', (req, res) => {
 // POST /api/orders
 app.post('/api/orders', (req, res) => {
   console.log('[INFO] Received POST /api/orders request');
-  const { user_id, package_id, title, content, link, image } = req.body;
-  if (!user_id || !package_id || !title || !content) {
-      console.warn('[WARN] Missing required fields for order creation.');
-      return res.status(400).json({ error: 'Missing required fields' });
+  const { user_id, package_id, title, content, link, image, prompay_number } = req.body; // Add prompay_number
+  if (!user_id || !package_id || !title || !content || !prompay_number) { // Make prompay_number mandatory
+    console.warn('[WARN] Missing required fields for order creation.');
+    return res.status(400).json({ error: 'Missing required fields (user_id, package_id, title, content, prompay_number)' });
   }
   // ดึงข้อมูล package
   pool.query('SELECT * FROM ad_packages WHERE package_id = ?', [package_id], (err, pkg) => {
-      if (err) {
-          console.error('[ERROR] Database error fetching package:', err);
-          return res.status(500).json({ error: 'Database error' });
-      }
-      if (pkg.length === 0) {
-          console.warn(`[WARN] Invalid package_id: ${package_id}`);
-          return res.status(400).json({ error: 'Invalid package' });
-      }
-      const amount = pkg[0].price;
-      const duration = pkg[0].duration_days;
-      // สร้าง order
-      const sql = `
-          INSERT INTO orders (user_id, amount, order_status, created_at, updated_at)
-          VALUES (?, ?, 'pending', NOW(), NOW())
+    if (err) {
+      console.error('[ERROR] Database error fetching package:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    if (pkg.length === 0) {
+      console.warn(`[WARN] Invalid package_id: ${package_id}`);
+      return res.status(400).json({ error: 'Invalid package' });
+    }
+    const amount = pkg[0].price;
+    const duration = pkg[0].duration_days;
+    // สร้าง order
+    // เพิ่ม prompay_number ใน SQL query และ VALUES
+    const sql = `
+          INSERT INTO orders (user_id, amount, order_status, created_at, updated_at, prompay_number)
+          VALUES (?, ?, 'pending', NOW(), NOW(), ?)
       `;
-      pool.query(sql, [user_id, amount], (err, result) => {
-          if (err) {
-              console.error('[ERROR] Database error creating order:', err);
-              return res.status(500).json({ error: 'Database error' });
-          }
-          const order_id = result.insertId;
-          console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);
-          // สร้างโฆษณาแบบ pending (รอจ่ายเงิน)
-          const adSql = `
-              INSERT INTO ads (user_id, order_id, title, content, link, image, status, created_at, expiration_date)
-              VALUES (?, ?, ?, ?, ?, ?, 'pending', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))
-          `;
-          pool.query(adSql, [user_id, order_id, title, content, link || '', image || '', duration], (err2) => {
-              if (err2) {
-                  console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
-                  return res.status(500).json({ error: 'Database error (ads)' });
-              }
-              console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
-              res.status(201).json({ order_id, amount, duration });
-          });
+    pool.query(sql, [user_id, amount, prompay_number], (err, result) => { // เพิ่ม prompay_number ที่นี่
+      if (err) {
+        console.error('[ERROR] Database error creating order:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      const order_id = result.insertId;
+      console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);
+      // สร้างโฆษณาแบบ pending (รอจ่ายเงิน)
+      const adSql = `
+            INSERT INTO ads (user_id, order_id, title, content, link, image, status, created_at, expiration_date)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))
+        `;
+      pool.query(adSql, [user_id, order_id, title, content, link || '', image || '', duration], (err2) => {
+        if (err2) {
+          console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
+          return res.status(500).json({ error: 'Database error (ads)' });
+        }
+        console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
+        res.status(201).json({ order_id, amount, duration });
       });
+    });
   });
 });
 
