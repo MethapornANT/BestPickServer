@@ -49,7 +49,7 @@ def find_order_by_id(order_id, conn=None):
     
     cursor = conn.cursor(dictionary=True)
     try:
-        query = "SELECT id, user_id, amount, order_status, promptpay_qr_payload FROM orders WHERE id = %s"
+        query = "SELECT id, user_id, amount, status, promptpay_qr_payload FROM orders WHERE id = %s"
         cursor.execute(query, (order_id,))
         order = cursor.fetchone()
         return order
@@ -58,8 +58,6 @@ def find_order_by_id(order_id, conn=None):
         return None
     finally:
         cursor.close()
-        if close_conn and conn.is_connected():
-            conn.close()
 
 def find_ad_by_order_id(order_id, conn=None):
     close_conn = False
@@ -79,15 +77,13 @@ def find_ad_by_order_id(order_id, conn=None):
         return None
     finally:
         cursor.close()
-        if close_conn and conn.is_connected():
-            conn.close()
 
-def update_order_status_and_slip_info(order_id, new_status, slip_image_path, conn):
+def update_status_and_slip_info(order_id, new_status, slip_image_path, conn):
     cursor = conn.cursor()
     try:
         query = """
             UPDATE orders
-            SET order_status = %s, slip_image = %s, updated_at = NOW()
+            SET status = %s, slip_image = %s, updated_at = NOW()
             WHERE id = %s
         """
         cursor.execute(query, (new_status, slip_image_path, order_id))
@@ -138,8 +134,6 @@ def update_order_with_promptpay_payload_db(order_id, payload_to_store_in_db, con
         return False
     finally:
         cursor.close()
-        if close_conn and conn.is_connected():
-            conn.close()
 
 def create_advertisement_db(order_data, conn):
     cursor = conn.cursor()
@@ -222,9 +216,10 @@ def verify_payment_and_update_status(order_id, slip_image_path, payload_from_cli
             print(f"❌ Error: Order ID {order_id} not found.")
             return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
         
-        if order["order_status"] != 'pending':
-            print(f"❌ Error: Order ID {order_id} is not pending. Current status: {order['order_status']}.")
-            return {"success": False, "message": "คำสั่งซื้อนี้ดำเนินการไปแล้วหรือสถานะไม่ถูกต้อง"}
+        print("DEBUG: order =", order)
+        if order["status"] != 'approved':
+            print(f"❌ Error: Order ID {order_id} is not approved. Current status: {order['status']}.")
+            return {"success": False, "message": "ไม่สามารถอัปโหลดสลิปได้ ต้องรอให้แอดมินอนุมัติก่อน"}
         
         # Check if an Ad already exists and its status
         ad = find_ad_by_order_id(order_id)
@@ -309,7 +304,7 @@ def verify_payment_and_update_status(order_id, slip_image_path, payload_from_cli
         conn.start_transaction()
         
         # 1. อัปเดตสถานะ Order เป็น 'paid' พร้อมบันทึก Slip ID
-        if not update_order_status_and_slip_info(order_id, "paid", slip_image_path, slip_transaction_id_from_api, conn):
+        if not update_status_and_slip_info(order_id, "paid", slip_image_path, slip_transaction_id_from_api, conn):
             raise Exception("Failed to update order status and slip info.")
         
         # 2. สร้างหรืออัปเดต Ad

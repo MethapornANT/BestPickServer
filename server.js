@@ -2414,6 +2414,77 @@ app.delete("/api/notifications", verifyToken, (req, res) => {
 });
 
 
+app.post("/api/ads/:id/notify-status-change", verifyToken, (req, res) => {
+  const adId = req.params.id;
+  const { new_status, admin_notes } = req.body;
+
+  // ดึงข้อมูล ads
+  const getAdSql = `SELECT * FROM ads WHERE id = ?`;
+  pool.query(getAdSql, [adId], (adErr, adResults) => {
+    if (adErr || adResults.length === 0) {
+      return res.status(404).json({ error: "ไม่พบโฆษณานี้" });
+    }
+    const ad = adResults[0];
+
+    // สร้างข้อความแจ้งเตือน
+    let content = `โฆษณาของคุณ (${ad.title}) มีการเปลี่ยนสถานะเป็น "${new_status}"`;
+    if (new_status === "rejected" && admin_notes) {
+      content += `\nเหตุผลที่ถูกปฏิเสธ: ${admin_notes}`;
+    }
+
+    // เพิ่ม notification
+    const insertNotificationSql = `
+      INSERT INTO notifications (user_id, action_type, content)
+      VALUES (?, ?, ?)
+    `;
+    pool.query(
+      insertNotificationSql,
+      [ad.user_id, "ads_status_change", content],
+      (notiErr, notiResults) => {
+        if (notiErr) {
+          return res.status(500).json({ error: "บันทึกแจ้งเตือนไม่สำเร็จ" });
+        }
+        res.status(201).json({ message: "แจ้งเตือนสถานะโฆษณาสำเร็จ" });
+      }
+    );
+  });
+});
+
+
+// ฟังก์ชันสำหรับสร้าง notification เมื่อ ads เปลี่ยนสถานะ
+function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
+  pool.query('SELECT user_id FROM ads WHERE id = ?', [adId], (err, results) => {
+    if (err || results.length === 0) return callback(err || new Error('Ad not found'));
+    const { user_id } = results[0];
+    let content = '';
+    switch (newStatus) {
+      case 'approved':
+        content = 'โฆษณาของคุณได้รับการตรวจสอบแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา';
+        break;
+      case 'active':
+        content = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว';
+        break;
+      case 'rejected':
+        content = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${adminNotes || '-'}`;
+        break;
+      case 'paid':
+        content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ';
+        break;
+      case 'expired':
+        content = 'โฆษณาของคุณหมดอายุแล้ว';
+        break;
+      default:
+        content = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${newStatus}`;
+    }
+    pool.query(
+      `INSERT INTO notifications (user_id, action_type, content) VALUES (?, 'ads_status_change', ?)`,
+      [user_id, content],
+      callback
+    );
+  });
+}
+
+
 //########################################################   Bookmark API  #######################################################
 
 
@@ -2988,31 +3059,26 @@ app.get("/api/ads/random", (req, res) => {
 // --- NEW: Admin API for Ad Approval/Rejection ---
 app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, upload.single('admin_slip'), (req, res) => {
   const adId = req.params.adId;
-  const { action, admin_notes } = req.body; // ไม่ต้องใช้ package_duration_days แล้ว
-
-  if (!action || (action !== 'approve' && action !== 'reject')) {
-      return res.status(400).json({ message: "Invalid action. Must be 'approve' or 'reject'." });
+  const { action, admin_notes } = req.body;
+  const allowedActions = ['approved', 'active', 'rejected', 'expired', 'paid', 'pending'];
+  if (!action || !allowedActions.includes(action)) {
+      return res.status(400).json({ message: "Invalid action. ต้องเป็นหนึ่งใน: " + allowedActions.join(', ') });
   }
-
   pool.getConnection((err, connection) => {
       if (err) {
           console.error('Error getting DB connection:', err);
           return res.status(500).json({ error: 'Database connection error.' });
       }
-
       connection.beginTransaction(err => {
           if (err) {
               connection.release();
-              console.error('Error starting transaction:', err);
-              return res.status(500).json({ error: 'Failed to start transaction.' });
+              return res.status(500).json({ error: 'Database transaction error.' });
           }
-
           const fetchAdSql = "SELECT id, order_id, status, user_id FROM ads WHERE id = ?";
           connection.query(fetchAdSql, [adId], (err, adResults) => {
               if (err) {
                   return connection.rollback(() => {
                       connection.release();
-                      console.error('Error fetching ad:', err);
                       res.status(500).json({ error: 'Failed to fetch ad details.' });
                   });
               }
@@ -3022,78 +3088,71 @@ app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, uploa
                       res.status(404).json({ message: 'Ad not found.' });
                   });
               }
-
               const ad = adResults[0];
-
-              let updateAdSql = "";
-              let updateAdParams = [];
-              let adNewStatus = "";
+              let updateAdSql = "UPDATE ads SET status = ?, updated_at = NOW(), admin_notes = ? WHERE id = ?";
+              let updateAdParams = [action, admin_notes || null, adId];
               let admin_slip = null;
-
-              if (action === 'approve') {
-                  adNewStatus = 'active';
-                  updateAdSql = `UPDATE ads SET status = ?, updated_at = NOW(), admin_notes = ? WHERE id = ?`;
-                  updateAdParams = [adNewStatus, admin_notes || null, adId];
-              } else if (action === 'reject') {
+              if (action === 'rejected') {
                   admin_slip = req.file ? req.file.filename : null;
-                  if (!admin_notes || !admin_slip) {
-                      return connection.rollback(() => {
-                          connection.release();
-                          res.status(400).json({ message: 'กรุณาแนบเหตุผลและสลิปคืนเงิน' });
-                      });
+                  if (!admin_notes) {
+                      connection.release();
+                      return res.status(400).json({ message: 'กรุณาแนบเหตุผลที่ปฏิเสธ' });
                   }
-                  adNewStatus = 'rejected';
                   updateAdSql = "UPDATE ads SET status = ?, updated_at = NOW(), admin_notes = ?, admin_slip = ? WHERE id = ?";
-                  updateAdParams = [adNewStatus, admin_notes, admin_slip, adId];
+                  updateAdParams = [action, admin_notes, admin_slip, adId];
               }
-
               connection.query(updateAdSql, updateAdParams, (err, adUpdateResult) => {
                   if (err) {
                       return connection.rollback(() => {
                           connection.release();
-                          console.error('Error updating ad status:', err);
                           res.status(500).json({ error: 'Failed to update ad status.' });
                       });
                   }
-
                   // update order status ให้ตรงกับ ads status
-                  let orderNewStatus = adNewStatus;
-
                   const updateOrderStatusSql = "UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?";
-                  const updateOrderStatusParams = [orderNewStatus, ad.order_id];
-
+                  const updateOrderStatusParams = [action, ad.order_id];
                   connection.query(updateOrderStatusSql, updateOrderStatusParams, (err, orderUpdateResult) => {
                       if (err) {
                           return connection.rollback(() => {
                               connection.release();
-                              console.error('Error updating order status after ad action:', err);
                               res.status(500).json({ error: 'Failed to update order status.' });
                           });
                       }
-
                       // --- แจ้งเตือน user ---
                       let notifyContent = '';
-                      if (action === 'approve') {
-                        notifyContent = 'โฆษณาของคุณได้รับการอนุมัติแล้ว';
-                      } else if (action === 'reject') {
-                        notifyContent = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${admin_notes}`;
+                      switch (action) {
+                        case 'approved':
+                          notifyContent = 'โฆษณาของคุณได้รับการอนุมัติแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา';
+                          break;
+                        case 'active':
+                          notifyContent = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว';
+                          break;
+                        case 'rejected':
+                          notifyContent = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${admin_notes}`;
+                          break;
+                        case 'paid':
+                          notifyContent = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ';
+                          break;
+                        case 'expired':
+                          notifyContent = 'โฆษณาของคุณหมดอายุแล้ว';
+                          break;
+                        default:
+                          notifyContent = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${action}`;
                       }
                       const insertNotificationSql = `INSERT INTO notifications (user_id, action_type, content, ads_id) VALUES (?, 'ads_status_change', ?, ?)`;
                       connection.query(insertNotificationSql, [ad.user_id, notifyContent, ad.id], (notifyErr) => {
                         if (notifyErr) {
-                          // log error แต่ไม่ rollback transaction หลัก
                           console.error('Notification error:', notifyErr);
                         }
                         connection.commit(commitErr => {
                           if (commitErr) {
                               connection.rollback(() => {
                                   connection.release();
-                                  console.error('Error committing transaction:', commitErr);
                                   res.status(500).json({ error: 'Transaction commit failed.' });
                               });
                           } else {
                               connection.release();
-                              res.status(200).json({ message: `Ad ID ${adId} ${action} successfully.`, new_status: adNewStatus });
+                              res.status(200).json({ message: `Ad ID ${adId} เปลี่ยนสถานะเป็น ${action} สำเร็จ`, new_status: action });
                           }
                         });
                       });
@@ -4716,31 +4775,57 @@ app.post('/api/orders/:orderId/upload-slip', upload.single('slip_image'), (req, 
   console.log(`[INFO] Received POST /api/orders/${orderId}/upload-slip request.`);
   if (!req.file) {
       console.warn(`[WARN] No slip_image file uploaded for order ID ${orderId}.`);
-      return res.status(400).json({ error: 'No slip file uploaded' });
+      return res.status(400).json({ error: 'กรุณาอัปโหลดสลิปการโอนเงิน' });
   }
-  // สมมติบันทึก path ไว้ใน orders (เพิ่มฟิลด์ slip_image ใน orders ถ้ายังไม่มี)
-  const sql = 'UPDATE orders SET slip_image = ? WHERE id = ?';
-  pool.query(sql, [req.file.path, orderId], (err, result) => {
+  // ตรวจสอบว่า order ต้องอยู่ในสถานะ approved ก่อน
+  pool.query('SELECT status FROM orders WHERE id = ?', [orderId], (err, results) => {
+    if (err) {
+      console.error(`[ERROR] Database error checking order status for order ${orderId}:`, err);
+      return res.status(500).json({ error: 'เกิดข้อผิดพลาดในการตรวจสอบสถานะออเดอร์' });
+    }
+    if (results.length === 0) {
+      return res.status(404).json({ error: 'ไม่พบออเดอร์นี้' });
+    }
+    if (results[0].status !== 'approved') {
+      return res.status(400).json({ error: 'ไม่สามารถอัปโหลดสลิปได้ ต้องรอให้แอดมินอนุมัติก่อน' });
+    }
+    // อัปเดต slip_image และเปลี่ยน status เป็น paid
+    const sql = 'UPDATE orders SET slip_image = ?, status = "paid" WHERE id = ?';
+    pool.query(sql, [req.file.path, orderId], (err, result) => {
       if (err) {
-          console.error(`[ERROR] Database error updating slip_image for order ${orderId}:`, err);
-          return res.status(500).json({ error: 'Database error' });
+        console.error(`[ERROR] Database error updating slip_image for order ${orderId}:`, err);
+        return res.status(500).json({ error: 'เกิดข้อผิดพลาดในการบันทึกสลิป' });
       }
-      console.log(`[INFO] Slip image for order ID ${orderId} uploaded and path saved: ${req.file.path}`);
-      res.json({ message: 'Slip uploaded', slip_path: req.file.path });
+      // อัปเดต ads ที่เกี่ยวข้องให้เป็น paid ด้วย
+      const updateAdsSql = 'UPDATE ads SET status = "paid" WHERE order_id = ?';
+      pool.query(updateAdsSql, [orderId], (err2) => {
+        if (err2) {
+          console.error(`[ERROR] Database error updating ads status for order ${orderId}:`, err2);
+          // ไม่ต้อง return error ให้ user เพราะ slip อัปโหลดสำเร็จแล้ว
+        }
+        // แจ้งเตือน user ว่า "สลิปของคุณถูกส่งแล้ว รอแอดมินตรวจสอบ"
+        res.json({ message: 'อัปโหลดสลิปสำเร็จ กรุณารอแอดมินตรวจสอบ' , slip_path: req.file.path });
+      });
+    });
   });
 });
 
 
-// GET /api/ads
-app.get('/api/ads', (req, res) => {
-  console.log('[INFO] Received GET /api/ads request.');
-  pool.query('SELECT * FROM ads ORDER BY created_at DESC', (err, results) => {
-      if (err) {
-          console.error('[ERROR] Database error fetching ads:', err);
-          return res.status(500).json({ error: 'Database error' });
-      }
-      console.log(`[INFO] Fetched ${results.length} ads.`);
-      res.json(results);
+// GET /api/user/ads - สำหรับ user ดูโฆษณาของตัวเอง
+app.get('/api/user/ads', authenticateToken, (req, res) => {
+  const userId = req.user.id; // สมมติว่า authenticateToken ใส่ user id ใน req.user
+  const sql = `
+    SELECT title, content, link, image, status, show_at, expiration_date, admin_notes, admin_slip
+    FROM ads
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+  `;
+  pool.query(sql, [userId], (err, results) => {
+    if (err) {
+      console.error('[ERROR] Database error fetching user ads:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    res.json(results);
   });
 });
 
@@ -4753,69 +4838,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
-
-app.post("/api/ads/:id/notify-status-change", verifyToken, (req, res) => {
-  const adId = req.params.id;
-  const { new_status, admin_notes } = req.body;
-
-  // ดึงข้อมูล ads
-  const getAdSql = `SELECT * FROM ads WHERE id = ?`;
-  pool.query(getAdSql, [adId], (adErr, adResults) => {
-    if (adErr || adResults.length === 0) {
-      return res.status(404).json({ error: "ไม่พบโฆษณานี้" });
-    }
-    const ad = adResults[0];
-
-    // สร้างข้อความแจ้งเตือน
-    let content = `โฆษณาของคุณ (${ad.title}) มีการเปลี่ยนสถานะเป็น "${new_status}"`;
-    if (new_status === "rejected" && admin_notes) {
-      content += `\nเหตุผลที่ถูกปฏิเสธ: ${admin_notes}`;
-    }
-
-    // เพิ่ม notification
-    const insertNotificationSql = `
-      INSERT INTO notifications (user_id, action_type, content)
-      VALUES (?, ?, ?)
-    `;
-    pool.query(
-      insertNotificationSql,
-      [ad.user_id, "ads_status_change", content],
-      (notiErr, notiResults) => {
-        if (notiErr) {
-          return res.status(500).json({ error: "บันทึกแจ้งเตือนไม่สำเร็จ" });
-        }
-        res.status(201).json({ message: "แจ้งเตือนสถานะโฆษณาสำเร็จ" });
-      }
-    );
-  });
-});
-
-// ฟังก์ชันสำหรับสร้าง notification เมื่อ ads เปลี่ยนสถานะ
-function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
-  pool.query('SELECT user_id FROM ads WHERE id = ?', [adId], (err, results) => {
-    if (err || results.length === 0) return callback(err || new Error('Ad not found'));
-    const { user_id } = results[0];
-    let content = '';
-    switch (newStatus) {
-      case 'approved':
-        content = 'โฆษณาของคุณได้รับการอนุมัติแล้ว';
-        break;
-      case 'rejected':
-        content = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${adminNotes || '-'}`;
-        break;
-      case 'paid':
-        content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว';
-        break;
-      case 'expired':
-        content = 'โฆษณาของคุณหมดอายุแล้ว';
-        break;
-      default:
-        content = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${newStatus}`;
-    }
-    pool.query(
-      `INSERT INTO notifications (user_id, action_type, content) VALUES (?, 'ads_status_change', ?)`,
-      [user_id, content],
-      callback
-    );
-  });
-}

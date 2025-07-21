@@ -180,6 +180,11 @@ def generate_promptpay_qr_for_order(order_id):
     img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     return {"success": True, "message": "สร้าง QR Code สำเร็จ", "qrcode_base64": img_b64, "payload": original_scannable_payload}
 
+# --- ฟังก์ชันตรวจสอบว่าสามารถอัปโหลด slip ได้หรือไม่ ---
+def can_upload_slip(order):
+    """คืนค่า True ถ้า order สามารถอัปโหลด slip ได้ (status ต้องเป็น approved)"""
+    return order and order["status"] == 'approved'
+
 # --- ฟังก์ชันหลักในการตรวจสอบสลิปและอัปเดตสถานะ ---
 def verify_payment_and_update_status(order_id, slip_image_path, payload_from_client):
     print(f"\n--- Processing payment for Order ID: {order_id} ---")
@@ -189,16 +194,13 @@ def verify_payment_and_update_status(order_id, slip_image_path, payload_from_cli
     try:
         # Find order
         order = find_order_by_id(order_id)
-        if not order:
-            print(f"❌ Error: Order ID {order_id} not found.")
-            return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
-        if order["status"] != 'pending':
-            print(f"❌ Error: Order ID {order_id} is not pending. Current status: {order['status']}.")
-            return {"success": False, "message": "คำสั่งซื้อนี้ดำเนินการไปแล้วหรือสถานะไม่ถูกต้อง"}
+        if not can_upload_slip(order):
+            print(f"❌ Error: Order ID {order_id} is not approved. Current status: {order['status'] if order else None}.")
+            return {"success": False, "message": "ไม่สามารถอัปโหลดสลิปได้ ต้องรอให้แอดมินอนุมัติก่อน"}
         # Check if an Ad already exists and its status
         ad = find_ad_by_order_id(order_id)
-        if ad and ad['status'] != 'pending':
-            print(f"❌ Error: Associated ad for Order ID {order_id} is not pending. Current ad status: {ad['status']}.")
+        if ad and ad['status'] in ['active', 'rejected']:
+            print(f"❌ Error: Associated ad for Order ID {order_id} is already processed. Current ad status: {ad['status']}.")
             return {"success": False, "message": "โฆษณาสำหรับคำสั่งซื้อนี้มีการดำเนินการไปแล้ว"}
         # --- Call SlipOK API ---
         if not os.path.exists(slip_image_path):
@@ -352,7 +354,7 @@ class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, nullable=False)
     amount = db.Column(db.Numeric(10,2), nullable=False)
-    status = db.Column(db.Enum('pending', 'paid', 'cancelled'), nullable=False, default='pending')
+    status = db.Column(db.Enum('pending', 'approved', 'paid', 'active', 'rejected', 'expired'), nullable=False, default='pending')
     slip_image = db.Column(db.String(255))
     created_at = db.Column(db.DateTime)
     updated_at = db.Column(db.DateTime)
@@ -367,7 +369,7 @@ class Ad(db.Model):
     content = db.Column(db.Text, nullable=False)
     link = db.Column(db.String(255))
     image = db.Column(db.String(255))
-    status = db.Column(db.Enum('pending', 'paid', 'active', 'inactive'), nullable=False, default='pending')
+    status = db.Column(db.Enum('pending', 'approved', 'paid', 'active', 'rejected', 'expired'), nullable=False, default='pending')
     created_at = db.Column(db.DateTime)
     updated_at = db.Column(db.DateTime)
     expiration_date = db.Column(db.Date)
@@ -1094,6 +1096,11 @@ def api_verify_slip(order_id):
     if 'payload' not in request.form:
         return jsonify({'success': False, 'message': 'ต้องระบุ payload (QR Code)'}), 400
     payload = request.form['payload']
+
+    order = find_order_by_id(order_id)
+    if not can_upload_slip(order):
+        return jsonify({'success': False, 'message': 'ไม่สามารถอัปโหลดสลิปได้ ต้องรอให้แอดมินอนุมัติก่อน'}), 400
+
     unique_filename = f"{uuid.uuid4()}_{file.filename}"
     slip_dir = 'Slip'
     if not os.path.exists(slip_dir):
@@ -1102,6 +1109,8 @@ def api_verify_slip(order_id):
     file.save(save_path)
     print(f"✅ Slip image uploaded to {save_path}")
     print(f"✅ Payload from client (QR Code data): {payload}")
+
+    # --- ดำเนินการตรวจสอบสลิปและอัปเดตสถานะ ---
     result = verify_payment_and_update_status(order_id, save_path, payload)
     return jsonify(result)
 
