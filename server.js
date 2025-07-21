@@ -1794,11 +1794,7 @@ app.get("/api/users/:userId/view-profile", verifyToken, (req, res) => {
 
 
 //update profile
-app.put(
-  "/api/users/:userId/profile",
-  verifyToken,
-  upload.single("profileImage"),
-  (req, res) => {
+app.put("/api/users/:userId/profile",verifyToken,upload.single("profileImage"),(req, res) => {
     const userId = req.params.userId;
 
     // Extract the data from the request body
@@ -2477,8 +2473,8 @@ function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
         content = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${newStatus}`;
     }
     pool.query(
-      `INSERT INTO notifications (user_id, action_type, content) VALUES (?, 'ads_status_change', ?)`,
-      [user_id, content],
+      `INSERT INTO notifications (user_id, action_type, content, ads_id) VALUES (?, 'ads_status_change', ?, ?)`,
+      [user_id, content, adId],
       callback
     );
   });
@@ -3056,114 +3052,6 @@ app.get("/api/ads/random", (req, res) => {
 });
 
 
-// --- NEW: Admin API for Ad Approval/Rejection ---
-app.post('/api/admin/ads/:adId/action', authenticateToken, authorizeAdmin, upload.single('admin_slip'), (req, res) => {
-  const adId = req.params.adId;
-  const { action, admin_notes } = req.body;
-  const allowedActions = ['approved', 'active', 'rejected', 'expired', 'paid', 'pending'];
-  if (!action || !allowedActions.includes(action)) {
-      return res.status(400).json({ message: "Invalid action. ต้องเป็นหนึ่งใน: " + allowedActions.join(', ') });
-  }
-  pool.getConnection((err, connection) => {
-      if (err) {
-          console.error('Error getting DB connection:', err);
-          return res.status(500).json({ error: 'Database connection error.' });
-      }
-      connection.beginTransaction(err => {
-          if (err) {
-              connection.release();
-              return res.status(500).json({ error: 'Database transaction error.' });
-          }
-          const fetchAdSql = "SELECT id, order_id, status, user_id FROM ads WHERE id = ?";
-          connection.query(fetchAdSql, [adId], (err, adResults) => {
-              if (err) {
-                  return connection.rollback(() => {
-                      connection.release();
-                      res.status(500).json({ error: 'Failed to fetch ad details.' });
-                  });
-              }
-              if (adResults.length === 0) {
-                  return connection.rollback(() => {
-                      connection.release();
-                      res.status(404).json({ message: 'Ad not found.' });
-                  });
-              }
-              const ad = adResults[0];
-              let updateAdSql = "UPDATE ads SET status = ?, updated_at = NOW(), admin_notes = ? WHERE id = ?";
-              let updateAdParams = [action, admin_notes || null, adId];
-              let admin_slip = null;
-              if (action === 'rejected') {
-                  admin_slip = req.file ? req.file.filename : null;
-                  if (!admin_notes) {
-                      connection.release();
-                      return res.status(400).json({ message: 'กรุณาแนบเหตุผลที่ปฏิเสธ' });
-                  }
-                  updateAdSql = "UPDATE ads SET status = ?, updated_at = NOW(), admin_notes = ?, admin_slip = ? WHERE id = ?";
-                  updateAdParams = [action, admin_notes, admin_slip, adId];
-              }
-              connection.query(updateAdSql, updateAdParams, (err, adUpdateResult) => {
-                  if (err) {
-                      return connection.rollback(() => {
-                          connection.release();
-                          res.status(500).json({ error: 'Failed to update ad status.' });
-                      });
-                  }
-                  // update order status ให้ตรงกับ ads status
-                  const updateOrderStatusSql = "UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?";
-                  const updateOrderStatusParams = [action, ad.order_id];
-                  connection.query(updateOrderStatusSql, updateOrderStatusParams, (err, orderUpdateResult) => {
-                      if (err) {
-                          return connection.rollback(() => {
-                              connection.release();
-                              res.status(500).json({ error: 'Failed to update order status.' });
-                          });
-                      }
-                      // --- แจ้งเตือน user ---
-                      let notifyContent = '';
-                      switch (action) {
-                        case 'approved':
-                          notifyContent = 'โฆษณาของคุณได้รับการอนุมัติแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา';
-                          break;
-                        case 'active':
-                          notifyContent = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว';
-                          break;
-                        case 'rejected':
-                          notifyContent = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${admin_notes}`;
-                          break;
-                        case 'paid':
-                          notifyContent = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ';
-                          break;
-                        case 'expired':
-                          notifyContent = 'โฆษณาของคุณหมดอายุแล้ว';
-                          break;
-                        default:
-                          notifyContent = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${action}`;
-                      }
-                      const insertNotificationSql = `INSERT INTO notifications (user_id, action_type, content, ads_id) VALUES (?, 'ads_status_change', ?, ?)`;
-                      connection.query(insertNotificationSql, [ad.user_id, notifyContent, ad.id], (notifyErr) => {
-                        if (notifyErr) {
-                          console.error('Notification error:', notifyErr);
-                        }
-                        connection.commit(commitErr => {
-                          if (commitErr) {
-                              connection.rollback(() => {
-                                  connection.release();
-                                  res.status(500).json({ error: 'Transaction commit failed.' });
-                              });
-                          } else {
-                              connection.release();
-                              res.status(200).json({ message: `Ad ID ${adId} เปลี่ยนสถานะเป็น ${action} สำเร็จ`, new_status: action });
-                          }
-                        });
-                      });
-                  });
-              });
-          });
-      });
-  });
-});
-
-
 // Serve images from the uploads directory
 app.use('/api/uploads', express.static('uploads'));
 
@@ -3200,58 +3088,72 @@ app.post("/api/ads", authenticateToken, authorizeAdmin, upload.single("image"), 
 });
 
 
-// สร้าง API สำหรับอัปเดตข้อมูล
-app.put('/api/ads/:id', authenticateToken, authorizeAdmin, upload.single('image'), (req, res) => {
+// สร้าง API สำหรับอัปเดตข้อมูล (Admin only)
+app.put('/api/admin/ads/:id', authenticateToken, authorizeAdmin, upload.single('image'), (req, res) => {
   const { id } = req.params;
-  const { title, content, link, status, expiration_date } = req.body; // created_at, updated_at ไม่ควรอนุญาตให้อัปเดตจากภายนอก
+  const { title, content, link, status, expiration_date, admin_notes } = req.body; // เพิ่ม admin_notes
   const image = req.file ? `/uploads/${req.file.filename}` : null;
+
+  // ถ้า status เป็น rejected แต่ไม่ได้ใส่ admin_notes ห้ามบันทึก
+  if (status === 'rejected' && (!admin_notes || admin_notes.trim() === '')) {
+    if (req.file) {
+      require('fs').unlink(req.file.path, (err) => {
+        if (err) console.error('Error deleting uploaded image:', err);
+      });
+    }
+    return res.status(400).json({ error: 'กรุณาระบุเหตุผล (admin_notes) เมื่อปฏิเสธโฆษณา' });
+  }
 
   const updateFields = [];
   const updateValues = [];
-
   if (title !== undefined) { updateFields.push('title = ?'); updateValues.push(title); }
   if (content !== undefined) { updateFields.push('content = ?'); updateValues.push(content); }
   if (link !== undefined) { updateFields.push('link = ?'); updateValues.push(link); }
-  if (image) { // ถ้ามีการอัปโหลดรูปใหม่
-      updateFields.push('image = ?');
-      updateValues.push(image);
-      // TODO: ควรลบรูปเก่าออกด้วยหากมีการอัปโหลดรูปใหม่ เพื่อไม่ให้มีไฟล์ขยะ
-  }
+  if (image) { updateFields.push('image = ?'); updateValues.push(image); }
   if (status !== undefined) { updateFields.push('status = ?'); updateValues.push(status); }
   if (expiration_date !== undefined) { updateFields.push('expiration_date = ?'); updateValues.push(expiration_date); }
+  if (admin_notes !== undefined) { updateFields.push('admin_notes = ?'); updateValues.push(admin_notes); }
+  updateFields.push('updated_at = NOW()');
 
-  updateFields.push('updated_at = NOW()'); // อัปเดต updated_at เสมอ
-
-  if (updateFields.length === 1 && updateFields[0] === 'updated_at = NOW()') { // ถ้ามีแค่อัปเดต updated_at
-      return res.status(400).json({ error: 'No meaningful fields to update besides updated_at' });
+  if (updateFields.length === 1 && updateFields[0] === 'updated_at = NOW()') {
+    if (req.file) {
+      require('fs').unlink(req.file.path, (err) => {
+        if (err) console.error('Error deleting uploaded image:', err);
+      });
+    }
+    return res.status(400).json({ error: 'No meaningful fields to update besides updated_at' });
   }
 
   const sql = `UPDATE ads SET ${updateFields.join(', ')} WHERE id = ?`;
   updateValues.push(id);
 
   pool.query(sql, updateValues, (err, results) => {
-      if (err) {
-          console.error('Database error during ad update:', err);
-          // ถ้า update ไม่สำเร็จ และมีการอัปโหลดไฟล์ใหม่ ควรลบไฟล์นั้นทิ้ง
-          if (req.file) {
-              require('fs').unlink(req.file.path, (unlinkErr) => {
-                  if (unlinkErr) console.error("Error deleting new ad image after DB update error:", unlinkErr);
-              });
-          }
-          return res.status(500).json({ error: 'Error updating ad' });
+    if (err) {
+      console.error('Database error during ad update:', err);
+      if (req.file) {
+        require('fs').unlink(req.file.path, (unlinkErr) => {
+          if (unlinkErr) console.error('Error deleting new ad image after DB update error:', unlinkErr);
+        });
       }
-
-      if (results.affectedRows === 0) {
-          // ถ้าไม่พบ ad และมีการอัปโหลดไฟล์ใหม่ ควรลบไฟล์นั้นทิ้ง
-          if (req.file) {
-              require('fs').unlink(req.file.path, (unlinkErr) => {
-                  if (unlinkErr) console.error("Error deleting new ad image for not found ad:", unlinkErr);
-              });
-          }
-          return res.status(404).json({ error: 'Ad not found' });
+      return res.status(500).json({ error: 'Error updating ad' });
+    }
+    if (results.affectedRows === 0) {
+      if (req.file) {
+        require('fs').unlink(req.file.path, (unlinkErr) => {
+          if (unlinkErr) console.error('Error deleting new ad image for not found ad:', unlinkErr);
+        });
       }
-
+      return res.status(404).json({ error: 'Ad not found' });
+    }
+    // ถ้ามีการเปลี่ยน status ให้แจ้งเตือน user
+    if (status !== undefined) {
+      notifyAdsStatusChange(parseInt(id), status, admin_notes || null, (notifyErr) => {
+        if (notifyErr) console.error('Notify user error:', notifyErr);
+        return res.json({ message: 'Ad updated successfully and user notified.' });
+      });
+    } else {
       res.json({ message: 'Ad updated successfully' });
+    }
   });
 });
 
@@ -3946,6 +3848,185 @@ app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req,
               res.status(500).json({ error: "Transaction failed during post status update and report deletion" });
           }
       });
+  });
+});
+
+
+// APi สำหรับแอดมินดูข้อมูลออเดอร์ทั้งหมด (Admin only)
+app.get('/api/admin/orders', authenticateToken, authorizeAdmin, (req, res) => {
+  const sql = `
+      SELECT o.*, a.title, a.content, a.link, a.image, a.status AS ad_status
+      FROM orders o
+      LEFT JOIN ads a ON o.id = a.order_id
+      ORDER BY o.created_at DESC
+  `;
+  pool.query(sql, (err, results) => {
+      if (err) {
+          console.error(`[ERROR] Database error fetching all orders:`, err);
+          return res.status(500).json({ error: 'Database error' });
+      }
+      res.json(results);
+  });
+});
+
+
+// PUT /api/admin/orders/:orderId - แก้ไขข้อมูลออเดอร์ (Admin only)
+app.put('/api/admin/orders/:orderId', authenticateToken, authorizeAdmin, async (req, res) => {
+  const { orderId } = req.params;
+  const { amount, status, prompay_number, title, content, link, image, expiration_date, admin_notes } = req.body;
+
+  // 1. ถ้า status เป็น rejected แต่ไม่ได้ใส่ admin_notes ห้ามบันทึก
+  if (status === 'rejected' && (!admin_notes || admin_notes.trim() === '')) {
+    return res.status(400).json({ error: 'กรุณาระบุเหตุผล (admin_notes) เมื่อปฏิเสธออเดอร์' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error getting DB connection:', err);
+      return res.status(500).json({ error: 'Database connection error.' });
+    }
+    connection.beginTransaction(err => {
+      if (err) {
+        connection.release();
+        return res.status(500).json({ error: 'Database transaction error.' });
+      }
+      // 1. อัปเดต orders
+      const updateOrderSql = `UPDATE orders SET amount = COALESCE(?, amount), status = COALESCE(?, status), prompay_number = COALESCE(?, prompay_number), updated_at = NOW() WHERE id = ?`;
+      connection.query(updateOrderSql, [amount, status, prompay_number, orderId], (err, orderResult) => {
+        if (err) {
+          return connection.rollback(() => {
+            connection.release();
+            res.status(500).json({ error: 'Failed to update order.' });
+          });
+        }
+        // 2. อัปเดต ads ที่เชื่อมโยง (ถ้ามีข้อมูลส่งมา)
+        if (title !== undefined || content !== undefined || link !== undefined || image !== undefined || status !== undefined || expiration_date !== undefined || admin_notes !== undefined) {
+          const updateFields = [];
+          const updateValues = [];
+          if (title !== undefined) { updateFields.push('title = ?'); updateValues.push(title); }
+          if (content !== undefined) { updateFields.push('content = ?'); updateValues.push(content); }
+          if (link !== undefined) { updateFields.push('link = ?'); updateValues.push(link); }
+          if (image !== undefined) { updateFields.push('image = ?'); updateValues.push(image); }
+          if (status !== undefined) { updateFields.push('status = ?'); updateValues.push(status); }
+          if (expiration_date !== undefined) { updateFields.push('expiration_date = ?'); updateValues.push(expiration_date); }
+          if (admin_notes !== undefined) { updateFields.push('admin_notes = ?'); updateValues.push(admin_notes); }
+          if (updateFields.length > 0) {
+            updateFields.push('updated_at = NOW()');
+            const updateAdSql = `UPDATE ads SET ${updateFields.join(', ')} WHERE order_id = ?`;
+            updateValues.push(orderId);
+            connection.query(updateAdSql, updateValues, (err, adResult) => {
+              if (err) {
+                return connection.rollback(() => {
+                  connection.release();
+                  res.status(500).json({ error: 'Failed to update ad.' });
+                });
+              }
+              // --- แจ้งเตือน user ด้วยฟังก์ชันกลาง ---
+              const getAdIdSql = 'SELECT id FROM ads WHERE order_id = ? LIMIT 1';
+              connection.query(getAdIdSql, [orderId], (adIdErr, adIdRows) => {
+                if (!adIdErr && adIdRows.length > 0 && status) {
+                  const adId = adIdRows[0].id;
+                  notifyAdsStatusChange(adId, status, admin_notes || null, (notifyErr) => {
+                    if (notifyErr) console.error('Notify user error:', notifyErr);
+                  });
+                }
+                connection.commit(commitErr => {
+                  if (commitErr) {
+                    return connection.rollback(() => {
+                      connection.release();
+                      res.status(500).json({ error: 'Transaction commit failed.' });
+                    });
+                  }
+                  connection.release();
+                  res.json({ message: 'Order and related ad updated successfully.' });
+                });
+              });
+            });
+            return;
+          }
+        }
+        // ถ้าไม่มีข้อมูล ads ให้ commit เลย
+        connection.commit(commitErr => {
+          if (commitErr) {
+            return connection.rollback(() => {
+              connection.release();
+              res.status(500).json({ error: 'Transaction commit failed.' });
+            });
+          }
+          connection.release();
+          res.json({ message: 'Order updated successfully.' });
+        });
+      });
+    });
+  });
+});
+
+// DELETE /api/admin/orders/:orderId - ลบออเดอร์และโฆษณาที่เกี่ยวข้อง (Admin only)
+app.delete('/api/admin/orders/:orderId', authenticateToken, authorizeAdmin, (req, res) => {
+  const { orderId } = req.params;
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error getting DB connection:', err);
+      return res.status(500).json({ error: 'Database connection error.' });
+    }
+    connection.beginTransaction(err => {
+      if (err) {
+        connection.release();
+        return res.status(500).json({ error: 'Database transaction error.' });
+      }
+      // 1. ลบ ads ที่เชื่อมโยงกับ order นี้ก่อน
+      const fetchAdSql = 'SELECT image FROM ads WHERE order_id = ?';
+      connection.query(fetchAdSql, [orderId], (fetchErr, adResults) => {
+        if (fetchErr) {
+          return connection.rollback(() => {
+            connection.release();
+            res.status(500).json({ error: 'Failed to fetch ad for deletion.' });
+          });
+        }
+        // เตรียมลบไฟล์ภาพ ads ถ้ามี
+        const imagePaths = adResults.map(row => row.image).filter(Boolean);
+        const deleteAdSql = 'DELETE FROM ads WHERE order_id = ?';
+        connection.query(deleteAdSql, [orderId], (adDelErr, adDelResult) => {
+          if (adDelErr) {
+            return connection.rollback(() => {
+              connection.release();
+              res.status(500).json({ error: 'Failed to delete ad.' });
+            });
+          }
+          // 2. ลบ order
+          const deleteOrderSql = 'DELETE FROM orders WHERE id = ?';
+          connection.query(deleteOrderSql, [orderId], (orderDelErr, orderDelResult) => {
+            if (orderDelErr) {
+              return connection.rollback(() => {
+                connection.release();
+                res.status(500).json({ error: 'Failed to delete order.' });
+              });
+            }
+            connection.commit(commitErr => {
+              if (commitErr) {
+                return connection.rollback(() => {
+                  connection.release();
+                  res.status(500).json({ error: 'Transaction commit failed.' });
+                });
+              }
+              connection.release();
+              // ลบไฟล์ภาพ ads ออกจาก disk
+              const fs = require('fs');
+              const path = require('path');
+              imagePaths.forEach(imgPath => {
+                if (imgPath) {
+                  const fullPath = path.join(__dirname, imgPath);
+                  fs.unlink(fullPath, (err) => {
+                    if (err) console.error('Error deleting ad image file:', err);
+                  });
+                }
+              });
+              res.json({ message: 'Order and related ad(s) deleted successfully.' });
+            });
+          });
+        });
+      });
+    });
   });
 });
 
@@ -4744,7 +4825,7 @@ app.post('/api/orders', (req, res) => {
 });
 
 
-// GET /api/orders/:orderId
+// GET /api/orders/:orderId - สำหรับ user ดูข้อมูลออเดอร์
 app.get('/api/orders/:orderId', (req, res) => {
   const { orderId } = req.params;
   console.log(`[INFO] Received GET /api/orders/${orderId} request`);
