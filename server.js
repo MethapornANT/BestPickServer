@@ -2897,7 +2897,7 @@ app.get("/api/users/search/followers", verifyToken, (req, res) => {
 });
 
 // Endpoint to check bookmark status
-app.get('/api/bookmarks/:post_id', verifyToken, (req, res) => {
+app.get("/api/bookmarks/:post_id", verifyToken, (req, res) => {
   const post_id = req.params.post_id;
   const user_id = req.userId;
 
@@ -3053,7 +3053,7 @@ app.get("/api/ads/random", (req, res) => {
 
 
 // Serve images from the uploads directory
-app.use('/api/uploads', express.static('uploads'));
+app.use("/api/uploads", express.static('uploads'));
 
 
 // Create an Ad (Admin only)
@@ -3089,9 +3089,9 @@ app.post("/api/ads", authenticateToken, authorizeAdmin, upload.single("image"), 
 
 
 // สร้าง API สำหรับอัปเดตข้อมูล (Admin only)
-app.put('/api/admin/ads/:id', authenticateToken, authorizeAdmin, upload.single('image'), (req, res) => {
+app.put("/api/admin/ads/:id", authenticateToken, authorizeAdmin, upload.single('image'), (req, res) => {
   const { id } = req.params;
-  const { title, content, link, status, expiration_date, admin_notes } = req.body; // เพิ่ม admin_notes
+  const { title, content, link, status, expiration_date, admin_notes, show_at, expired_at } = req.body; // เพิ่ม expired_at
   const image = req.file ? `/uploads/${req.file.filename}` : null;
 
   // ถ้า status เป็น rejected แต่ไม่ได้ใส่ admin_notes ห้ามบันทึก
@@ -3113,6 +3113,8 @@ app.put('/api/admin/ads/:id', authenticateToken, authorizeAdmin, upload.single('
   if (status !== undefined) { updateFields.push('status = ?'); updateValues.push(status); }
   if (expiration_date !== undefined) { updateFields.push('expiration_date = ?'); updateValues.push(expiration_date); }
   if (admin_notes !== undefined) { updateFields.push('admin_notes = ?'); updateValues.push(admin_notes); }
+  if (show_at !== undefined) { updateFields.push('show_at = ?'); updateValues.push(show_at); }
+  if (expired_at !== undefined) { updateFields.push('expired_at = ?'); updateValues.push(expired_at); }
   updateFields.push('updated_at = NOW()');
 
   if (updateFields.length === 1 && updateFields[0] === 'updated_at = NOW()') {
@@ -3200,7 +3202,7 @@ app.delete("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
 // Get All Ads (Admin only) - ควรใช้ authenticateToken, authorizeAdmin
 app.get("/api/ads", authenticateToken, authorizeAdmin, (req, res) => {
   const fetchAdsSql = `
-      SELECT id, user_id, order_id, title, content, link, image, status, created_at, updated_at, expiration_date, admin_notes
+      SELECT id, user_id, order_id, title, content, link, image, status, created_at, updated_at, expiration_date, admin_notes, show_at
       FROM ads
       ORDER BY
           FIELD(status, 'pending', 'paid', 'active', 'rejected'), -- Custom order for status
@@ -3715,7 +3717,7 @@ app.put("/api/admin/reports/:reportId", authenticateToken, authorizeAdmin, (req,
 
 
 // Get All Categories (Admin only)
-app.get('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
+app.get("/api/categories", authenticateToken, authorizeAdmin, (req, res) => {
   const fetchCategoriesSql = 'SELECT * FROM category ORDER BY CategoryID ASC';
   pool.query(fetchCategoriesSql, (err, results) => {
       if (err) {
@@ -3728,7 +3730,7 @@ app.get('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
 
 
 // Create a Category (Admin only)
-app.post('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
+app.post("/api/categories", authenticateToken, authorizeAdmin, (req, res) => {
   const { CategoryName } = req.body;
 
   if (!CategoryName) {
@@ -3747,7 +3749,7 @@ app.post('/api/categories', authenticateToken, authorizeAdmin, (req, res) => {
 
 
 // Update a Category (Admin only)
-app.put('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) => {
+app.put("/api/categories/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
   const { CategoryName } = req.body;
 
@@ -3770,7 +3772,7 @@ app.put('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) => 
 
 
 // Delete a Category (Admin only)
-app.delete('/api/categories/:id', authenticateToken, authorizeAdmin, (req, res) => {
+app.delete("/api/categories/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
 
   const deleteCategorySql = 'DELETE FROM category WHERE CategoryID = ?';
@@ -3853,7 +3855,7 @@ app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req,
 
 
 // APi สำหรับแอดมินดูข้อมูลออเดอร์ทั้งหมด (Admin only)
-app.get('/api/admin/orders', authenticateToken, authorizeAdmin, (req, res) => {
+app.get("/api/admin/orders", authenticateToken, authorizeAdmin, (req, res) => {
   const sql = `
       SELECT o.*, a.title, a.content, a.link, a.image, a.status AS ad_status
       FROM orders o
@@ -3871,7 +3873,7 @@ app.get('/api/admin/orders', authenticateToken, authorizeAdmin, (req, res) => {
 
 
 // PUT /api/admin/orders/:orderId - แก้ไขข้อมูลออเดอร์ (Admin only)
-app.put('/api/admin/orders/:orderId', authenticateToken, authorizeAdmin, async (req, res) => {
+app.put("/api/admin/orders/:orderId", authenticateToken, authorizeAdmin, async (req, res) => {
   const { orderId } = req.params;
   const { amount, status, prompay_number, title, content, link, image, expiration_date, admin_notes } = req.body;
 
@@ -3962,7 +3964,7 @@ app.put('/api/admin/orders/:orderId', authenticateToken, authorizeAdmin, async (
 });
 
 // DELETE /api/admin/orders/:orderId - ลบออเดอร์และโฆษณาที่เกี่ยวข้อง (Admin only)
-app.delete('/api/admin/orders/:orderId', authenticateToken, authorizeAdmin, (req, res) => {
+app.delete("/api/admin/orders/:orderId", authenticateToken, authorizeAdmin, (req, res) => {
   const { orderId } = req.params;
   pool.getConnection((err, connection) => {
     if (err) {
@@ -4035,7 +4037,7 @@ app.delete('/api/admin/orders/:orderId', authenticateToken, authorizeAdmin, (req
 
 
 //search ads
-app.get('/api/admin/search/ads', authenticateToken, (req, res) => {
+app.get("/api/admin/search/ads", authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
   if (!query) {
@@ -4092,7 +4094,7 @@ app.get('/api/admin/search/ads', authenticateToken, (req, res) => {
 
 
 //search users
-app.get('/api/admin/search/users', authenticateToken, (req, res) => {
+app.get("/api/admin/search/users", authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
   if (!query) {
@@ -4165,7 +4167,7 @@ app.get('/api/admin/search/users', authenticateToken, (req, res) => {
 
 
 //search posts
-app.get('/api/admin/search/posts', authenticateToken, (req, res) => {
+app.get("/api/admin/search/posts", authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
   if (!query) {
@@ -4229,7 +4231,7 @@ app.get('/api/admin/search/posts', authenticateToken, (req, res) => {
 
 
 //search reports
-app.get('/api/admin/search/reports', authenticateToken, (req, res) => {
+app.get("/api/admin/search/reports", authenticateToken, (req, res) => {
   const { q: query } = req.query;
 
   if (!query) {
@@ -4308,7 +4310,7 @@ app.get('/api/admin/search/reports', authenticateToken, (req, res) => {
 
 
 // API สร้าง Match อัตโนมัติเมื่อมีการ Follow
-app.post('/api/users/:userId/follow/:followingId', (req, res) => {
+app.post("/api/users/:userId/follow/:followingId", (req, res) => {
     const { userId, followingId } = req.params;
 
     // เพิ่มข้อมูลการ follow ใน table follower_following
@@ -4347,7 +4349,7 @@ app.post('/api/users/:userId/follow/:followingId', (req, res) => {
 
 
 // API สร้าง Match จากการ Follow (เรียกแยกได้ถ้าต้องการ)
-app.post('/api/create-match-on-follow', (req, res) => {
+app.post("/api/create-match-on-follow", (req, res) => {
     const { followerID, followingID } = req.body;
 
     if (!followerID || !followingID) {
@@ -4413,7 +4415,7 @@ app.post('/api/create-match-on-follow', (req, res) => {
 
 
 // API Get Matches - แสดงรายการ chat ของ user
-app.get('/api/matches/:userID', (req, res) => {
+app.get("/api/matches/:userID", (req, res) => {
     const { userID } = req.params;
 
     const getMatchedUsersWithLastMessageQuery = `
@@ -4467,7 +4469,7 @@ app.get('/api/matches/:userID', (req, res) => {
 
 
 //get chats
-app.get('/api/chats/:matchID', (req, res) => {
+app.get("/api/chats/:matchID", (req, res) => {
     const { matchID } = req.params;
 
     const getChatQuery = `
@@ -4502,7 +4504,7 @@ app.get('/api/chats/:matchID', (req, res) => {
 
 
 // API Send Chat Message
-app.post('/api/chats/:matchID', (req, res) => {
+app.post("/api/chats/:matchID", (req, res) => {
     const { matchID } = req.params;
     const { senderID, message } = req.body;
 
@@ -4565,7 +4567,7 @@ app.post('/api/chats/:matchID', (req, res) => {
 
 
 // API Delete Chat (ซ่อน chat ฝั่งเดียว)
-app.post('/api/delete-chat', (req, res) => {
+app.post("/api/delete-chat", (req, res) => {
     const { userID, matchID } = req.body;
 
     if (!userID || !matchID) {
@@ -4589,7 +4591,7 @@ app.post('/api/delete-chat', (req, res) => {
 
 
 // API Restore All Chats
-app.post('/api/restore-all-chats', (req, res) => {
+app.post("/api/restore-all-chats", (req, res) => {
     const { userID } = req.body;
 
     if (!userID) {
@@ -4615,7 +4617,7 @@ app.post('/api/restore-all-chats', (req, res) => {
 
 
 // API Block Chat
-app.post('/api/block-chat', (req, res) => {
+app.post("/api/block-chat", (req, res) => {
     const { userID, matchID, isBlocked } = req.body;
 
     if (!userID || !matchID || isBlocked === undefined) {
@@ -4687,7 +4689,7 @@ app.post('/api/block-chat', (req, res) => {
 
 
 // API Unblock Chat
-app.post('/api/unblock-chat', (req, res) => {
+app.post("/api/unblock-chat", (req, res) => {
     const { userID, matchID } = req.body;
 
     if (!userID || !matchID) {
@@ -4717,7 +4719,7 @@ app.post('/api/unblock-chat', (req, res) => {
 
 
 //check block status
-app.post('/api/check-block-status', (req, res) => {
+app.post("/api/check-block-status", (req, res) => {
     const { matchID, userID } = req.body;
     
     const query = `
@@ -4749,7 +4751,7 @@ app.post('/api/check-block-status', (req, res) => {
 
 
 // GET /api/ad-packages
-app.get('/api/ad-packages', (req, res) => {
+app.get("/api/ad-packages", (req, res) => {
   console.log('[INFO] Received GET /api/ad-packages request');
   const sql = 'SELECT * FROM ad_packages ORDER BY duration_days ASC';
   pool.query(sql, (err, results) => {
@@ -4764,7 +4766,7 @@ app.get('/api/ad-packages', (req, res) => {
 
 
 // POST /api/orders
-app.post('/api/orders', (req, res) => {
+app.post("/api/orders", (req, res) => {
   console.log('[INFO] Received POST /api/orders request');
   const { user_id, package_id, title, content, link, image, prompay_number, ad_start_date } = req.body; // Add prompay_number
   if (!user_id || !package_id || !title || !content || !prompay_number) { // Make prompay_number mandatory
@@ -4826,7 +4828,7 @@ app.post('/api/orders', (req, res) => {
 
 
 // GET /api/orders/:orderId - สำหรับ user ดูข้อมูลออเดอร์
-app.get('/api/orders/:orderId', (req, res) => {
+app.get("/api/orders/:orderId", (req, res) => {
   const { orderId } = req.params;
   console.log(`[INFO] Received GET /api/orders/${orderId} request`);
   const sql = `
@@ -4851,7 +4853,7 @@ app.get('/api/orders/:orderId', (req, res) => {
 
 
 // POST /api/orders/:orderId/upload-slip
-app.post('/api/orders/:orderId/upload-slip', upload.single('slip_image'), (req, res) => { // เปลี่ยน 'slip' เป็น 'slip_image'
+app.post("/api/orders/:orderId/upload-slip", upload.single('slip_image'), (req, res) => { // เปลี่ยน 'slip' เป็น 'slip_image'
   const { orderId } = req.params;
   console.log(`[INFO] Received POST /api/orders/${orderId}/upload-slip request.`);
   if (!req.file) {
@@ -4893,7 +4895,7 @@ app.post('/api/orders/:orderId/upload-slip', upload.single('slip_image'), (req, 
 
 
 // GET /api/user/ads - สำหรับ user ดูโฆษณาของตัวเอง
-app.get('/api/user/ads', authenticateToken, (req, res) => {
+app.get("/api/user/ads", authenticateToken, (req, res) => {
   const userId = req.user.id; // สมมติว่า authenticateToken ใส่ user id ใน req.user
   const sql = `
     SELECT title, content, link, image, status, show_at, expiration_date, admin_notes, admin_slip
