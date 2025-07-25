@@ -19,9 +19,10 @@ import pickle
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import locale # สำหรับการแสดงวันที่ภาษาไทย
 
 from datetime import datetime, timezone
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 from sqlalchemy import create_engine
 from sqlalchemy.sql import text
@@ -42,7 +43,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
 
-# ==================== SLIP & PROMPTPAY FUNCTIONS (from Slip.py) ====================
 import qrcode
 from qrcode.constants import ERROR_CORRECT_H
 import uuid
@@ -53,448 +53,13 @@ try:
 except ImportError:
     promptpay_qrcode = None  # จะ refactor ให้รองรับกรณีไม่มี promptpay ทีหลัง
 
-def find_order_by_id(order_id): # ลบ conn=None ออก เพราะตอนนี้ใช้ db.Model.query
-    """
-    ค้นหา Order ด้วย ID และคืนค่าเป็น Dictionary พร้อมข้อมูลที่จำเป็น
-    เพิ่ม renew_ads_id, package_id, และ show_at เพื่อรองรับการต่ออายุและโฆษณาใหม่
-    """
-    order = Order.query.filter_by(id=order_id).first()
-    if not order:
-        return None
-    return {
-        'id': order.id,
-        'user_id': order.user_id,
-        'amount': order.amount,
-        'status': order.status,
-        'promptpay_qr_payload': order.promptpay_qr_payload,
-        'slip_image': order.slip_image, # ดึง slip_image มาด้วย
-        'renew_ads_id': order.renew_ads_id, # เพิ่ม
-        'package_id': order.package_id,     # เพิ่ม
-        'show_at': order.show_at            # เพิ่ม
-    }
-
-def find_ad_by_order_id(order_id): # ลบ conn=None ออก
-    """
-    ค้นหา Ad ที่ผูกกับ Order ID และคืนค่าเป็น Dictionary
-    เพิ่ม show_at เพื่อรองรับ Ad ใหม่
-    """
-    ad = Ad.query.filter_by(order_id=order_id).first()
-    if not ad:
-        return None
-    return {
-        'id': ad.id,
-        'status': ad.status,
-        'expiration_date': ad.expiration_date,
-        'show_at': ad.show_at # เพิ่ม
-    }
-
-def find_ad_by_id(ad_id): # ฟังก์ชันใหม่สำหรับค้นหา Ad ด้วย Ad ID
-    """
-    ค้นหา Ad ด้วย Ad ID และคืนค่าเป็น Dictionary พร้อมข้อมูลที่จำเป็น
-    ใช้สำหรับดึงข้อมูล Ad เดิมที่ต้องการต่ออายุ
-    """
-    ad = Ad.query.filter_by(id=ad_id).first()
-    if not ad:
-        return None
-    return {
-        'id': ad.id,
-        'user_id': ad.user_id,
-        'order_id': ad.order_id,
-        'title': ad.title,
-        'content': ad.content,
-        'link': ad.link,
-        'image': ad.image,
-        'status': ad.status,
-        'expiration_date': ad.expiration_date,
-        'created_at': ad.created_at,
-        'updated_at': ad.updated_at,
-        'show_at': ad.show_at
-    }
-
-def get_ad_package_duration(package_id): # ฟังก์ชันใหม่สำหรับดึง duration_days
-    """
-    ดึง duration_days จาก AdPackage ด้วย package_id
-    """
-    pkg = AdPackage.query.filter_by(package_id=package_id).first()
-    if not pkg:
-        print(f"❌ [ERROR] AdPackage with ID {package_id} not found.")
-        return None
-    return pkg.duration_days
-
-def update_status_and_slip_info(order_id, new_status, slip_image_path, slip_transaction_id):
-    """
-    อัปเดตสถานะ Order และบันทึกข้อมูลสลิป
-    """
-    order = Order.query.filter_by(id=order_id).first()
-    if not order:
-        print(f"❌ [ERROR] Order ID {order_id} not found for status update.")
-        return False
-    order.status = new_status
-    order.slip_image = slip_image_path
-    # --- ลบบรรทัดนี้ออก ---
-    # order.slip_transaction_id = slip_transaction_id # เพิ่มการบันทึก transaction ID
-    order.updated_at = datetime.now()
+try:
+    locale.setlocale(locale.LC_ALL, 'th_TH.UTF-8') # ลองใช้สำหรับ Linux/macOS
+except locale.Error:
     try:
-        db.session.commit()
-        print(f"✅ Order ID: {order_id} status updated to '{new_status}' with slip info.")
-        return True
-    except Exception as e:
-        db.session.rollback()
-        print(f"❌ Error updating order status for ID {order_id}: {e}")
-        return False
-
-def update_ad_status(ad_id, new_status): # ลบ conn=None ออก
-    """
-    อัปเดตสถานะของ Ad เท่านั้น (สำหรับ Ad ใหม่ หรือ Ad ต่ออายุที่ต้องการเปลี่ยนสถานะเฉยๆ)
-    ไม่กระทบ expiration_date หรือ show_at
-    """
-    ad = Ad.query.filter_by(id=ad_id).first()
-    if not ad:
-        print(f"❌ [ERROR] Ad ID {ad_id} not found for status update.")
-        return False
-    ad.status = new_status
-    ad.updated_at = datetime.now()
-    try:
-        db.session.commit()
-        print(f"✅ Ad ID: {ad_id} status updated to '{new_status}'.")
-        return True
-    except Exception as e:
-        db.session.rollback()
-        print(f"❌ Error updating ad status for ID {ad_id}: {e}")
-        return False
-
-def update_ad_for_renewal(ad_id, new_status, new_expiration_date): # ฟังก์ชันใหม่สำหรับอัปเดต Ad ที่ต่ออายุ
-    """
-    อัปเดตสถานะและวันหมดอายุของ Ad สำหรับการต่ออายุ
-    *ไม่เปลี่ยนแปลง show_at เดิมของ Ad*
-    """
-    ad = Ad.query.filter_by(id=ad_id).first()
-    if not ad:
-        print(f"❌ [ERROR] Ad ID {ad_id} not found for renewal update.")
-        return False
-    ad.status = new_status
-    ad.expiration_date = new_expiration_date
-    ad.updated_at = datetime.now()
-    try:
-        db.session.commit()
-        print(f"✅ Ad ID: {ad_id} status updated to '{new_status}' and expiration date extended to {new_expiration_date.strftime('%Y-%m-%d')}.")
-        return True
-    except Exception as e:
-        db.session.rollback()
-        print(f"❌ Error updating ad for renewal ID {ad_id}: {e}")
-        return False
-
-def update_order_with_promptpay_payload_db(order_id, payload_to_store_in_db): # ลบ conn=None ออก
-    """
-    บันทึก PromptPay QR Payload ลงใน Order
-    """
-    order = Order.query.filter_by(id=order_id).first()
-    if not order:
-        print(f"❌ [ERROR] Order ID {order_id} not found for payload update.")
-        return False
-    order.promptpay_qr_payload = payload_to_store_in_db
-    order.updated_at = datetime.now()
-    try:
-        db.session.commit()
-        print(f"✅ Order ID: {order_id} updated with PromptPay payload.")
-        return True
-    except Exception as e:
-        db.session.rollback()
-        print(f"❌ Error updating order with PromptPay payload: {e}")
-        return False
-
-def create_advertisement_db(order_data): # ลบ conn=None ออก
-    """
-    สร้าง Ad ใหม่สำหรับ Order ที่ชำระเงินแล้ว (ในกรณีที่เป็นโฆษณาใหม่)
-    กำหนด status เริ่มต้นเป็น 'paid' และใช้ show_at จาก order_data
-    """
-    now = datetime.now()
-    default_title = f"Advertisement for Order {order_data['id']}"
-    default_content = "This is a new advertisement pending admin approval after payment."
-    
-    # show_at ของ Ad ใหม่จะใช้ค่าจาก order_data['show_at'] ถ้ามี
-    # ซึ่งโดยปกติแล้ว order_data['show_at'] จะมาจากตอนสร้าง Order
-    ad_show_at = order_data.get('show_at', now) # กำหนดค่าเริ่มต้นเป็น datetime.now() หากไม่มี show_at ใน order_data
-
-    ad = Ad(
-        user_id=order_data['user_id'],
-        order_id=order_data['id'],
-        title=default_title,
-        content=default_content,
-        link="",
-        image="",
-        status='paid', # เริ่มต้นเป็น paid เพราะสลิปผ่านแล้ว
-        created_at=now,
-        updated_at=now,
-        show_at=ad_show_at # กำหนด show_at
-    )
-    try:
-        db.session.add(ad)
-        db.session.commit()
-        print(f"🚀 Advertisement ID: {ad.id} created for Order ID: {order_data['id']} with status 'paid'.")
-        return ad.id
-    except Exception as e:
-        db.session.rollback()
-        print(f"❌ Error creating advertisement for Order ID {order_data['id']}: {e}")
-        return None
-
-# --- ฟังก์ชันสร้าง PromptPay QR Code สำหรับ Order ที่ปรับแก้ ---
-def generate_promptpay_qr_for_order(order_id):
-    """
-    สร้าง PromptPay QR Code สำหรับ Order ที่กำหนด
-    เงื่อนไข:
-    - Order ต้องมี status เป็น 'approved' (สำหรับโฆษณาใหม่)
-    - หรือ status เป็น 'pending' และ renew_ads_id ไม่เป็น null (สำหรับโฆษณาต่ออายุ)
-    """
-    order = find_order_by_id(order_id)
-    if not order:
-        print(f"❌ [WARN] Order ID {order_id} not found for QR generation.")
-        return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
-
-    # เงื่อนไขการ Generate QR Code ตามที่ตกลงกัน
-    is_new_ad_approved = order["status"] == 'approved' and order.get("renew_ads_id") is None
-    is_renewal_ad_pending = order["status"] == 'pending' and order.get("renew_ads_id") is not None
-
-    if is_new_ad_approved or is_renewal_ad_pending:
-        print(f"✅ [INFO] Order ID {order_id} is eligible for QR generation. Status: '{order['status']}', Renew Ad: {order.get('renew_ads_id')}.")
-    else:
-        log_message = f"❌ [WARN] Cannot generate QR for order {order_id}. Current status: '{order['status']}'."
-        if order["status"] == 'pending' and order.get("renew_ads_id") is None:
-            log_message += " (New ad order not yet approved by admin)."
-            return {"success": False, "message": "ไม่สามารถสร้าง QR Code ได้ ต้องรอให้แอดมินอนุมัติเนื้อหาก่อน"}
-        else:
-            log_message += " (Invalid status for QR generation)."
-            return {"success": False, "message": "ไม่สามารถสร้าง QR Code ได้ สถานะคำสั่งซื้อไม่ถูกต้อง"}
-        print(log_message)
-
-    amount = float(order["amount"])
-    if promptpay_qrcode is None:
-        print(f"❌ [ERROR] promptpay_qrcode library not found.")
-        return {"success": False, "message": "ไม่พบไลบรารี promptpay กรุณาติดตั้งก่อน"}
-
-    promptpay_id = os.getenv("PROMPTPAY_ID")
-    if not promptpay_id:
-        print(f"❌ [ERROR] PROMPTPAY_ID environment variable not set.")
-        return {"success": False, "message": "ไม่พบ PromptPay ID ในการตั้งค่า"}
-
-    original_scannable_payload = promptpay_qrcode.generate_payload(promptpay_id, amount)
-
-    if not update_order_with_promptpay_payload_db(order_id, original_scannable_payload):
-        print(f"❌ [ERROR] Failed to save QR Code payload to database for order {order_id}.")
-        return {"success": False, "message": "ไม่สามารถบันทึกข้อมูล QR Code ลงฐานข้อมูลได้"}
-
-    print(f"✅ Generated PromptPay payload (stored in DB): {original_scannable_payload}")
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=ERROR_CORRECT_H,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(original_scannable_payload)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buffered = io.BytesIO()
-    if hasattr(img, 'get_image'): # Pillow specific
-        img.get_image().save(buffered, "PNG")
-    else: # qrcode library's default image object
-        img.save(buffered, "PNG")
-    img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    return {"success": True, "message": "สร้าง QR Code สำเร็จ", "qrcode_base64": img_b64, "payload": original_scannable_payload}
-
-# --- ฟังก์ชันตรวจสอบว่าสามารถอัปโหลด slip ได้หรือไม่ ที่ปรับแก้ ---
-def can_upload_slip(order):
-    """
-    คืนค่า True ถ้า order สามารถอัปโหลด slip ได้ตามเงื่อนไข:
-    - status เป็น 'approved' (สำหรับโฆษณาใหม่)
-    - หรือ status เป็น 'pending' และ renew_ads_id ไม่เป็น None (สำหรับโฆษณาต่ออายุ)
-    """
-    if not order:
-        return False
-    
-    is_new_ad_approved = order["status"] == 'approved' and order.get("renew_ads_id") is None
-    is_renewal_ad_pending = order["status"] == 'pending' and order.get("renew_ads_id") is not None
-    
-    return is_new_ad_approved or is_renewal_ad_pending
-
-
-# --- ฟังก์ชันหลักในการตรวจสอบสลิปและอัปเดตสถานะ (ฉบับแก้ไข: ข้าม SlipOK API และแก้ Logic วันหมดอายุ) ---
-def verify_payment_and_update_status(order_id, slip_image_path, payload_from_client):
-    print(f"\n--- Processing payment for Order ID: {order_id} ---")
-    print(f"Slip image path: {slip_image_path}")
-    print(f"Payload (from client - original QR data): {payload_from_client}")
-
-    # ดึงข้อมูล Order มาก่อน
-    order = find_order_by_id(order_id)
-    if not order:
-        print(f"❌ [ERROR] Order ID {order_id} not found.")
-        return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
-
-    try:
-        # ตรวจสอบเงื่อนไขการอัปโหลดสลิป
-        if not can_upload_slip(order):
-            log_message = f"❌ [WARN] Cannot upload slip for Order ID {order_id}. Current status: {order.get('status')}."
-            if order.get("status") == 'pending' and order.get("renew_ads_id") is None:
-                log_message += " (New ad order not yet approved by admin)."
-                print(log_message)
-                return {"success": False, "message": "ไม่สามารถอัปโหลดสลิปได้ ต้องรอให้แอดมินอนุมัติเนื้อหาก่อน"}
-            else:
-                log_message += " (Invalid order status)."
-                print(log_message)
-                return {"success": False, "message": "ไม่สามารถอัปโหลดสลิปได้ สถานะคำสั่งซื้อไม่ถูกต้อง"}
-
-        # --- ส่วนตรวจสอบ Ad ที่เกี่ยวข้องก่อนเรียก SlipOK API ---
-        ad_related = None
-        if order.get("renew_ads_id") is not None:
-            ad_related = find_ad_by_id(order["renew_ads_id"])
-            if not ad_related:
-                print(f"❌ [ERROR] Associated ad for renewal (ID {order['renew_ads_id']}) not found for Order ID {order_id}.")
-                return {"success": False, "message": "ไม่พบโฆษณาที่ต้องการต่ออายุ"}
-
-            today = datetime.now().date()
-            if ad_related.get('expiration_date') and ad_related['expiration_date'] < today:
-                print(f"❌ [WARN] Cannot renew ad ID {ad_related['id']} for Order ID {order_id}. Ad has expired on {ad_related['expiration_date'].strftime('%Y-%m-%d')}.")
-                return {"success": False, "message": "ไม่สามารถต่ออายุโฆษณาได้ เนื่องจากโฆษณาหมดอายุแล้ว"}
-
-            if ad_related.get('status') not in ['active', 'expiring_soon', 'paused']:
-                print(f"❌ [WARN] Associated ad ID {ad_related['id']} for Order ID {order_id} is not in a renewable status. Current ad status: {ad_related['status']}.")
-                return {"success": False, "message": "โฆษณาสำหรับคำสั่งซื้อนี้ไม่อยู่ในสถานะที่สามารถต่ออายุได้"}
-        else:
-            ad_related = find_ad_by_order_id(order_id)
-            if ad_related and ad_related.get('status') in ['active', 'rejected', 'paid']:
-                print(f"❌ [WARN] Associated ad for Order ID {order_id} is already processed. Current ad status: {ad_related['status']}.")
-                return {"success": False, "message": "โฆษณาสำหรับคำสั่งซื้อนี้มีการดำเนินการไปแล้ว"}
-
-        # --- เรียก SlipOK API จริง ---
-        SLIP_OK_API_ENDPOINT = os.getenv("SLIP_OK_API_ENDPOINT", "https://api.slipok.com/api/line/apikey/49130")
-        SLIP_OK_API_KEY = os.getenv("SLIP_OK_API_KEY", "SLIPOKKBE52WN")
-        if not os.path.exists(slip_image_path):
-            print(f"❌ [ERROR] Slip image file not found at '{slip_image_path}'")
-            return {"success": False, "message": "ไม่พบไฟล์รูปภาพสลิป"}
-        with open(slip_image_path, 'rb') as img_file:
-            files = {'files': img_file}
-            form_data_for_slipok = {
-                'log': 'true',
-                'amount': str(float(order["amount"]))
-            }
-            headers = {
-                "x-authorization": SLIP_OK_API_KEY,
-            }
-            print(f"Sending request to SlipOK API: {SLIP_OK_API_ENDPOINT}")
-            print(f"Headers sent: {headers}")
-            print(f"Form Data sent to SlipOK: {form_data_for_slipok}")
-            response = requests.post(SLIP_OK_API_ENDPOINT, files=files, data=form_data_for_slipok, headers=headers, timeout=30)
-            response.raise_for_status()
-            print(f"DEBUG: Full SlipOK response text: {response.text}")
-            slip_ok_response_data = response.json()
-            print(f"Received response from SlipOK: {slip_ok_response_data}")
-            if not slip_ok_response_data.get("success"):
-                error_message = slip_ok_response_data.get("message", "Unknown error from SlipOK API")
-                print(f"❌ Log: Error from SlipOK API: {error_message}")
-                return {"success": False, "message": f"การตรวจสอบสลิปไม่สำเร็จ: {error_message}"}
-            slipok_data = slip_ok_response_data.get("data")
-            if not slipok_data:
-                print(f"❌ Log: Unexpected response format from SlipOK API: 'data' field is missing or empty.")
-                return {"success": False, "message": "รูปแบบข้อมูลจากระบบตรวจสอบสลิปไม่ถูกต้อง (ไม่พบข้อมูลสลิป)"}
-            slip_transaction_id_from_api = slipok_data.get("transRef")
-            slip_amount = float(slipok_data.get("amount", 0.0))
-            if not slip_transaction_id_from_api:
-                print(f"❌ Log: Missing 'transRef' in SlipOK 'data' object.")
-                return {"success": False, "message": "รูปแบบข้อมูลจากระบบตรวจสอบสลิปไม่ถูกต้อง (ไม่พบ Transaction ID)"}
-
-        # ตรวจสอบยอดเงิน
-        if abs(slip_amount - float(order.get("amount"))) > 0.01:
-            print(f"❌ [WARN] Amount mismatch. Order: {order.get('amount')}, Slip: {slip_amount}")
-            return {"success": False, "message": f"ยอดเงินไม่ถูกต้อง (ต้องการ {order.get('amount'):.2f} บาท แต่ได้รับ {slip_amount:.2f} บาท)"}
-
-        # --- เริ่มต้น Transaction เพื่ออัปเดตฐานข้อมูล ---
-        # ใช้ db.session ของ SQLAlchemy
-        if not update_status_and_slip_info(order_id, "paid", slip_image_path, slip_transaction_id_from_api):
-            raise Exception("Failed to update order status and slip info.")
-
-        ad_id_to_return = None
-        # ตรวจสอบว่าเป็น Order สำหรับการต่ออายุโฆษณาหรือไม่
-        if order.get("renew_ads_id") is not None:
-            current_ad = find_ad_by_id(order["renew_ads_id"])
-            if not current_ad:
-                raise Exception(f"Ad with ID {order['renew_ads_id']} not found for renewal processing after order update.")
-            duration_days = get_ad_package_duration(order["package_id"])
-            if duration_days is None:
-                raise Exception(f"Ad package duration not found for package_id {order['package_id']} for renewal.")
-            original_expiration = current_ad.get('expiration_date')
-            renewal_start_date_candidate = None
-            if original_expiration:
-                if isinstance(original_expiration, date) and not isinstance(original_expiration, datetime):
-                    renewal_start_date_candidate = datetime.combine(original_expiration, datetime.min.time())
-                elif isinstance(original_expiration, datetime):
-                    renewal_start_date_candidate = original_expiration
-            if order.get("renew_ads_id") is not None and original_expiration:
-                if renewal_start_date_candidate:
-                    calculated_renewal_start = renewal_start_date_candidate + timedelta(days=1)
-                else:
-                    calculated_renewal_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                if calculated_renewal_start.date() < datetime.now().date():
-                    actual_renewal_start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                else:
-                    actual_renewal_start_date = calculated_renewal_start
-                new_expiration_date = actual_renewal_start_date + timedelta(days=duration_days - 1)
-            else:
-                order_show_at = order.get('show_at')
-                actual_start_date_for_new_ad = None
-                if order_show_at:
-                    if isinstance(order_show_at, date) and not isinstance(order_show_at, datetime):
-                        actual_start_date_for_new_ad = datetime.combine(order_show_at, datetime.min.time())
-                    elif isinstance(order_show_at, datetime):
-                        actual_start_date_for_new_ad = order_show_at
-                if actual_start_date_for_new_ad is None:
-                    actual_start_date_for_new_ad = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                new_expiration_date = actual_start_date_for_new_ad + timedelta(days=duration_days - 1)
-            if not update_ad_for_renewal(current_ad['id'], "active", new_expiration_date.date()):
-                raise Exception("Failed to update existing ad status and expiration date for renewal.")
-            ad_id_to_return = current_ad['id']
-            print(f"✅ [INFO] Transaction committed successfully for Order ID: {order_id}. Ad ID {ad_id_to_return} renewed.")
-            return {"success": True, "message": f"ชำระเงินสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก {duration_days} วันเรียบร้อยแล้ว", "ad_id": ad_id_to_return}
-        else:
-            ad_id = None
-            ad = find_ad_by_order_id(order_id)
-            if ad:
-                ad_id = ad['id']
-                if not update_ad_status(ad_id, "paid"):
-                    raise Exception("Failed to update existing ad status to 'paid' for new ad.")
-            else:
-                ad_id = create_advertisement_db(order)
-                if ad_id is None:
-                    raise Exception("Failed to create new advertisement.")
-            ad_id_to_return = ad_id
-            print(f"✅ [INFO] Transaction committed successfully for Order ID: {order_id} and new Ad ID: {ad_id_to_return}")
-            return {"success": True, "message": "ชำระเงินสำเร็จ! กรุณารอแอดมินตรวจสอบ", "ad_id": ad_id_to_return}
-
-    except requests.exceptions.Timeout:
-        print(f"❌ Log: API Request Timeout: SlipOK API did not respond in time.")
-        return {"success": False, "message": "ระบบตรวจสอบสลิปตอบกลับช้าเกินไป โปรดลองอีกครั้ง"}
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ Log: Network or API HTTP Error (Unhandled by custom codes): {e}")
-        try:
-            error_details = response.json()
-            print(f"    Error Details: {error_details}")
-            # เพิ่มบรรทัดนี้
-            print(f"    [SlipOK Message] {error_details.get('message', '')}")
-            return {"success": False, "message": f"เกิดข้อผิดพลาดในการเชื่อมต่อกับระบบตรวจสอบสลิป: {error_details.get('message', 'Unknown HTTP Error')}"}
-        except Exception:
-            return {"success": False, "message": f"เกิดข้อผิดพลาดในการเชื่อมต่อกับระบบตรวจสอบสลิป: {e}"}
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Log: Network Error (e.g., DNS, connection refused): {e}")
-        return {"success": False, "message": f"เกิดข้อผิดพลาดในการเชื่อมต่อกับระบบตรวจสอบสลิป: {e}"}
-    except ValueError:
-        print(f"❌ Log: Error: Could not parse amount from SlipOK response.")
-        return {"success": False, "message": "รูปแบบยอดเงินจากระบบตรวจสอบสลิปไม่ถูกต้อง"}
-    except Exception as e:
-        try:
-            if 'db' in globals() and hasattr(db, 'session'):
-                db.session.rollback()
-        except Exception as rollback_e:
-            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
-        print(f"❌ [ERROR] Transaction failed for Order ID: {order_id}. Rolling back changes. Error: {e}")
-        return {"success": False, "message": f"เกิดข้อผิดพลาดในการทำรายการ: {e}"}
+        locale.setlocale(locale.LC_ALL, 'thai') # ลองใช้สำหรับ Windows
+    except locale.Error:
+        print("⚠️ [WARN] Could not set Thai locale. Date formatting might not show full Thai month names.")
 
 
 app = Flask(__name__)
@@ -624,6 +189,7 @@ class AdPackage(db.Model):
 
     def __repr__(self):
         return f'<AdPackage {self.package_id}>'
+
 
 load_dotenv()
 # Secret key for encoding/decoding JWT tokens
@@ -938,6 +504,677 @@ def clear_cache():
 
 # สร้าง thread สำหรับ clear cache
 threading.Thread(target=clear_cache, daemon=True).start()
+
+
+# ==================== SLIP & PROMPTPAY FUNCTIONS (from Slip.py) ====================
+
+
+def find_order_by_id(order_id): # ลบ conn=None ออก เพราะตอนนี้ใช้ db.Model.query
+    """
+    ค้นหา Order ด้วย ID และคืนค่าเป็น Dictionary พร้อมข้อมูลที่จำเป็น
+    เพิ่ม renew_ads_id, package_id, และ show_at เพื่อรองรับการต่ออายุและโฆษณาใหม่
+    """
+    order = Order.query.filter_by(id=order_id).first()
+    if not order:
+        return None
+    return {
+        'id': order.id,
+        'user_id': order.user_id,
+        'amount': order.amount,
+        'status': order.status,
+        'promptpay_qr_payload': order.promptpay_qr_payload,
+        'slip_image': order.slip_image, # ดึง slip_image มาด้วย
+        'renew_ads_id': order.renew_ads_id, # เพิ่ม
+        'package_id': order.package_id,     # เพิ่ม
+        'show_at': order.show_at            # เพิ่ม
+    }
+
+
+def find_ad_by_order_id(order_id): # ลบ conn=None ออก
+    """
+    ค้นหา Ad ที่ผูกกับ Order ID และคืนค่าเป็น Dictionary
+    เพิ่ม show_at เพื่อรองรับ Ad ใหม่
+    """
+    ad = Ad.query.filter_by(order_id=order_id).first()
+    if not ad:
+        return None
+    return {
+        'id': ad.id,
+        'status': ad.status,
+        'expiration_date': ad.expiration_date,
+        'show_at': ad.show_at # เพิ่ม
+    }
+
+
+def find_ad_by_id(ad_id): # ฟังก์ชันใหม่สำหรับค้นหา Ad ด้วย Ad ID
+    """
+    ค้นหา Ad ด้วย Ad ID และคืนค่าเป็น Dictionary พร้อมข้อมูลที่จำเป็น
+    ใช้สำหรับดึงข้อมูล Ad เดิมที่ต้องการต่ออายุ
+    """
+    ad = Ad.query.filter_by(id=ad_id).first()
+    if not ad:
+        return None
+    return {
+        'id': ad.id,
+        'user_id': ad.user_id,
+        'order_id': ad.order_id,
+        'title': ad.title,
+        'content': ad.content,
+        'link': ad.link,
+        'image': ad.image,
+        'status': ad.status,
+        'expiration_date': ad.expiration_date,
+        'created_at': ad.created_at,
+        'updated_at': ad.updated_at,
+        'show_at': ad.show_at
+    }
+
+
+def get_ad_package_duration(package_id): # ฟังก์ชันใหม่สำหรับดึง duration_days
+    """
+    ดึง duration_days จาก AdPackage ด้วย package_id
+    """
+    pkg = AdPackage.query.filter_by(package_id=package_id).first()
+    if not pkg:
+        print(f"❌ [ERROR] AdPackage with ID {package_id} not found.")
+        return None
+    return pkg.duration_days
+
+
+def update_status_and_slip_info(order_id, new_status, slip_image_path, slip_transaction_id):
+    """
+    อัปเดตสถานะ Order และบันทึกข้อมูลสลิป
+    """
+    order = Order.query.filter_by(id=order_id).first()
+    if not order:
+        print(f"❌ [ERROR] Order ID {order_id} not found for status update.")
+        return False
+    order.status = new_status
+    order.slip_image = slip_image_path
+    # --- ลบบรรทัดนี้ออก ---
+    # order.slip_transaction_id = slip_transaction_id # เพิ่มการบันทึก transaction ID
+    order.updated_at = datetime.now()
+    try:
+        db.session.commit()
+        print(f"✅ Order ID: {order_id} status updated to '{new_status}' with slip info.")
+        return True
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error updating order status for ID {order_id}: {e}")
+        return False
+
+
+def update_ad_status(ad_id, new_status): # ลบ conn=None ออก
+    """
+    อัปเดตสถานะของ Ad เท่านั้น (สำหรับ Ad ใหม่ หรือ Ad ต่ออายุที่ต้องการเปลี่ยนสถานะเฉยๆ)
+    ไม่กระทบ expiration_date หรือ show_at
+    """
+    ad = Ad.query.filter_by(id=ad_id).first()
+    if not ad:
+        print(f"❌ [ERROR] Ad ID {ad_id} not found for status update.")
+        return False
+    ad.status = new_status
+    ad.updated_at = datetime.now()
+    try:
+        db.session.commit()
+        print(f"✅ Ad ID: {ad_id} status updated to '{new_status}'.")
+        return True
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error updating ad status for ID {ad_id}: {e}")
+        return False
+
+
+def update_ad_for_renewal(ad_id, new_status, new_expiration_date): # ฟังก์ชันใหม่สำหรับอัปเดต Ad ที่ต่ออายุ
+    """
+    อัปเดตสถานะและวันหมดอายุของ Ad สำหรับการต่ออายุ
+    *ไม่เปลี่ยนแปลง show_at เดิมของ Ad*
+    """
+    ad = Ad.query.filter_by(id=ad_id).first()
+    if not ad:
+        print(f"❌ [ERROR] Ad ID {ad_id} not found for renewal update.")
+        return False
+    ad.status = new_status
+    ad.expiration_date = new_expiration_date
+    ad.updated_at = datetime.now()
+    try:
+        db.session.commit()
+        print(f"✅ Ad ID: {ad_id} status updated to '{new_status}' and expiration date extended to {new_expiration_date.strftime('%Y-%m-%d')}.")
+        return True
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error updating ad for renewal ID {ad_id}: {e}")
+        return False
+
+
+def update_order_with_promptpay_payload_db(order_id, payload_to_store_in_db): # ลบ conn=None ออก
+    """
+    บันทึก PromptPay QR Payload ลงใน Order
+    """
+    order = Order.query.filter_by(id=order_id).first()
+    if not order:
+        print(f"❌ [ERROR] Order ID {order_id} not found for payload update.")
+        return False
+    order.promptpay_qr_payload = payload_to_store_in_db
+    order.updated_at = datetime.now()
+    try:
+        db.session.commit()
+        print(f"✅ Order ID: {order_id} updated with PromptPay payload.")
+        return True
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error updating order with PromptPay payload: {e}")
+        return False
+
+
+def create_advertisement_db(order_data): # ลบ conn=None ออก
+    """
+    สร้าง Ad ใหม่สำหรับ Order ที่ชำระเงินแล้ว (ในกรณีที่เป็นโฆษณาใหม่)
+    กำหนด status เริ่มต้นเป็น 'paid' และใช้ show_at จาก order_data
+    """
+    now = datetime.now()
+    default_title = f"Advertisement for Order {order_data['id']}"
+    default_content = "This is a new advertisement pending admin approval after payment."
+    
+    # show_at ของ Ad ใหม่จะใช้ค่าจาก order_data['show_at'] ถ้ามี
+    # ซึ่งโดยปกติแล้ว order_data['show_at'] จะมาจากตอนสร้าง Order
+    ad_show_at = order_data.get('show_at', now) # กำหนดค่าเริ่มต้นเป็น datetime.now() หากไม่มี show_at ใน order_data
+
+    ad = Ad(
+        user_id=order_data['user_id'],
+        order_id=order_data['id'],
+        title=default_title,
+        content=default_content,
+        link="",
+        image="",
+        status='paid', # เริ่มต้นเป็น paid เพราะสลิปผ่านแล้ว
+        created_at=now,
+        updated_at=now,
+        show_at=ad_show_at # กำหนด show_at
+    )
+    try:
+        db.session.add(ad)
+        db.session.commit()
+        print(f"🚀 Advertisement ID: {ad.id} created for Order ID: {order_data['id']} with status 'paid'.")
+        return ad.id
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ Error creating advertisement for Order ID {order_data['id']}: {e}")
+        return None
+
+
+def generate_promptpay_qr_for_order(order_id):
+    """
+    สร้าง PromptPay QR Code สำหรับ Order ที่กำหนด
+    เงื่อนไข:
+    - Order ต้องมี status เป็น 'approved' (สำหรับโฆษณาใหม่)
+    - หรือ status เป็น 'pending' และ renew_ads_id ไม่เป็น null (สำหรับโฆษณาต่ออายุ)
+    """
+    order = find_order_by_id(order_id)
+    if not order:
+        print(f"❌ [WARN] Order ID {order_id} not found for QR generation.")
+        return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
+
+    # เงื่อนไขการ Generate QR Code ตามที่ตกลงกัน
+    is_new_ad_approved = order["status"] == 'approved' and order.get("renew_ads_id") is None
+    is_renewal_ad_pending = order["status"] == 'pending' and order.get("renew_ads_id") is not None
+
+    if is_new_ad_approved or is_renewal_ad_pending:
+        print(f"✅ [INFO] Order ID {order_id} is eligible for QR generation. Status: '{order['status']}', Renew Ad: {order.get('renew_ads_id')}.")
+    else:
+        log_message = f"❌ [WARN] Cannot generate QR for order {order_id}. Current status: '{order['status']}'."
+        if order["status"] == 'pending' and order.get("renew_ads_id") is None:
+            log_message += " (New ad order not yet approved by admin)."
+            return {"success": False, "message": "ไม่สามารถสร้าง QR Code ได้ ต้องรอให้แอดมินอนุมัติเนื้อหาก่อน"}
+        else:
+            log_message += " (Invalid status for QR generation)."
+            return {"success": False, "message": "ไม่สามารถสร้าง QR Code ได้ สถานะคำสั่งซื้อไม่ถูกต้อง"}
+        print(log_message)
+
+    amount = float(order["amount"])
+    if promptpay_qrcode is None:
+        print(f"❌ [ERROR] promptpay_qrcode library not found.")
+        return {"success": False, "message": "ไม่พบไลบรารี promptpay กรุณาติดตั้งก่อน"}
+
+    promptpay_id = os.getenv("PROMPTPAY_ID")
+    if not promptpay_id:
+        print(f"❌ [ERROR] PROMPTPAY_ID environment variable not set.")
+        return {"success": False, "message": "ไม่พบ PromptPay ID ในการตั้งค่า"}
+
+    original_scannable_payload = promptpay_qrcode.generate_payload(promptpay_id, amount)
+
+    if not update_order_with_promptpay_payload_db(order_id, original_scannable_payload):
+        print(f"❌ [ERROR] Failed to save QR Code payload to database for order {order_id}.")
+        return {"success": False, "message": "ไม่สามารถบันทึกข้อมูล QR Code ลงฐานข้อมูลได้"}
+
+    print(f"✅ Generated PromptPay payload (stored in DB): {original_scannable_payload}")
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=ERROR_CORRECT_H,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(original_scannable_payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffered = io.BytesIO()
+    if hasattr(img, 'get_image'): # Pillow specific
+        img.get_image().save(buffered, "PNG")
+    else: # qrcode library's default image object
+        img.save(buffered, "PNG")
+    img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    return {"success": True, "message": "สร้าง QR Code สำเร็จ", "qrcode_base64": img_b64, "payload": original_scannable_payload}
+
+
+def can_upload_slip(order):
+    """
+    คืนค่า True ถ้า order สามารถอัปโหลด slip ได้ตามเงื่อนไข:
+    - status เป็น 'approved' (สำหรับโฆษณาใหม่)
+    - หรือ status เป็น 'pending' และ renew_ads_id ไม่เป็น None (สำหรับโฆษณาต่ออายุ)
+    """
+    if not order:
+        return False
+    
+    is_new_ad_approved = order["status"] == 'approved' and order.get("renew_ads_id") is None
+    is_renewal_ad_pending = order["status"] == 'pending' and order.get("renew_ads_id") is not None
+    
+    return is_new_ad_approved or is_renewal_ad_pending
+
+
+def format_thai_date(date_obj):
+    """
+    ฟังก์ชันสำหรับจัดรูปแบบวันที่ให้เป็นภาษาไทยและปีพุทธศักราช
+    รับค่า date_obj: สามารถเป็น datetime.date, datetime.datetime, หรือ string
+    """
+    if not isinstance(date_obj, (datetime, date, str)):
+        return "วันที่ไม่ถูกต้อง"
+    
+    if isinstance(date_obj, str):
+        try:
+            date_obj = datetime.fromisoformat(date_obj)
+        except ValueError:
+            try:
+                date_obj = datetime.strptime(date_obj, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                try:
+                    date_obj = datetime.strptime(date_obj, '%Y-%m-%d').date()
+                except ValueError:
+                    return "วันที่ไม่ถูกต้อง"
+    
+    if isinstance(date_obj, date) and not isinstance(date_obj, datetime):
+        date_obj = datetime(date_obj.year, date_obj.month, date_obj.day)
+
+    thai_year = date_obj.year + 543
+    
+    try:
+        formatted_date = date_obj.strftime(f'%d %B {thai_year}')
+    except ValueError:
+        thai_month_names = [
+            "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+            "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"
+        ]
+        formatted_date = f"{date_obj.day} {thai_month_names[date_obj.month - 1]} {thai_year}"
+
+    return formatted_date
+
+
+def notify_ads_status_change(db, ad_id: int, new_status: str, admin_notes: str = None, duration_days_from_renewal: int = None) -> bool:
+    """
+    สร้างและบันทึก notification เมื่อสถานะโฆษณาเปลี่ยนแปลง หรือเมื่อมีการต่ออายุโฆษณาสำเร็จ.
+    ใช้ SQLAlchemy db.session ในการ query ข้อมูลและ COMMIT การแจ้งเตือนทันที.
+
+    Parameters:
+    - db: instance ของ SQLAlchemy object ที่เชื่อมต่อกับฐานข้อมูลแล้ว
+    - ad_id (int): รหัสของโฆษณาที่สถานะมีการเปลี่ยนแปลง
+    - new_status (str): สถานะใหม่ของโฆษณา
+    - admin_notes (str, optional): ข้อความบันทึกจากแอดมิน (ใช้ในกรณี 'rejected')
+    - duration_days_from_renewal (int, optional): จำนวนวันที่ต่ออายุ (ใช้ในกรณี 'active' จากการต่ออายุ)
+    """
+    try:
+        # ขั้นตอนที่ 1: ดึง user_id และ expiration_date ล่าสุดจากตาราง ads
+        ads_query = text('SELECT user_id, expiration_date FROM ads WHERE id = :ad_id')
+        ads_result = db.session.execute(ads_query, {'ad_id': ad_id}).fetchone()
+
+        if not ads_result:
+            print(f"❌ [WARN] notify_ads_status_change: Ad ID {ad_id} not found in 'ads' table.")
+            return False
+        
+        user_id = ads_result[0] # user_id
+        expiration_date = ads_result[1] # expiration_date
+
+        content = ''
+        
+        # เป็ดน้อยจะเปลี่ยน logic ในการดึง duration_from_package_db
+        # ให้ดึงเฉพาะเมื่อ duration_days_from_renewal ไม่มีค่า (คือไม่ได้ส่งมาจาก verify_payment_and_update_status)
+        duration_from_package_db = None
+        if duration_days_from_renewal is None: # ถ้าไม่มี duration_days ส่งมาโดยตรง ให้พยายามดึงจาก DB
+            order_package_query = text("""
+                SELECT ap.duration_days, o.status as order_status
+                FROM orders o
+                JOIN ad_packages ap ON o.package_id = ap.package_id
+                WHERE o.renew_ads_id = :ad_id -- แก้ไขตรงนี้: ลบ OR o.ads_id = :ad_id ออกไป
+                AND o.status IN ('paid', 'approved_payment_waiting')
+                ORDER BY o.created_at DESC
+                LIMIT 1
+            """)
+            package_info_result = db.session.execute(order_package_query, {'ad_id': ad_id}).fetchone()
+
+            if package_info_result:
+                duration_from_package_db = package_info_result[0]
+                order_status_found = package_info_result[1]
+                print(f"✅ [INFO] Found package duration {duration_from_package_db} days from order for Ad ID {ad_id} with order status '{order_status_found}'.")
+            else:
+                print(f"⚠️ [WARN] No 'paid' or 'approved_payment_waiting' order found linked to Ad ID {ad_id} via renew_ads_id to determine package duration.")
+
+
+        # กำหนดข้อความแจ้งเตือนตามเงื่อนไข
+        if new_status == 'active':
+            # ใช้ duration_days_from_renewal ก่อน ถ้ามีค่า (ซึ่งจะเป็นค่าที่ถูกต้องจากการคำนวณใน verify_payment_and_update_status)
+            duration_to_use = duration_days_from_renewal if duration_days_from_renewal is not None else duration_from_package_db
+            
+            if duration_to_use is not None:
+                formatted_expiration_date = format_thai_date(expiration_date)
+                content = f"โฆษณาของคุณได้รับการต่ออายุ {duration_to_use} วันสำเร็จแล้ว โฆษณานี้ขยายหมดอายุเป็นวันที่ {formatted_expiration_date}"
+            else:
+                content = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว'
+        elif new_status == 'paid':
+            content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ'
+        elif new_status == 'approved':
+            content = 'โฆษณาของคุณได้รับการตรวจสอบแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา'
+        elif new_status == 'rejected':
+            content = f'โฆษณาของคุณถูกปฏิเสธ เหตุผล: {admin_notes or "-"}'
+        elif new_status == 'expired':
+            content = 'โฆษณาของคุณหมดอายุแล้ว'
+        elif new_status == 'expiring_soon':
+            content = 'โฆษณาของคุณจะหมดอายุในอีก 3 วัน กรุณาต่ออายุเพื่อการแสดงผลอย่างต่อเนื่อง'
+        else:
+            content = f'สถานะโฆษณาของคุณเปลี่ยนเป็น {new_status}'
+        
+        # ขั้นตอนสุดท้าย: บันทึกข้อมูลการแจ้งเตือนลงในตาราง notifications
+        insert_notification_query = text("""
+            INSERT INTO notifications (user_id, action_type, content, ads_id)
+            VALUES (:user_id, 'ads_status_change', :content, :ads_id)
+        """)
+        db.session.execute(insert_notification_query, {
+            'user_id': user_id,
+            'content': content,
+            'ads_id': ad_id
+        })
+        db.session.commit()
+        print(f"✅ [INFO] Notification saved successfully for Ad ID {ad_id}. Content: '{content}'")
+        return True
+
+    except Exception as e:
+        print(f"❌ [ERROR] An unexpected error occurred in notify_ads_status_change for Ad ID {ad_id}: {e}")
+        db.session.rollback()
+        return False
+
+
+def verify_payment_and_update_status(order_id, slip_image_path, payload_from_client, db):
+    """
+    ฟังก์ชันหลักในการตรวจสอบสลิปการโอนเงินและอัปเดตสถานะคำสั่งซื้อ/โฆษณา.
+    จะรองรับทั้งการชำระเงินสำหรับโฆษณาใหม่และการต่ออายุโฆษณา.
+    """
+    print(f"\n--- Processing payment for Order ID: {order_id} ---")
+    print(f"Slip image path: {slip_image_path}")
+    print(f"Payload (from client - original QR data): {payload_from_client}")
+
+    # ดึงข้อมูล Order มาก่อน
+    order = find_order_by_id(order_id)
+    if not order:
+        print(f"❌ [ERROR] Order ID {order_id} not found.")
+        return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
+
+    try:
+        # ตรวจสอบเงื่อนไขการอัปโหลดสลิป
+        if not can_upload_slip(order):
+            log_message = f"❌ [WARN] Cannot upload slip for Order ID {order_id}. Current status: {order.get('status')}."
+            if order.get("status") == 'pending' and order.get("renew_ads_id") is None:
+                log_message += " (New ad order not yet approved by admin)."
+                print(log_message)
+                return {"success": False, "message": "ไม่สามารถอัปโหลดสลิปได้ ต้องรอให้แอดมินอนุมัติเนื้อหาก่อน"}
+            else:
+                log_message += " (Invalid order status)."
+                print(log_message)
+                return {"success": False, "message": "ไม่สามารถอัปโหลดสลิปได้ สถานะคำสั่งซื้อไม่ถูกต้อง"}
+
+        # --- ส่วนตรวจสอบ Ad ที่เกี่ยวข้องก่อนเรียก SlipOK API ---
+        ad_related = None
+        if order.get("renew_ads_id") is not None:
+            # กรณีต่ออายุโฆษณา: ตรวจสอบ Ad เดิม
+            ad_related = find_ad_by_id(order["renew_ads_id"])
+            if not ad_related:
+                print(f"❌ [ERROR] Associated ad for renewal (ID {order['renew_ads_id']}) not found for Order ID {order_id}.")
+                return {"success": False, "message": "ไม่พบโฆษณาที่ต้องการต่ออายุ"}
+
+            # ตรวจสอบว่าโฆษณาเดิมหมดอายุแล้วหรือไม่
+            today = datetime.now().date()
+            if isinstance(ad_related.get('expiration_date'), date) and ad_related['expiration_date'] < today:
+                print(f"❌ [WARN] Cannot renew ad ID {ad_related['id']} for Order ID {order_id}. Ad has expired on {ad_related['expiration_date'].strftime('%Y-%m-%d')}.")
+                return {"success": False, "message": "ไม่สามารถต่ออายุโฆษณาได้ เนื่องจากโฆษณาหมดอายุแล้ว"}
+
+            # ตรวจสอบสถานะ Ad เดิมที่สามารถต่ออายุได้ (active, expiring_soon, paused)
+            if ad_related.get('status') not in ['active', 'expiring_soon', 'paused']:
+                print(f"❌ [WARN] Associated ad ID {ad_related['id']} for Order ID {order_id} is not in a renewable status. Current ad status: {ad_related['status']}.")
+                return {"success": False, "message": "โฆษณาสำหรับคำสั่งซื้อนี้ไม่อยู่ในสถานะที่สามารถต่ออายุได้"}
+        else:
+            # กรณีโฆษณาใหม่: ตรวจสอบ Ad ที่ผูกกับ Order ID (ถ้ามีและสถานะไม่ถูกต้อง)
+            ad_related = find_ad_by_order_id(order_id)
+            if ad_related and ad_related.get('status') in ['active', 'rejected', 'paid']:
+                print(f"❌ [WARN] Associated ad for Order ID {order_id} is already processed. Current ad status: {ad_related['status']}.")
+                return {"success": False, "message": "โฆษณาสำหรับคำสั่งซื้อนี้มีการดำเนินการไปแล้ว"}
+
+        # --- เรียก SlipOK API จริง ---
+        SLIP_OK_API_ENDPOINT = os.getenv("SLIP_OK_API_ENDPOINT", "https://api.slipok.com/api/line/apikey/49130")
+        SLIP_OK_API_KEY = os.getenv("SLIP_OK_API_KEY", "SLIPOKKBE52WN")
+
+        if not os.path.exists(slip_image_path):
+            print(f"❌ [ERROR] Slip image file not found at '{slip_image_path}'")
+            return {"success": False, "message": "ไม่พบไฟล์รูปภาพสลิป"}
+
+        response = None # กำหนดค่าเริ่มต้นให้ response
+        with open(slip_image_path, 'rb') as img_file:
+            files = {'files': img_file}
+            form_data_for_slipok = {
+                'log': 'true',
+                'amount': str(float(order["amount"]))
+            }
+            headers = {
+                "x-authorization": SLIP_OK_API_KEY,
+            }
+            print(f"Sending request to SlipOK API: {SLIP_OK_API_ENDPOINT}")
+            print(f"Headers sent: {headers}")
+            print(f"Form Data sent to SlipOK: {form_data_for_slipok}")
+
+            response = requests.post(SLIP_OK_API_ENDPOINT, files=files, data=form_data_for_slipok, headers=headers, timeout=30)
+            response.raise_for_status() # จะ raise HTTPError ถ้าสถานะไม่ใช่ 2xx
+
+            print(f"DEBUG: Full SlipOK response text: {response.text}")
+            slip_ok_response_data = response.json()
+            print(f"Received response from SlipOK: {slip_ok_response_data}")
+
+            if not slip_ok_response_data.get("success"):
+                error_message = slip_ok_response_data.get("message", "Unknown error from SlipOK API")
+                print(f"❌ Log: Error from SlipOK API: {error_message}")
+                return {"success": False, "message": f"การตรวจสอบสลิปไม่สำเร็จ: {error_message}"}
+
+            slipok_data = slip_ok_response_data.get("data")
+            if not slipok_data:
+                print(f"❌ Log: Unexpected response format from SlipOK API: 'data' field is missing or empty.")
+                return {"success": False, "message": "รูปแบบข้อมูลจากระบบตรวจสอบสลิปไม่ถูกต้อง (ไม่พบข้อมูลสลิป)"}
+
+            slip_transaction_id_from_api = slipok_data.get("transRef")
+            slip_amount = float(slipok_data.get("amount", 0.0))
+
+            if not slip_transaction_id_from_api:
+                print(f"❌ Log: Missing 'transRef' in SlipOK 'data' object.")
+                return {"success": False, "message": "รูปแบบข้อมูลจากระบบตรวจสอบสลิปไม่ถูกต้อง (ไม่พบ Transaction ID)"}
+
+        # ตรวจสอบยอดเงิน
+        if abs(slip_amount - float(order.get("amount"))) > 0.01:
+            print(f"❌ [WARN] Amount mismatch. Order: {order.get('amount')}, Slip: {slip_amount}")
+            return {"success": False, "message": f"ยอดเงินไม่ถูกต้อง (ต้องการ {order.get('amount'):.2f} บาท แต่ได้รับ {slip_amount:.2f} บาท)"}
+
+        # --- เริ่มต้น Transaction เพื่ออัปเดตฐานข้อมูล ---
+        # ใช้ db.session ของ SQLAlchemy
+        if not update_status_and_slip_info(order_id, "paid", slip_image_path, slip_transaction_id_from_api):
+            raise Exception("Failed to update order status and slip info.")
+
+        ad_id_to_return = None
+        ad_new_status_for_notification = None # เพิ่มตัวแปรเพื่อเก็บสถานะสำหรับแจ้งเตือน
+
+        # ตรวจสอบว่าเป็น Order สำหรับการต่ออายุโฆษณาหรือไม่
+        if order.get("renew_ads_id") is not None:
+            # กรณีต่ออายุโฆษณา: อัปเดต Ad เดิม
+            current_ad = find_ad_by_id(order["renew_ads_id"])
+            if not current_ad:
+                raise Exception(f"Ad with ID {order['renew_ads_id']} not found for renewal processing after order update.")
+
+            duration_days = get_ad_package_duration(order["package_id"])
+            if duration_days is None:
+                raise Exception(f"Ad package duration not found for package_id {order['package_id']} for renewal.")
+
+            # --- Logic การคำนวณวันหมดอายุใหม่ ---
+            original_expiration = current_ad.get('expiration_date')
+
+            renewal_start_date_candidate = None
+
+            if original_expiration:
+                if isinstance(original_expiration, date) and not isinstance(original_expiration, datetime):
+                    renewal_start_date_candidate = datetime.combine(original_expiration, datetime.min.time())
+                elif isinstance(original_expiration, datetime):
+                    renewal_start_date_candidate = original_expiration
+
+            if original_expiration: # กรณีต่ออายุโฆษณาที่มีวันหมดอายุเดิม
+                if renewal_start_date_candidate:
+                    calculated_renewal_start = renewal_start_date_candidate + timedelta(days=1)
+                else: # Fallback ถ้า renewal_start_date_candidate เป็น None
+                    calculated_renewal_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+                if calculated_renewal_start.date() < datetime.now().date(): # ถ้าวันที่เริ่มต้นคำนวณย้อนหลังไปแล้ว
+                    actual_renewal_start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                else:
+                    actual_renewal_start_date = calculated_renewal_start
+
+                new_expiration_date = actual_renewal_start_date + timedelta(days=duration_days - 1)
+
+            else: # กรณีโฆษณาใหม่ (ไม่ควรเข้าบล็อกนี้หาก renew_ads_id ไม่ใช่ None)
+                order_show_at = order.get('show_at')
+                actual_start_date_for_new_ad = None
+                if order_show_at:
+                    if isinstance(order_show_at, date) and not isinstance(order_show_at, datetime):
+                        actual_start_date_for_new_ad = datetime.combine(order_show_at, datetime.min.time())
+                    elif isinstance(order_show_at, datetime):
+                        actual_start_date_for_new_ad = order_show_at
+
+                if actual_start_date_for_new_ad is None:
+                    actual_start_date_for_new_ad = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+                new_expiration_date = actual_start_date_for_new_ad + timedelta(days=duration_days - 1)
+
+            # อัปเดตโฆษณาด้วยสถานะ 'active' และวันหมดอายุใหม่
+            if not update_ad_for_renewal(current_ad['id'], "active", new_expiration_date.date()):
+                raise Exception("Failed to update existing ad status and expiration date for renewal.")
+
+            ad_id_to_return = current_ad['id']
+            ad_new_status_for_notification = 'active' # สถานะสำหรับแจ้งเตือนการต่ออายุ
+
+        else:
+            # กรณีโฆษณาใหม่: สร้างหรืออัปเดต Ad
+            ad_id = None
+            ad = find_ad_by_order_id(order_id)
+            if ad:
+                ad_id = ad['id']
+                if not update_ad_status(ad_id, "paid"):
+                    raise Exception("Failed to update existing ad status to 'paid' for new ad.")
+            else:
+                ad_id = create_advertisement_db(order)
+                if ad_id is None:
+                    raise Exception("Failed to create new advertisement.")
+
+            ad_id_to_return = ad_id
+            ad_new_status_for_notification = 'paid' # สถานะสำหรับแจ้งเตือนโฆษณาใหม่ที่ชำระแล้ว
+
+        db.session.commit() # *** COMMIT TRANSACTION ที่นี่ สำหรับ Order และ Ad Status ***
+        print(f"✅ [INFO] Transaction committed successfully for Order ID: {order_id}.")
+
+        # *** นี่คือจุดที่จะเรียกฟังก์ชันแจ้งเตือน หลังจาก Transaction สำเร็จ ***
+        # notify_ads_status_change จะทำการ commit ตัวเอง
+        if ad_id_to_return and ad_new_status_for_notification:
+            notify_ads_status_change(db, ad_id_to_return, ad_new_status_for_notification)
+
+        # กำหนดข้อความตอบกลับตามประเภทโฆษณา
+        if order.get("renew_ads_id") is not None:
+             # ดึง duration_days อีกครั้งเพื่อส่งข้อความที่ถูกต้อง
+            duration_days = get_ad_package_duration(order["package_id"])
+            message = f"ชำระเงินสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก {duration_days} วันเรียบร้อยแล้ว"
+        else:
+            message = "ชำระเงินสำเร็จ! กรุณารอแอดมินตรวจสอบ"
+
+        return {"success": True, "message": message, "ad_id": ad_id_to_return}
+
+    except requests.exceptions.Timeout:
+        # หากเกิด Timeout จากการเรียก SlipOK API
+        try:
+            db.session.rollback() # Rollback หากเกิดข้อผิดพลาดก่อน commit
+        except Exception as rollback_e:
+            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
+        print(f"❌ [API ERROR] SlipOK Timeout: API ไม่ตอบกลับภายในเวลาที่กำหนดสำหรับ Order ID: {order_id}.")
+        return {"success": False, "message": "ระบบตรวจสอบสลิปตอบกลับช้าเกินไป โปรดลองอีกครั้ง"}
+    except requests.exceptions.HTTPError as e:
+        # หากเกิด HTTP Error (สถานะ 4xx, 5xx)
+        try:
+            db.session.rollback() # Rollback หากเกิดข้อผิดพลาดก่อน commit
+        except Exception as rollback_e:
+            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
+
+        # เพิ่มการดึงข้อความจาก SlipOK response มาแสดงใน log ให้ชัดเจน
+        slipok_error_message = "ไม่ทราบข้อผิดพลาดจาก SlipOK API"
+        if response is not None: # ตรวจสอบว่า response มีค่า (คือเรียก API ไปแล้ว)
+            try:
+                error_details = response.json()
+                slipok_error_message = error_details.get('message', 'ไม่พบข้อความผิดพลาดจาก SlipOK')
+                print(f"❌ [API ERROR] HTTP Error {e.response.status_code} for Order ID: {order_id}. SlipOK Message: {slipok_error_message}. URL: {e.request.url}")
+                print(f"    Full SlipOK Response Body: {response.text}") # เพิ่มบรรทัดนี้เพื่อ debug เพิ่มเติม
+            except Exception as json_e:
+                # กรณีที่ response.json() ล้มเหลว (อาจจะไม่ใช่ JSON)
+                print(f"❌ [API ERROR] HTTP Error {e.response.status_code} for Order ID: {order_id}. URL: {e.request.url}. Cannot parse SlipOK response as JSON. Error: {json_e}")
+                print(f"    Full SlipOK Response Text (Non-JSON): {response.text}") # พิมพ์ text ออกมาตรงๆ
+                slipok_error_message = f"เกิดข้อผิดพลาดในการประมวลผลคำตอบจาก SlipOK: {response.text[:100]}..." # แสดงส่วนแรกของ text
+        else:
+            # กรณีที่ response เป็น None (ไม่น่าจะเกิดขึ้นหลัง raise_for_status แต่ก็เผื่อไว้)
+            print(f"❌ [API ERROR] HTTP Error for Order ID: {order_id}. Error: {e}. (No SlipOK response object found)")
+
+        return {"success": False, "message": f"การตรวจสอบสลิปไม่สำเร็จ: {slipok_error_message}"}
+
+    except requests.exceptions.RequestException as e:
+        # หากเกิดข้อผิดพลาดอื่นๆ ที่เกี่ยวกับ requests (เช่น ConnectionError, DNS issues)
+        try:
+            db.session.rollback() # Rollback หากเกิดข้อผิดพลาดก่อน commit
+        except Exception as rollback_e:
+            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
+        print(f"❌ [API ERROR] Connection Error: ไม่สามารถเชื่อมต่อกับ SlipOK API สำหรับ Order ID: {order_id}. Error: {e}")
+        return {"success": False, "message": f"เกิดข้อผิดพลาดในการเชื่อมต่อกับระบบตรวจสอบสลิป: {e}"}
+    except ValueError:
+        # หากแปลงยอดเงินไม่ได้
+        try:
+            db.session.rollback() # Rollback หากเกิดข้อผิดพลาดก่อน commit
+        except Exception as rollback_e:
+            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
+        print(f"❌ [API ERROR] Data Parsing Error: ไม่สามารถอ่านยอดเงินจาก SlipOK response ได้สำหรับ Order ID: {order_id}.")
+        return {"success": False, "message": "รูปแบบยอดเงินจากระบบตรวจสอบสลิปไม่ถูกต้อง"}
+    except Exception as e:
+        # หากมีข้อผิดพลาดอื่นๆ ที่ไม่ได้ระบุไว้ใน try-except block ข้างต้น
+        try:
+            # ใช้ db.session.rollback() เมื่อเกิด exception ทั่วไป
+            if db and hasattr(db, 'session'):
+                db.session.rollback()
+        except Exception as rollback_e:
+            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
+
+        print(f"❌ [APP ERROR] Transaction failed for Order ID: {order_id}. Rolling back changes. Error: {e}")
+        return {"success": False, "message": f"เกิดข้อผิดพลาดในการทำรายการ: {e}"}
+
 
 # ==================== FLASK ROUTES ====================
 
@@ -1372,8 +1609,8 @@ def api_verify_slip(order_id):
         return jsonify({'success': False, 'message': 'ไม่พบคำสั่งซื้อนี้'}), 404
 
     if not can_upload_slip(order):
-        order_status = order.status if hasattr(order, 'status') else 'N/A'
-        renew_ad_id = order.renew_ads_id if hasattr(order, 'renew_ads_id') else 'N/A'
+        order_status = order.get('status', 'N/A') # ใช้ .get() เพื่อความปลอดภัย
+        renew_ad_id = order.get('renew_ads_id', 'N/A') # ใช้ .get() เพื่อความปลอดภัย
         print(f"❌ [WARN] API Verify Slip: Order ID {order_id} not eligible for slip upload. Current status: {order_status}. Renew Ad: {renew_ad_id}.")
         return jsonify({'success': False, 'message': 'ไม่สามารถอัปโหลดสลิปได้ เนื่องจากสถานะคำสั่งซื้อไม่ถูกต้อง หรือยังไม่ได้รับการอนุมัติ'}), 400
 
@@ -1387,9 +1624,9 @@ def api_verify_slip(order_id):
     print(f"✅ [INFO] API Verify Slip: Slip image uploaded to {save_path} for Order ID {order_id}.")
     print(f"✅ [INFO] API Verify Slip: Payload from client (QR Code data): {payload}.")
 
-    # --- แก้ไขตรงนี้: สลับตำแหน่ง argument กลับให้ถูกต้อง ---
-    # verify_payment_and_update_status คาดหวัง (order_id, client_payload, slip_image_path)
-    result = verify_payment_and_update_status(order_id, save_path, payload)
+    # --- แก้ไขตรงนี้: สลับตำแหน่ง argument กลับให้ถูกต้องและเพิ่ม db object ---
+    # verify_payment_and_update_status คาดหวัง (order_id, slip_image_path, client_payload, db)
+    result = verify_payment_and_update_status(order_id, save_path, payload, db)
 
     if not result.get('success'):
         return jsonify(result), 400

@@ -2502,18 +2502,37 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
                   console.log(`[INFO] Ad ${renewAdsId} successfully renewed and set to 'active' via order ${orderId}.`);
                   console.log(`[INFO] โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันแล้วงับ!`); // เพิ่ม log ตรงนี้
 
-                  // เพิ่มการแจ้งเตือนหลังต่ออายุสำเร็จ
-                  notifyAdsStatusChange(renewAdsId, 'active', null, (notiErr) => {
-                      if (notiErr) {
-                          console.error(`[ERROR] Failed to send notification for renewed ad ID ${renewAdsId}:`, notiErr);
-                      } else {
-                          console.log(`[INFO] Sent notification for renewed ad ID ${renewAdsId}`);
-                      }
-                      connection.commit(() => {
-                          connection.release();
-                          res.json({ message: `อัปโหลดสลิปสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันเรียบร้อยแล้ว`, slip_path: slipImagePath });
-                      });
-                  });
+                  // เพิ่มการแจ้งเตือนหลังต่ออายุสำเร็จ (ข้อความใหม่)
+                  const notiMsg = `โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วัน สำเร็จแล้ว`;
+                  connection.query(
+                    `SELECT user_id FROM ads WHERE id = ?`,
+                    [renewAdsId],
+                    (err, results) => {
+                        if (!err && results.length > 0) {
+                            const user_id = results[0].user_id;
+                            connection.query(
+                                `INSERT INTO notifications (user_id, post_id, ads_id, action_type, content, created_at, read_status, comment_id) VALUES (?, NULL, ?, 'ads_status_change', ?, NOW(), 0, NULL)`,
+                                [user_id, renewAdsId, notiMsg],
+                                (notiErr) => {
+                                    if (notiErr) {
+                                        console.error(`[ERROR] Failed to send notification for renewed ad ID ${renewAdsId}:`, notiErr);
+                                    } else {
+                                        console.log(`[INFO] Sent notification for renewed ad ID ${renewAdsId}`);
+                                    }
+                                    connection.commit(() => {
+                                        connection.release();
+                                        res.json({ message: `อัปโหลดสลิปสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันเรียบร้อยแล้ว`, slip_path: slipImagePath });
+                                    });
+                                }
+                            );
+                        } else {
+                            connection.commit(() => {
+                                connection.release();
+                                res.json({ message: `อัปโหลดสลิปสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันเรียบร้อยแล้ว`, slip_path: slipImagePath });
+                            });
+                        }
+                    }
+                  );
               });
           });
 
@@ -2549,38 +2568,110 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
 }
 
 
-// ฟังก์ชันสำหรับสร้าง notification เมื่อ ads เปลี่ยนสถานะ (ใช้ notifyAdsStatusChange เดิม)
+// ฟังก์ชันสำหรับจัดรูปแบบวันที่ให้เป็นภาษาไทยและปีพุทธศักราช
+function formatThaiDate(dateString) {
+  const date = new Date(dateString);
+  // ใช้ Intl.DateTimeFormat เพื่อจัดรูปแบบเป็นวันที่ภาษาไทยและปีพุทธศักราช
+  const formatter = new Intl.DateTimeFormat('th-TH', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      calendar: 'buddhist' // ใช้ปีพุทธศักราช
+  });
+  return formatter.format(date);
+}
+
+// ฟังก์ชันสำหรับสร้าง notification เมื่อ ads เปลี่ยนสถานะ
 function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
-  pool.query('SELECT user_id FROM ads WHERE id = ?', [adId], (err, results) => {
-      if (err || results.length === 0) return callback(err || new Error('Ad not found'));
-      const { user_id } = results[0];
-      let content = '';
-      switch (newStatus) {
-          case 'approved':
-              content = 'โฆษณาของคุณได้รับการตรวจสอบแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา';
-              break;
-          case 'active':
-              content = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว';
-              break;
-          case 'rejected':
-              content = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${adminNotes || '-'}`;
-              break;
-          case 'paid':
-              content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ';
-              break;
-          case 'expired':
-              content = 'โฆษณาของคุณหมดอายุแล้ว';
-              break;
-          case 'expiring_soon':
-              content = 'โฆษณาของคุณจะหมดอายุในอีก 3 วัน กรุณาต่ออายุเพื่อการแสดงผลอย่างต่อเนื่อง';
-              break;
-          default:
-              content = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${newStatus}`;
+  // ขั้นตอนที่ 1: ดึง user_id และ expiration_date ล่าสุดจากตาราง ads โดยใช้ adId
+  pool.query('SELECT user_id, expiration_date FROM ads WHERE id = ?', [adId], (err, adsResults) => {
+      if (err || adsResults.length === 0) {
+          // หากเกิดข้อผิดพลาดในการดึงข้อมูลหรือหา ad ไม่พบ ก็ส่ง callback กลับไปพร้อมข้อผิดพลาด
+          return callback(err || new Error('Ad not found'));
       }
+      const { user_id, expiration_date } = adsResults[0]; // ดึง user_id และ expiration_date ออกมา
+      let content = ''; // เตรียมตัวแปรสำหรับเก็บข้อความแจ้งเตือน
+
+      // ขั้นตอนที่ 2: ตรวจสอบว่าเป็น "การต่ออายุที่ชำระเงินแล้ว" หรือไม่
+      // โดยการ query ตาราง orders เพื่อดูว่ามีรายการที่ renew_ads_id ตรงกับ adId
+      // และมี status เป็น 'paid' และดึง package_id มาด้วย
       pool.query(
-          `INSERT INTO notifications (user_id, action_type, content, ads_id) VALUES (?, 'ads_status_change', ?, ?)`,
-          [user_id, content, adId],
-          callback
+          `SELECT package_id FROM orders WHERE renew_ads_id = ? AND status = 'paid'`,
+          [adId],
+          (err, orderResults) => {
+              if (err) {
+                  // หากเกิดข้อผิดพลาดในการดึงข้อมูลจากตาราง orders
+                  return callback(err);
+              }
+
+              // เงื่อนไขหลักในการกำหนดข้อความแจ้งเตือน
+              // ถ้าสถานะใหม่คือ 'active' และพบว่ามีการต่ออายุที่ชำระเงินแล้วในตาราง orders
+              if (newStatus === 'active' && orderResults.length > 0) {
+                  const renewedPackageId = orderResults[0].package_id;
+
+                  // ขั้นตอนที่ 3: ดึง duration_days จากตาราง ad_packages โดยใช้ package_id ที่ได้จาก orders
+                  pool.query(
+                      `SELECT duration_days FROM ad_packages WHERE package_id = ?`,
+                      [renewedPackageId],
+                      (err, packageResults) => {
+                          if (err) {
+                              return callback(err);
+                          }
+
+                          let renewedDays = 'ไม่ระบุ'; // ค่าเริ่มต้นถ้าหา duration_days ไม่เจอ
+                          if (packageResults.length > 0) {
+                              renewedDays = packageResults[0].duration_days;
+                          }
+
+                          // จัดรูปแบบวันที่หมดอายุใหม่ให้เป็นภาษาไทยและปีพุทธศักราช
+                          const formattedExpirationDate = formatThaiDate(expiration_date);
+
+                          // สร้างข้อความแจ้งเตือนการต่ออายุที่ละเอียดขึ้น
+                          content = `โฆษณาของคุณได้รับการต่ออายุ ${renewedDays} วันสำเร็จแล้ว โฆษณานี้ขยายหมดอายุเป็นวันที่ ${formattedExpirationDate}`;
+
+                          // ขั้นตอนสุดท้าย: บันทึกข้อมูลการแจ้งเตือนลงในตาราง notifications
+                          pool.query(
+                              `INSERT INTO notifications (user_id, action_type, content, ads_id) VALUES (?, 'ads_status_change', ?, ?)`,
+                              [user_id, content, adId],
+                              callback
+                          );
+                      }
+                  );
+              } else {
+                  // ถ้าไม่ใช่กรณีของการต่ออายุที่ชำระเงินแล้ว หรือสถานะไม่ใช่ 'active'
+                  // ให้ใช้ switch case เดิม เพื่อกำหนดข้อความตามสถานะปกติ
+                  switch (newStatus) {
+                      case 'approved':
+                          content = 'โฆษณาของคุณได้รับการตรวจสอบแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา';
+                          break;
+                      case 'active':
+                          // ข้อความนี้จะใช้เฉพาะกรณีที่ 'active' แต่ไม่ใช่การต่ออายุครั้งแรก
+                          content = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว';
+                          break;
+                      case 'rejected':
+                          content = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${adminNotes || '-'}`;
+                          break;
+                      case 'paid':
+                          content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ';
+                          break;
+                      case 'expired':
+                          content = 'โฆษณาของคุณหมดอายุแล้ว';
+                          break;
+                      case 'expiring_soon':
+                          content = 'โฆษณาของคุณจะหมดอายุในอีก 3 วัน กรุณาต่ออายุเพื่อการแสดงผลอย่างต่อเนื่อง';
+                          break;
+                      default:
+                          content = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${newStatus}`;
+                  }
+
+                  // ขั้นตอนสุดท้าย: บันทึกข้อมูลการแจ้งเตือนลงในตาราง notifications
+                  pool.query(
+                      `INSERT INTO notifications (user_id, action_type, content, ads_id) VALUES (?, 'ads_status_change', ?, ?)`,
+                      [user_id, content, adId],
+                      callback
+                  );
+              }
+          }
       );
   });
 }
