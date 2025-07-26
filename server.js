@@ -554,101 +554,223 @@ app.post("/api/resent-otp/reset-password", async (req, res) => {
 // Login
 app.post("/api/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+      const { email, password, google_id } = req.body; // รับ google_id เพิ่มเข้ามาด้วย
 
-    // Get the users IP address (optional)
-    const ipAddress =
-      req.headers["x-forwarded-for"] || req.connection.remoteAddress;
+      // Get the users IP address (optional)
+      const ipAddress = req.headers["x-forwarded-for"] || req.connection.remoteAddress;
 
-    const sql = "SELECT * FROM users WHERE email = ?";
-    pool.query(sql, [email], (err, results) => {
-      if (err) throw new Error("Database error during login");
-      if (results.length === 0) {
-        return res.status(404).json({ message: "No user found" });
+      // ตรวจสอบว่ามีอีเมลส่งมาหรือไม่
+      if (!email) {
+          return res.status(400).json({ message: "Email is required." });
       }
 
-      const user = results[0];
+      const sql = "SELECT * FROM users WHERE email = ?";
+      pool.query(sql, [email], async (err, results) => { // ใช้ async-await ที่นี่
+          if (err) {
+              console.error("Database error during login:", err);
+              return res.status(500).json({ error: "Database error during login" });
+          }
 
-      // Check if the user's status is active
-      if (user.status !== 'active') {
-        return res.status(403).json({ message: "User is Suspended" });
-      }
+          let user = results.length > 0 ? results[0] : null;
 
-      if(user.password === null)
+          // --- กรณีที่ผู้ใช้กำลังพยายามล็อกอินด้วย Google ---
+          if (google_id) {
+              if (!user) {
+                  // ถ้าไม่พบ user ด้วยอีเมลนี้เลย -> สร้าง user ใหม่ด้วย Google ID
+                  const insertSql = "INSERT INTO users (email, google_id, created_at, last_login, last_login_ip, status, role, failed_attempts) VALUES (?, ?, NOW(), NOW(), ?, ?, ?, ?)";
+                  pool.query(insertSql, [email, google_id, ipAddress, 'active', 'user', 0], (insertErr, insertResult) => {
+                      if (insertErr) {
+                          console.error("Error creating new user with Google ID:", insertErr);
+                          return res.status(500).json({ message: "Failed to create user with Google ID." });
+                      }
+                      user = {
+                          id: insertResult.insertId,
+                          email: email,
+                          username: null, // หรือค่า default อื่นๆ
+                          picture: null,
+                          google_id: google_id,
+                          password: null,
+                          status: 'active',
+                          role: 'user',
+                          failed_attempts: 0,
+                          last_login: new Date(),
+                          last_login_ip: ipAddress,
+                      };
+                      // ส่ง Token กลับทันที
+                      const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
+                      return res.status(200).json({
+                          message: "Google sign-in successful. New user created.",
+                          token,
+                          user: {
+                              id: user.id,
+                              email: user.email,
+                              username: user.username,
+                              picture: user.picture,
+                              last_login: new Date(),
+                              last_login_ip: ipAddress,
+                          },
+                      });
+                  });
+                  return; // ออกจากการทำงานของ API นี้
+              }
 
-      // Check if the user signed up with Google
-      if (user.google_id !== null) {
-        return res.status(400).json({ message: "Please sign in using Google." });
-      }
+              // ถ้าพบ user ด้วยอีเมลนี้
+              if (user.google_id === null) {
+                  // ถ้า user นี้ไม่มี google_id (เคยสมัครด้วย email/password มาก่อน) -> อัปเดต google_id ให้เขา
+                  const updateGoogleIdSql = "UPDATE users SET google_id = ? WHERE id = ?";
+                  pool.query(updateGoogleIdSql, [google_id, user.id], (updateErr) => {
+                      if (updateErr) {
+                          console.error("Error updating Google ID:", updateErr);
+                          return res.status(500).json({ message: "Failed to link Google account." });
+                      }
+                      user.google_id = google_id; // อัปเดต object user ที่ใช้งานอยู่
+                      // ดำเนินการล็อกอินต่อ
+                      handleSuccessfulLogin(res, user, ipAddress);
+                  });
+              } else if (user.google_id === google_id) {
+                  // ถ้า user มี google_id และตรงกัน -> ล็อกอินปกติ
+                  handleSuccessfulLogin(res, user, ipAddress);
+              } else {
+                  // ถ้า user มี google_id แต่ไม่ตรงกัน (คนละ Google Account หรือซ้ำซ้อน)
+                  return res.status(400).json({ message: "This email is already associated with a different Google account." });
+              }
+          }
+          // --- จบกรณีล็อกอินด้วย Google ---
 
-      // If the user has exceeded failed login attempts, block them for 5 minutes
-      if (user.failed_attempts >= 5 && user.last_failed_attempt) {
-        const now = Date.now();
-        const timeSinceLastAttempt = now - new Date(user.last_failed_attempt).getTime();
-        if (timeSinceLastAttempt < 300000) { // 5 minutes
-          return res.status(429).json({
-            message: "Too many failed login attempts. Try again in 5 minutes.",
-          });
-        }
-      }
+          // --- กรณีที่ผู้ใช้กำลังพยายามล็อกอินด้วย Email/Password ---
+          else if (password) {
+              if (!user) {
+                  // ถ้าไม่พบ user ด้วยอีเมลนี้เลย (และไม่ได้มาจาก Google ID)
+                  return res.status(404).json({ message: "No user found with this email." });
+              }
 
-      // Compare the entered password with the stored hashed password
-      bcrypt.compare(password, user.password, (err, isMatch) => {
-        if (err) throw new Error("Password comparison error");
-        if (!isMatch) {
-          // Increment failed attempts and update last_failed_attempt
-          const updateFailSql = "UPDATE users SET failed_attempts = failed_attempts + 1, last_failed_attempt = NOW() WHERE id = ?";
-          pool.query(updateFailSql, [user.id], (err) => {
-            if (err) console.error("Error logging failed login attempt:", err);
-          });
+              // ตรวจสอบว่า user มีรหัสผ่านหรือไม่
+              if (user.password === null) {
+                  // ถ้า user นี้ไม่มีรหัสผ่าน (เคยสมัครด้วย Google มาก่อน)
+                  return res.status(400).json({ message: "Please sign in using Google or set a password for this account first." });
+              }
 
-          return res.status(401).json({ message: "Email or Password is incorrect." });
-        }
+              // Check if the user's status is active
+              if (user.status !== 'active') {
+                  return res.status(403).json({ message: "User is Suspended" });
+              }
 
-        // Reset failed attempts after a successful login
-        const resetFailSql = "UPDATE users SET failed_attempts = 0, last_login = NOW(), last_login_ip = ? WHERE id = ?";
-        pool.query(resetFailSql, [ipAddress, user.id], (err) => {
-          if (err) throw new Error("Error resetting failed attempts or updating login time.");
+              // If the user has exceeded failed login attempts, block them for 5 minutes
+              if (user.failed_attempts >= 5 && user.last_failed_attempt) {
+                  const now = Date.now();
+                  const timeSinceLastAttempt = now - new Date(user.last_failed_attempt).getTime();
+                  if (timeSinceLastAttempt < 300000) { // 5 minutes
+                      return res.status(429).json({
+                          message: "Too many failed login attempts. Try again in 5 minutes.",
+                      });
+                  }
+              }
 
-          // Generate JWT token
-          const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
+              // Compare the entered password with the stored hashed password
+              bcrypt.compare(password, user.password, (err, isMatch) => {
+                  if (err) {
+                      console.error("Password comparison error:", err);
+                      return res.status(500).json({ error: "Password comparison error" });
+                  }
+                  if (!isMatch) {
+                      // Increment failed attempts and update last_failed_attempt
+                      const updateFailSql = "UPDATE users SET failed_attempts = failed_attempts + 1, last_failed_attempt = NOW() WHERE id = ?";
+                      pool.query(updateFailSql, [user.id], (err) => {
+                          if (err) console.error("Error logging failed login attempt:", err);
+                      });
+                      return res.status(401).json({ message: "Email or Password is incorrect." });
+                  }
 
-          // Return successful login response with token and user data
-          res.status(200).json({
-            message: "Authentication successful",
-            token,
-            user: {
-              id: user.id,
-              email,
-              username: user.username,
-              picture: user.picture,
-              last_login: new Date(),
-              last_login_ip: ipAddress,
-            },
-          });
-        });
+                  // Successful login
+                  handleSuccessfulLogin(res, user, ipAddress);
+              });
+          }
+          // --- จบกรณีล็อกอินด้วย Email/Password ---
+
+          else {
+              // ไม่มีทั้ง password และ google_id ส่งมา (request ไม่ถูกต้อง)
+              return res.status(400).json({ message: "Missing login credentials (password or google_id)." });
+          }
       });
-    });
   } catch (error) {
-    console.error("Internal error:", error.message);
-    res.status(500).json({ error: "Internal server error" });
+      console.error("Internal error:", error.message);
+      res.status(500).json({ error: "Internal server error" });
   }
 });
 
 
+// Helper function สำหรับการล็อกอินสำเร็จ
+function handleSuccessfulLogin(res, user, ipAddress) {
+  const resetFailSql = "UPDATE users SET failed_attempts = 0, last_login = NOW(), last_login_ip = ? WHERE id = ?";
+  pool.query(resetFailSql, [ipAddress, user.id], (err) => {
+      if (err) {
+          console.error("Error resetting failed attempts or updating login time:", err);
+          return res.status(500).json({ error: "Error updating login status." });
+      }
+
+      // Generate JWT token
+      const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
+
+      // Return successful login response with token and user data
+      res.status(200).json({
+          message: "Authentication successful",
+          token,
+          user: {
+              id: user.id,
+              email: user.email,
+              username: user.username, // อาจจะเป็น null ถ้าเพิ่งสร้าง
+              picture: user.picture,   // อาจจะเป็น null ถ้าเพิ่งสร้าง
+              last_login: new Date(),
+              last_login_ip: ipAddress,
+          },
+      });
+  });
+}
+
+
 // Set profile route (Profile setup or update)
 app.post("/api/set-profile", verifyToken, upload.single('picture'), (req, res) => {
-  const { newUsername, birthday } = req.body;
+  const { newUsername, birthday, gender } = req.body; // <<-- เพิ่ม gender เข้ามา
   const userId = req.userId;
   const picture = req.file ? `/uploads/${req.file.filename}` : null; 
 
-  if (!newUsername || !picture || !birthday) {
-    return res.status(400).json({ message: "New username, picture, and birthday are required" });
+  // <<-- เพิ่ม gender เข้าไปในเงื่อนไขการตรวจสอบข้อมูลที่จำเป็น
+  if (!newUsername || !picture || !birthday || !gender) {
+    return res.status(400).json({ message: "New username, picture, birthday, and gender are required" });
   }
 
   // Convert birthday from DD/MM/YYYY to YYYY-MM-DD
   const birthdayParts = birthday.split('/');
+  // ตรวจสอบความถูกต้องของรูปแบบวันที่ก่อนแปลง
+  if (birthdayParts.length !== 3 || isNaN(parseInt(birthdayParts[0])) || isNaN(parseInt(birthdayParts[1])) || isNaN(parseInt(birthdayParts[2]))) {
+    return res.status(400).json({ message: "Invalid birthday format. Please use DD/MM/YYYY" });
+  }
   const formattedBirthday = `${birthdayParts[2]}-${birthdayParts[1]}-${birthdayParts[0]}`;
+
+  // <<-- คำนวณอายุ
+  let age = null;
+  try {
+    const birthDate = new Date(formattedBirthday);
+    const today = new Date();
+    age = today.getFullYear() - birthDate.getFullYear();
+    const m = today.getMonth() - birthDate.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
+      age--;
+    }
+    if (age < 0) { // กรณีวันเกิดในอนาคต หรือผิดพลาด
+        age = 0; // ตั้งค่าเป็น 0 หรือส่ง error ก็ได้
+    }
+  } catch (e) {
+    console.error("Error calculating age:", e);
+    // ไม่ได้ return error ทันที เพราะอาจจะยังต้องการอัปเดตข้อมูลอื่น
+    // หรือจะ return res.status(400).json({ message: "Invalid birthday date" }); ก็ได้ถ้าต้องการบังคับ
+  }
+
+  // <<-- ตรวจสอบค่า gender ให้ถูกต้อง
+  const allowedGenders = ['Male', 'Female', 'Other'];
+  if (!allowedGenders.includes(gender)) {
+    return res.status(400).json({ message: "Invalid gender value. Must be Male, Female, or Other." });
+  }
 
   // Check if the new username is already taken
   const checkUsernameQuery = "SELECT * FROM users WHERE username = ?";
@@ -662,9 +784,9 @@ app.post("/api/set-profile", verifyToken, upload.single('picture'), (req, res) =
       return res.status(400).json({ message: "Username already taken" });
     }
 
-    // Update the profile with the new username, picture (with '/uploads/'), and birthday (formatted)
-    const updateProfileQuery = "UPDATE users SET username = ?, picture = ?, birthday = ? WHERE id = ?";
-    pool.query(updateProfileQuery, [newUsername, picture, formattedBirthday, userId], (err) => {
+    // Update the profile with the new username, picture (with '/uploads/'), birthday (formatted), gender, and age
+    const updateProfileQuery = "UPDATE users SET username = ?, picture = ?, birthday = ?, gender = ?, age = ? WHERE id = ?"; // <<-- เพิ่ม gender และ age ใน query
+    pool.query(updateProfileQuery, [newUsername, picture, formattedBirthday, gender, age, userId], (err) => { // <<-- เพิ่ม gender และ age ใน parameters
       if (err) {
         console.error("Error updating profile: ", err);
         return res.status(500).json({ message: "Error updating profile" });
@@ -690,7 +812,10 @@ app.post("/api/google-signin", async (req, res) => {
     const checkGoogleIdSql =
       "SELECT * FROM users WHERE google_id = ? AND (status = 'active' OR status = 'deactivated')";
     pool.query(checkGoogleIdSql, [googleId], (err, googleIdResults) => {
-      if (err) throw new Error("Database error during Google ID check");
+      if (err) {
+        console.error("Original database error during Google ID check:", err); // เพิ่มบรรทัดนี้
+        throw new Error("Database error during Google ID check");
+      }
 
       if (googleIdResults.length > 0) {
         const user = googleIdResults[0];
@@ -699,7 +824,10 @@ app.post("/api/google-signin", async (req, res) => {
         if (user.status === "deactivated") {
           const reactivateSql = "UPDATE users SET status = 'active', email = ? WHERE google_id = ?";
           pool.query(reactivateSql, [email, googleId], (err) => {
-            if (err) throw new Error("Database error during user reactivation");
+            if (err) {
+              console.error("Original database error during user reactivation:", err); // เพิ่มบรรทัดนี้
+              throw new Error("Database error during user reactivation");
+            }
 
             const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
             return res.json({
@@ -720,7 +848,10 @@ app.post("/api/google-signin", async (req, res) => {
           // If the user is already active, update email if necessary
           const updateSql = "UPDATE users SET email = ? WHERE google_id = ?";
           pool.query(updateSql, [email, googleId], (err) => {
-            if (err) throw new Error("Database error during user update");
+            if (err) {
+              console.error("Original database error during user update:", err); // เพิ่มบรรทัดนี้
+              throw new Error("Database error during user update");
+            }
 
             const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
             return res.json({
@@ -739,11 +870,15 @@ app.post("/api/google-signin", async (req, res) => {
           });
         }
       } else {
-        // ตรวจสอบว่ามี email นี้ในฐานข้อมูลหรือไม่
+        // ตรวจสอบว่ามี email นี้ในฐานข้อมูลหรือไม่ (และเป็น active)
         const checkEmailSql = "SELECT * FROM users WHERE email = ? AND status = 'active'";
         pool.query(checkEmailSql, [email], (err, emailResults) => {
-          if (err) throw new Error("Database error during email check");
+          if (err) {
+            console.error("Original database error during email check:", err); // เพิ่มบรรทัดนี้
+            throw new Error("Database error during email check");
+          }
           if (emailResults.length > 0) {
+            // ถ้า email นี้ถูกใช้งานอยู่แล้วโดยบัญชีอื่น (ที่ไม่ใช่ Google ID นี้)
             return res.status(409).json({
               error: "Email already registered with another account",
             });
@@ -753,12 +888,19 @@ app.post("/api/google-signin", async (req, res) => {
           const insertSql =
             "INSERT INTO users (google_id, email, username, status, role) VALUES (?, ?, '', 'active', 'user')";
           pool.query(insertSql, [googleId, email], (err, result) => {
-            if (err) throw new Error("Database error during user insertion");
+            // นี่คือบรรทัดที่ 756 ที่งับเจอ Error:
+            if (err) {
+              console.error("Original database error during user insertion:", err); // <<-- เพิ่มบรรทัดนี้
+              throw new Error("Database error during user insertion");
+            }
 
             const newUserId = result.insertId;
             const newUserSql = "SELECT * FROM users WHERE id = ?";
             pool.query(newUserSql, [newUserId], (err, newUserResults) => {
-              if (err) throw new Error("Database error during new user fetch");
+              if (err) {
+                console.error("Original database error during new user fetch:", err); // เพิ่มบรรทัดนี้
+                throw new Error("Database error during new user fetch");
+              }
 
               const newUser = newUserResults[0];
               const token = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET);
@@ -782,7 +924,7 @@ app.post("/api/google-signin", async (req, res) => {
       }
     });
   } catch (error) {
-    console.error(error.message);
+    console.error("Caught error in Google Sign-In API:", error.message); // แก้ไขข้อความตรงนี้ด้วยก็ได้
     res.status(500).json({ error: "Internal server error" });
   }
 });
