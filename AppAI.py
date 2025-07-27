@@ -121,7 +121,7 @@ driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
 
 # ==================== DATABASE SETUP ====================
 # Configure your database URI
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:1234@localhost/bestpick'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:1234@localhost/bestpick5'
 
 # Initialize the SQLAlchemy object
 db = SQLAlchemy(app)
@@ -287,6 +287,10 @@ def search_and_scrape_banana_product(product_name, results):
 
 # ==================== RECOMMENDATION SYSTEM FUNCTIONS ====================
 def verify_token(f):
+    """
+    Decorator function to verify JWT token from request header.
+    Ensures that only authorized users can access certain endpoints.
+    """
     @wraps(f)
     def decorated_function(*args, **kwargs):
         auth_header = request.headers.get("Authorization")
@@ -308,14 +312,20 @@ def verify_token(f):
     return decorated_function
 
 def load_data_from_db():
-    """โหลดข้อมูลจากฐานข้อมูล MySQL และส่งคืนเป็น DataFrame"""
+    """
+    Loads content-based and collaborative data from MySQL database
+    and returns them as pandas DataFrames.
+    """
     try:
-        engine = create_engine('mysql+mysqlconnector://bestpick_user:bestpick7890@localhost/reviewapp')
+        # Establish connection to MySQL database
+        engine = create_engine('mysql+mysqlconnector://root:1234@localhost/bestpick5')
         
+        # Load content-based data
         query_content = "SELECT * FROM contentbasedview;"
         content_based_data = pd.read_sql(query_content, con=engine)
         print("โหลดข้อมูล Content-Based สำเร็จ")
         
+        # Load collaborative data
         query_collaborative = "SELECT * FROM collaborativeview;"
         collaborative_data = pd.read_sql(query_collaborative, con=engine)
         print("โหลดข้อมูล Collaborative สำเร็จ")
@@ -323,108 +333,124 @@ def load_data_from_db():
         return content_based_data, collaborative_data
     except Exception as e:
         print(f"ข้อผิดพลาดในการโหลดข้อมูลจากฐานข้อมูล: {str(e)}")
-        raise
+        raise # Re-raise the exception to propagate the error
 
 def normalize_scores(series):
-    """ทำให้คะแนนอยู่ในช่วง [0, 1]"""
+    """
+    Normalizes a pandas Series to a [0, 1] range.
+    Returns the original series if min and max values are the same.
+    """
     min_val, max_val = series.min(), series.max()
     if max_val > min_val:
         return (series - min_val) / (max_val - min_val)
-    return series
+    return series # Return original if no variance
 
 def normalize_engagement(data, user_column='owner_id', engagement_column='PostEngagement'):
-    """ปรับ Engagement ให้เหมาะสมตามผู้ใช้แต่ละคนให้อยู่ในช่วง [0, 1]"""
+    """
+    Normalizes engagement scores for each user to a [0, 1] range.
+    This helps in fair comparison of engagement across different users.
+    """
     data['NormalizedEngagement'] = data.groupby(user_column)[engagement_column].transform(lambda x: normalize_scores(x))
     return data
 
-def analyze_comments(comments):
-    """วิเคราะห์ความรู้สึกของคอมเมนต์ รองรับทั้งภาษาไทยและภาษาอังกฤษ"""
-    sentiment_scores = []
-    for comment in comments:
-        try:
-            if pd.isna(comment):
-                sentiment_scores.append(0)
-            else:
-                # หากเป็นภาษาไทย ให้ tokenize ด้วย PyThaiNLP
-                if any('\u0E00' <= char <= '\u0E7F' for char in comment):
-                    tokenized_comment = ' '.join(word_tokenize(comment, engine='newmm'))
-                else:
-                    tokenized_comment = comment
-
-                # คำนวณ Sentiment ด้วย TextBlob
-                blob = TextBlob(tokenized_comment)
-                polarity = blob.sentiment.polarity
-                
-                # กำหนด Sentiment Score
-                if polarity > 0.5:
-                    sentiment_scores.append(1)  # Sentiment บวก
-                elif 0 < polarity <= 0.5:
-                    sentiment_scores.append(0.5)  # Sentiment บวก
-                elif -0.5 <= polarity < 0:
-                    sentiment_scores.append(-0.5)  # Sentiment ลบ
-                else:
-                    sentiment_scores.append(-1)  # Sentiment ลบ
-                    
-        except Exception as e:
-            sentiment_scores.append(0)  # หากเกิดข้อผิดพลาด ให้คะแนนเป็น 0
-    return sentiment_scores
+def analyze_comments(comments_series):
+    """
+    Analyzes comments by counting the number of individual comments
+    within a single string, separated by ';'. Returns a list of counts.
+    """
+    comment_counts = []
+    for comment_text in comments_series:
+        if pd.isna(comment_text) or str(comment_text).strip() == '':
+            comment_counts.append(0)  # No comment text, count as 0
+        else:
+            # Split the string by ';' to get individual comments
+            # Strip whitespace from each part and filter out empty strings
+            individual_comments = [c.strip() for c in str(comment_text).split(';') if c.strip()]
+            comment_counts.append(len(individual_comments))
+    return comment_counts
 
 def create_content_based_model(data, text_column='Content', comment_column='Comments', engagement_column='PostEngagement'):
-    """สร้างโมเดล Content-Based Filtering ด้วย TF-IDF และ KNN พร้อมแบ่งข้อมูล"""
+    """
+    Creates and trains a Content-Based Filtering model using TF-IDF and KNN.
+    It also prepares and normalizes engagement and comment data for weighting.
+    """
     required_columns = [text_column, comment_column, engagement_column]
     if not all(col in data.columns for col in required_columns):
         raise ValueError(f"ข้อมูลขาดคอลัมน์ที่จำเป็น: {set(required_columns) - set(data.columns)}")
 
-    # แบ่งข้อมูลเป็น train และ test
+    # Split data into training and testing sets
     train_data, test_data = train_test_split(data, test_size=0.25, random_state=42)
 
-    # ใช้ TF-IDF เพื่อแปลงเนื้อหาของโพสต์เป็นเวกเตอร์
+    # Use TF-IDF to convert post content into vectors
     tfidf = TfidfVectorizer(stop_words='english', max_features=6000, ngram_range=(1, 3), min_df=1, max_df=0.8)
     tfidf_matrix = tfidf.fit_transform(train_data[text_column].fillna(''))
 
-    # ใช้ KNN เพื่อหาความคล้ายคลึงระหว่างโพสต์
+    # Use KNN for similarity search between posts
     knn = NearestNeighbors(n_neighbors=10, metric='cosine')
     knn.fit(tfidf_matrix)
 
-    # วิเคราะห์ความรู้สึกจากความคิดเห็นใน train และ test sets
-    train_data['SentimentScore'] = analyze_comments(train_data[comment_column])
-    test_data['SentimentScore'] = analyze_comments(test_data[comment_column])
+    # Analyze comment counts for both train and test sets
+    train_data['CommentCount'] = analyze_comments(train_data[comment_column])
+    test_data['CommentCount'] = analyze_comments(test_data[comment_column])
 
-    # ปรับ Engagement ใน train set
+    # Normalize CommentCount to a [0, 1] range based on train_data's max
+    max_comment_count = train_data['CommentCount'].max()
+    if max_comment_count > 0:
+        train_data['NormalizedCommentCount'] = train_data['CommentCount'] / max_comment_count
+        test_data['NormalizedCommentCount'] = test_data['CommentCount'] / max_comment_count
+    else:
+        # If no comments exist, all normalized comment scores are 0
+        train_data['NormalizedCommentCount'] = 0.0
+        test_data['NormalizedCommentCount'] = 0.0
+
+    # Normalize general engagement in train set
     train_data = normalize_engagement(train_data)
     train_data['NormalizedEngagement'] = normalize_scores(train_data[engagement_column])
-    train_data['WeightedEngagement'] = train_data['NormalizedEngagement'] + train_data['SentimentScore']
+    
+    # Combine NormalizedEngagement and NormalizedCommentCount into WeightedEngagement
+    train_data['WeightedEngagement'] = train_data['NormalizedEngagement'] + train_data['NormalizedCommentCount']
 
-    # ปรับ Engagement ใน test set (กรณีใช้ในการประเมิน)
+    # Normalize general engagement in test set and calculate its WeightedEngagement
     test_data = normalize_engagement(test_data)
+    test_data['WeightedEngagement'] = test_data['NormalizedEngagement'] + test_data['NormalizedCommentCount']
 
+    # Save trained models
     joblib.dump(tfidf, 'TFIDF_Model.pkl')
     joblib.dump(knn, 'KNN_Model.pkl')
     return tfidf, knn, train_data, test_data
 
 def create_collaborative_model(data, n_factors=150, n_epochs=70, lr_all=0.005, reg_all=0.5):
-    """สร้างและฝึกโมเดล Collaborative Filtering พร้อมแบ่งข้อมูลเป็น training และ test set"""
+    """
+    Creates and trains a Collaborative Filtering model using SVD.
+    Splits data into training and test sets for model evaluation.
+    """
     required_columns = ['user_id', 'post_id']
     if not all(col in data.columns for col in required_columns):
         raise ValueError(f"ข้อมูลขาดคอลัมน์ที่จำเป็น: {set(required_columns) - set(data.columns)}")
 
+    # Melt data to a long format suitable for Surprise library
     melted_data = data.melt(id_vars=['user_id', 'post_id'], var_name='category', value_name='score')
-    melted_data = melted_data[melted_data['score'] > 0]
+    melted_data = melted_data[melted_data['score'] > 0] # Filter out zero scores
 
+    # Split melted data into train and test sets for the collaborative model
     train_data, test_data = train_test_split(melted_data, test_size=0.25, random_state=42)
 
+    # Define the rating scale and load data into Surprise Dataset format
     reader = Reader(rating_scale=(melted_data['score'].min(), melted_data['score'].max()))
     trainset = Dataset.load_from_df(train_data[['user_id', 'post_id', 'score']], reader).build_full_trainset()
 
+    # Initialize and train the SVD model
     model = SVD(n_factors=n_factors, n_epochs=n_epochs, lr_all=lr_all, reg_all=reg_all)
     model.fit(trainset)
 
+    # Save the trained collaborative model
     joblib.dump(model, 'Collaborative_Model.pkl')
     return model, test_data
 
-def recommend_hybrid(user_id, train_data, test_data, collaborative_model, knn, tfidf, categories, alpha=0.50, beta=0.20):
+def recommend_hybrid(user_id, all_posts_data, collaborative_model, knn, tfidf, categories, alpha=0.50, beta=0.20):
     """
-    แนะนำโพสต์โดยใช้ Hybrid Filtering รวม Collaborative, Content-Based และ Categories Adjustment
+    แนะนําโพสต์โดยใช้ Hybrid Filtering รวม Collaborative, Content-Based และ Categories Adjustment
+    คํานวณคะแนนสําหรับโพสต์ทั้งหมดใน all_posts_data
     :param alpha: น้ำหนักของคะแนน Collaborative (0 ถึง 1)
     :param beta: น้ำหนักของคะแนน Categories (0 ถึง 1)
     """
@@ -435,63 +461,163 @@ def recommend_hybrid(user_id, train_data, test_data, collaborative_model, knn, t
 
     recommendations = []
 
-    # ใช้ test_data ทั้งหมด
-    for _, post in test_data.iterrows():
-        # Collaborative Filtering
-        collab_score = collaborative_model.predict(user_id, post['post_id']).est
+    # ใช้ข้อมูลโพสต์ทั้งหมดที่เราต้องการแนะนำ
+    for _, post in all_posts_data.iterrows():
+        post_id = post['post_id']
+        
+        # --- Collaborative Filtering Score ---
+        collab_score = 0.5 # ให้คะแนนกลางๆ หาก prediction ล้มเหลว
+        try:
+            collab_score = collaborative_model.predict(user_id, post_id).est
+        except ValueError:
+            # จัดการ post_id ที่อาจจะยังไม่มีในโมเดล Collaborative
+            pass 
+        
+        # --- Content-Based Filtering Score ---
+        content_score = 0.0
+        try:
+            # แก้ไขตรงนี้: ตรวจสอบและแปลง Content ให้เป็นสตริงเปล่า ถ้าเป็น NaN
+            # เราใช้ str() เพื่อให้แน่ใจว่าเป็น string แล้วค่อยตรวจสอบ pd.notna
+            post_content = str(post['Content']) if pd.notna(post['Content']) else ''
+            
+            # ใช้ tfidf.transform กับ list ที่มี string เดียว
+            tfidf_vector = tfidf.transform([post_content]) 
+            
+            # ค้นหา Nearest Neighbors
+            if knn._fit_X.shape[0] > 0:
+                n_neighbors = min(20, knn._fit_X.shape[0])
+                distances, indices = knn.kneighbors(tfidf_vector, n_neighbors=n_neighbors)
+                
+                # คํานวณ Content-Based Score โดยใช้ NormalizedEngagement จากโพสต์ที่คล้ายกัน
+                if len(indices[0]) > 0:
+                    # ใช้ NormalizedEngagement จาก all_posts_data (content_based_data) ที่ถูกประมวลผลแล้ว
+                    content_score = np.mean([all_posts_data.iloc[i]['NormalizedEngagement'] for i in indices[0]])
+        except Exception as e:
+            # บันทึกข้อผิดพลาดในการคํานวณ Content-Based Score
+            print(f"ข้อผิดพลาดในการคํานวณ Content-Based score สําหรับ post_id {post_id}: {e}")
+            content_score = 0.0
 
-        # Content-Based Filtering
-        idx = train_data.index[train_data['post_id'] == post['post_id']].tolist()
-        content_score = 0
-        if idx:
-            idx = idx[0]
-            tfidf_vector = tfidf.transform([train_data.iloc[idx]['Content']])
-            n_neighbors = min(20, knn._fit_X.shape[0])
-            distances, indices = knn.kneighbors(tfidf_vector, n_neighbors=n_neighbors)
-            content_score = np.mean([train_data.iloc[i]['NormalizedEngagement'] for i in indices[0]])
-
-        # Categories Adjustment
-        category_score = 0
+        # --- Categories Adjustment ---
+        category_score = 0.0
         if categories:
             for category in categories:
-                if category in post and post[category] == 1:  # เช็คว่าหมวดหมู่ตรงหรือไม่
+                # ตรวจสอบว่าคอลัมน์ category มีอยู่และมีค่าเป็น 1
+                if category in post.index and pd.notna(post[category]) and post[category] == 1:
                     category_score += 1
 
         # Normalize Category Score
-        if categories:
+        if categories and len(categories) > 0:
             category_score /= len(categories)
+        else:
+            category_score = 0.0
 
-        # Hybrid Score
-        final_score = (alpha * collab_score) + ((1 - alpha) * content_score) + (beta * category_score)
-        recommendations.append((post['post_id'], final_score))
+        # --- Hybrid Score Calculation ---
+        # ตรวจสอบให้แน่ใจว่าคะแนนเป็นตัวเลขก่อนคํานวณ
+        final_score = (alpha * float(collab_score)) + \
+                      ((1 - alpha) * float(content_score)) + \
+                      (beta * float(category_score))
+        
+        recommendations.append((post_id, final_score))
 
-    # Normalize Scores
+    # แปลงคําแนะนําเป็น DataFrame เพื่อจัดการได้ง่ายขึ้น
     recommendations_df = pd.DataFrame(recommendations, columns=['post_id', 'score'])
-    recommendations_df['normalized_score'] = normalize_scores(recommendations_df['score'])
-    return recommendations_df.sort_values(by='normalized_score', ascending=False)['post_id'].tolist()
+    
+    # เพิ่มคอลัมน์ random_order สําหรับใช้ในการเรียงลําดับเมื่อคะแนนเท่ากัน
+    recommendations_df['random_order'] = np.random.rand(len(recommendations_df))
 
-def split_and_rank_recommendations(recommendations, user_interactions):
-    """แยกโพสต์ที่ผู้ใช้เคยโต้ตอบออกจากโพสต์ที่ยังไม่เคยดู และเรียงลำดับใหม่"""
-    # แปลง recommendations ให้ไม่มีโพสต์ซ้ำ
-    unique_recommendations = list(dict.fromkeys(recommendations))
+    # Normalize คะแนนสุดท้ายให้อยู่ในช่วง [0, 1]
+    if not recommendations_df['score'].empty and recommendations_df['score'].nunique() > 1:
+        recommendations_df['normalized_score'] = normalize_scores(recommendations_df['score'])
+    else:
+        recommendations_df['normalized_score'] = 0.5 # ให้คะแนนกลางๆ ถ้าคะแนนทั้งหมดเท่ากันหรือไม่ข้อมูล
 
-    # แยกโพสต์ที่ผู้ใช้ยังไม่เคยดู และโพสต์ที่ผู้ใช้เคยโต้ตอบแล้ว
-    unviewed_posts = [post_id for post_id in unique_recommendations if post_id not in user_interactions]
-    viewed_posts = [post_id for post_id in unique_recommendations if post_id in user_interactions]
+    # เรียงลําดับตาม normalized_score (มากไปน้อย) และ random_order (มากไปน้อย)
+    return recommendations_df.sort_values(by=['normalized_score', 'random_order'], ascending=[False, False])['post_id'].tolist()
 
-    # รวมโพสต์ที่ยังไม่เคยดู (unviewed) ก่อน ตามด้วยโพสต์ที่เคยดูแล้ว (viewed)
-    final_recommendations = unviewed_posts + viewed_posts
 
-    # พิมพ์ข้อมูลออกมา
-    print("Unviewed Posts:", unviewed_posts)
-    print("Viewed Posts:", viewed_posts)
-    print("Final Recommendations (ordered):", final_recommendations)
+def split_and_rank_recommendations(recommendations, user_interactions, num_unviewed_first=30):
+    """
+    Splits recommended posts into "unviewed" and "viewed" categories.
+    Ranks unviewed posts first (up to a specified count), then mixes
+    the remaining unviewed and all viewed posts while maintaining overall recommendation order
+    and introducing some randomness.
 
-    return final_recommendations
+    :param recommendations: List of tuples (post_id, score), ordered by recommendation score.
+    :param user_interactions: Set or list of post_ids the user has already interacted with.
+    :param num_unviewed_first: Number of unviewed posts to prioritize at the beginning.
+    """
+    
+    unique_recommendations_ids = [int(p) if isinstance(p, float) else p for p in list(dict.fromkeys(recommendations))]
+    user_interactions_set = set([int(p) if isinstance(p, float) else p for p in user_interactions])
 
-# Cache สำหรับเก็บคำแนะนำของผู้ใช้
+    # Separate posts into unviewed and viewed lists, maintaining the original order
+    # Since unique_recommendations_ids is already sorted by recommendation score (from recommend_hybrid)
+    unviewed_posts = [post_id for post_id in unique_recommendations_ids if post_id not in user_interactions_set]
+    viewed_posts = [post_id for post_id in unique_recommendations_ids if post_id in user_interactions_set]
+
+    final_recommendations_ordered = []
+
+    # 1. Add a specified number of unviewed posts to the beginning (highest recommended unviewed posts)
+    num_to_take_first = min(num_unviewed_first, len(unviewed_posts))
+    final_recommendations_ordered.extend(unviewed_posts[:num_to_take_first])
+
+    # Get the remaining unviewed posts
+    remaining_unviewed = unviewed_posts[num_to_take_first:]
+    combined_remaining_posts_temp = []
+    final_recommendations_ordered = []
+
+    # 1. Separate all recommendations into unviewed and viewed, keeping original order (from recommend_hybrid)
+    all_unviewed = [post_id for post_id in unique_recommendations_ids if post_id not in user_interactions_set]
+    all_viewed = [post_id for post_id in unique_recommendations_ids if post_id in user_interactions_set]
+
+    # 2. Take the top N unviewed posts as the absolute highest priority
+    num_to_take_first = min(num_unviewed_first, len(all_unviewed))
+    final_recommendations_ordered.extend(all_unviewed[:num_to_take_first])
+
+    # 3. Collect the *remaining* unviewed posts and all viewed posts.
+
+    # Get the top N unviewed posts that we want to prioritize
+    top_n_unviewed_prioritized = all_unviewed[:num_to_take_first]
+
+    # Filter out the top_n_unviewed_prioritized from the original unique_recommendations_ids list
+    remaining_overall_recommendations = [
+        post_id for post_id in unique_recommendations_ids if post_id not in set(top_n_unviewed_prioritized)
+    ]
+
+    block_size = 5 # Example: Shuffle in blocks of 5 posts
+    shuffled_remaining_recommendations = []
+    for i in range(0, len(remaining_overall_recommendations), block_size):
+        block = remaining_overall_recommendations[i : i + block_size]
+        random.shuffle(block) # Shuffle posts within this small block
+        shuffled_remaining_recommendations.extend(block)
+
+    # Combine the top N unviewed with the block-shuffled remainder
+    final_recommendations_ordered = top_n_unviewed_prioritized + shuffled_remaining_recommendations
+
+    # Update print statements to reflect the new lists
+    print("Top N Unviewed (prioritized):", top_n_unviewed_prioritized)
+    print("Remaining Overall Recommendations (block-shuffled):", shuffled_remaining_recommendations)
+    print("Final Recommendations (ordered, after mix):", final_recommendations_ordered)
+
+    return final_recommendations_ordered
+
+# --- Recommendation Cache System ---
 recommendation_cache = {}
-cache_expiry_time = 10  # หน่วยเป็นวินาที (10 วินาที)
+cache_expiry_time = 10  # Cache expiry time in seconds (10 seconds)
+
+def clear_cache():
+    """
+    Automatically clears the recommendation cache at regular intervals.
+    Runs as a daemon thread.
+    """
+    global recommendation_cache
+    while True:
+        time.sleep(cache_expiry_time)  # Wait for the specified expiry time
+        recommendation_cache = {} # Clear the cache
+        # No print statement here as requested
+
+# Start the cache clearing thread when the script runs
+threading.Thread(target=clear_cache, daemon=True).start()
 
 # ฟังก์ชันสำหรับ clear cache
 def clear_cache():
@@ -500,10 +626,11 @@ def clear_cache():
     while True:
         time.sleep(cache_expiry_time)  # รอ 10 วินาที
         recommendation_cache = {}
-        print("Cache cleared automatically.")
+        # ไม่มีการ print ข้อความ "Cache cleared automatically." แล้วงับ
 
 # สร้าง thread สำหรับ clear cache
 threading.Thread(target=clear_cache, daemon=True).start()
+
 
 
 # ==================== SLIP & PROMPTPAY FUNCTIONS (from Slip.py) ====================
@@ -1481,32 +1608,48 @@ def recommend():
         # โหลดข้อมูลจากฐานข้อมูล
         content_based_data, collaborative_data = load_data_from_db()
 
-        # สร้างคอลัมน์ 'NormalizedEngagement' หากยังไม่มี
-        if 'NormalizedEngagement' not in content_based_data.columns:
-            content_based_data = normalize_engagement(content_based_data, user_column='owner_id', engagement_column='PostEngagement')
-
-        # Load pre-trained models
+        # โหลดโมเดลที่เทรนไว้แล้ว
         try:
             knn = joblib.load('KNN_Model.pkl')
             collaborative_model = joblib.load('Collaborative_Model.pkl')
             tfidf = joblib.load('TFIDF_Model.pkl')
+            
+            if 'NormalizedEngagement' not in content_based_data.columns:
+                 content_based_data = normalize_engagement(content_based_data, user_column='owner_id', engagement_column='PostEngagement')
+            
+            # ต้องแน่ใจว่า content_based_data มี 'CommentCount' และ 'NormalizedCommentCount'
+            if 'CommentCount' not in content_based_data.columns:
+                content_based_data['CommentCount'] = analyze_comments(content_based_data['Comments'])
+                max_comment_count_for_normalization = content_based_data['CommentCount'].max()
+                if max_comment_count_for_normalization > 0:
+                    content_based_data['NormalizedCommentCount'] = content_based_data['CommentCount'] / max_comment_count_for_normalization
+                else:
+                    content_based_data['NormalizedCommentCount'] = 0.0
+
+            if 'WeightedEngagement' not in content_based_data.columns:
+                content_based_data['WeightedEngagement'] = content_based_data['NormalizedEngagement'] + content_based_data['NormalizedCommentCount']
+
+
         except FileNotFoundError as e:
             print(f"Error loading models: {e}")
             return jsonify({"error": "Model files not found"}), 500
 
-        # สร้างหมวดหมู่
+        # สร้างหมวดหมู่ (ใช้จากที่เรามีใน content_based_data ได้เลย)
         categories = [
-            'Gadget', 'Smartphone', 'Laptop', 'Smartwatch', 'Headphone', 'Tablet', 'Camera', 'Drone',
-            'Home_Appliance', 'Gaming_Console', 'Wearable_Device', 'Fitness_Tracker', 'VR_Headset',
-            'Smart_Home', 'Power_Bank', 'Bluetooth_Speaker', 'Action_Camera', 'E_Reader',
-            'Desktop_Computer', 'Projector'
+            'Electronics_Gadgets', 'Furniture', 'Outdoor_Gear', 'Beauty_Products', 'Accessories'
         ]
 
         # คำนวณคำแนะนำใหม่
+        # แก้ไขตรงนี้: ลบ collaborative_data ออกจากพารามิเตอร์ที่ 3
         recommendations = recommend_hybrid(
-            user_id, content_based_data, collaborative_data,
-            collaborative_model, knn, tfidf, categories,
-            alpha=0.8, beta=0.2  # เพิ่ม beta สำหรับ categories
+            user_id,
+            content_based_data, # นี่คือ all_posts_data ที่แท้จริงที่เราต้องการให้โมเดลแนะนำจาก
+            collaborative_model, # นี่คือ collaborative_model
+            knn, # นี่คือ knn
+            tfidf, # นี่คือ tfidf
+            categories, # นี่คือ categories
+            alpha=0.8, # กำหนดค่า alpha ที่ต้องการ
+            beta=0.2   # กำหนดค่า beta ที่ต้องการ
         )
 
         if not recommendations:
@@ -1516,7 +1659,11 @@ def recommend():
         user_interactions = collaborative_data[collaborative_data['user_id'] == user_id]['post_id'].tolist()
         final_recommendations = split_and_rank_recommendations(recommendations, user_interactions)
 
-        # Query for post details
+        # Query for post details (ส่วนนี้ไม่ได้แก้ไข)
+        # ต้องระวังเรื่อง Security ของ SQL query ด้วยงับ ควรใช้ parametrized query
+        # ซึ่งเราใช้ placeholders และ params ถูกต้องแล้ว
+        from sqlalchemy import text # ต้อง import text จาก sqlalchemy
+        
         placeholders = ', '.join([f':id_{i}' for i in range(len(final_recommendations))])
         query = text(f"""
             SELECT posts.*, users.username, users.picture,
@@ -1535,6 +1682,8 @@ def recommend():
 
         output = []
         for post in sorted_posts:
+            # ต้องนำเข้า timezone จาก datetime ด้วยงับ ถ้ายังไม่ได้ทำ
+            from datetime import timezone
             output.append({
                 "id": post['id'],
                 "userId": post['user_id'],
@@ -1559,6 +1708,10 @@ def recommend():
     except Exception as e:
         print("Error in recommend function:", e)
         return jsonify({"error": "Internal Server Error"}), 500
+
+
+
+
 
 @app.route('/api/generate-qrcode/<int:order_id>', methods=['GET'])
 def api_generate_qrcode(order_id):
