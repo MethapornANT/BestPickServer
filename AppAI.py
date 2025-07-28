@@ -1311,8 +1311,7 @@ def create_post():
                 "status": "warning",
                 "message": "กรุณาเปลี่ยนภาพแล้วลองใหม่อีกครั้ง",
                 "invalid_photos": invalid_photos,
-                "valid_photos": photo_urls,
-                "suggestion": "กรุณาลบภาพที่ไม่เหมาะสมออกจากโพสต์และลองใหม่อีกครั้ง"
+                "valid_photos": photo_urls
             }), 400
 
         # รับ URL ของวิดีโอที่อัปโหลด (mockup)
@@ -1383,47 +1382,61 @@ def update_post(id):
         ProductName = request.form.get('ProductName')
         CategoryID = request.form.get('CategoryID')
         user_id = request.form.get('user_id')
-        existing_photos = request.form.getlist('existing_photos')
-        existing_videos = request.form.getlist('existing_videos')
+        
+        # อ่านค่า existing_photos และ existing_videos จาก JSON string ถ้ามี
+        # เนื่องจาก form.getlist จะคืนค่าเป็น list ของ string แม้ว่าจะเป็น JSON string ก็ตาม
+        # เราต้องแปลงมันเป็น Python list ที่ถูกต้อง
+        existing_photos_str = request.form.get('existing_photos')
+        existing_videos_str = request.form.get('existing_videos')
+        
+        # พยายามโหลด JSON, ถ้าไม่เป็น JSON หรือว่างเปล่า ก็ให้เป็น list ว่าง
+        existing_photos = json.loads(existing_photos_str) if existing_photos_str else []
+        existing_videos = json.loads(existing_videos_str) if existing_videos_str else []
+        
         photos = request.files.getlist('photo')
         videos = request.files.getlist('video')
 
         if not user_id:
             return jsonify({"error": "You are not authorized to update this post"}), 403
 
+        # รวมรูปภาพเดิมและรูปภาพใหม่ที่อัปโหลด
         photo_urls = existing_photos if existing_photos else []
-        video_urls = existing_videos if existing_videos else []
         invalid_photos = []
 
         for photo in photos:
+            # กำหนด photo_path ไว้ก่อน
+            photo_path = None
             if not photo or not photo.filename:
                 continue
                 
             try:
                 filename = secure_filename(photo.filename)
                 photo_path = os.path.join(UPLOAD_FOLDER, filename)
-                photo.save(photo_path)
-                
+                photo.save(photo_path) # บันทึกไฟล์ก่อนตรวจสอบ
+
+                print(f"Processing new photo for update: {filename}")
                 is_nude, result = nude_predict_image(photo_path)
                 
                 if is_nude:
-                    # ลบไฟล์ภาพที่ไม่เหมาะสม
+                    print(f"NSFW detected in {filename} during update")
+                    # ลบไฟล์ภาพที่ไม่เหมาะสมทันที
                     if os.path.exists(photo_path):
                         os.remove(photo_path)
                     
-                    # เก็บข้อมูลภาพที่ไม่เหมาะสม
                     invalid_photos.append({
                         "filename": filename,
                         "reason": "พบภาพโป๊ (Hentai หรือ Pornography > 20%)",
                         "details": result
                     })
                 else:
+                    print(f"New photo {filename} is safe")
                     photo_urls.append(f'/uploads/{filename}')
+                    # ไม่ต้องลบไฟล์ที่นี่ เพราะจะถูกเก็บไว้เป็นส่วนหนึ่งของโพสต์
                     
             except Exception as e:
-                print(f"Error processing photo {photo.filename}: {e}")
+                print(f"Error processing photo {photo.filename} during update: {e}")
                 # หากเกิดข้อผิดพลาด ให้ลบไฟล์และแจ้งเตือน
-                if os.path.exists(photo_path):
+                if photo_path and os.path.exists(photo_path): # ตรวจสอบ photo_path ก่อนใช้
                     os.remove(photo_path)
                 invalid_photos.append({
                     "filename": photo.filename,
@@ -1433,14 +1446,17 @@ def update_post(id):
         
         # หากมีภาพที่ไม่เหมาะสม ให้แจ้งเตือนและไม่อัปเดต post
         if invalid_photos:
+            print("แจ้งเตือน user: พบภาพไม่เหมาะสมในระหว่างการอัปเดต")
+            # ถ้ามี invalid_photos จะไม่ทำการอัปเดตข้อมูลใน DB เลย
             return jsonify({
                 "status": "warning",
                 "message": "กรุณาเปลี่ยนภาพแล้วลองใหม่อีกครั้ง",
                 "invalid_photos": invalid_photos,
-                "valid_photos": photo_urls,
-                "suggestion": "กรุณาลบภาพที่ไม่เหมาะสมออกจากโพสต์และลองใหม่อีกครั้ง"
+                "valid_photos": photo_urls
             }), 400
 
+        # รวมวิดีโอเดิมและวิดีโอใหม่ที่อัปโหลด
+        video_urls = existing_videos if existing_videos else []
         for video in videos:
             if not video or not video.filename:
                 continue
@@ -1458,7 +1474,7 @@ def update_post(id):
             update_query = text("""
                 UPDATE posts 
                 SET Title = :title, content = :content, ProductName = :product_name, 
-                    category = :category, photo_url = :photo_urls, video_url = :video_urls, 
+                    CategoryID = :category_id, photo_url = :photo_urls, video_url = :video_urls, 
                     updated_at = NOW()
                 WHERE id = :post_id AND user_id = :user_id
             """)
@@ -1470,7 +1486,7 @@ def update_post(id):
                 'title': Title,
                 'content': content,
                 'product_name': ProductName,
-                'category': CategoryID,
+                'category_id': CategoryID, # แก้เป็น CategoryID ให้ตรงกับชื่อคอลัมน์ใน DB
                 'photo_urls': photo_urls_json,
                 'video_urls': video_urls_json
             })
@@ -1502,6 +1518,143 @@ def update_post(id):
     except Exception as error:
         print("Internal server error:", str(error))
         return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/ai/users/<int:userId>/profile", methods=['PUT'])
+# @verifyToken # อย่าลืมเปิดใช้งาน middleware นี้ด้วยนะงับ
+def update_user_profile(userId):
+    try:
+        username = request.form.get('username')
+        bio = request.form.get('bio')
+        gender = request.form.get('gender')
+        birthday_str = request.form.get('birthday')
+
+        profile_image_file = request.files.get('profileImage')
+
+        if not all([username, bio, gender, birthday_str]):
+            return jsonify({
+                "error": "กรุณากรอกข้อมูลให้ครบทุกช่องงับ: ชื่อผู้ใช้, ไบโอ, เพศ, และวันเกิด"
+            }), 400
+
+        # --- ส่วนจัดการและตรวจสอบวันเกิด ---
+        # เนื่องจาก Front-end จะส่งมาเป็น YYYY-MM-DD แล้ว
+        # เรายังคงให้ Back-end ยืดหยุ่นในการ parse รูปแบบอื่น ๆ เผื่อไว้
+        birthday = None
+        date_formats = [
+            "%Y-%m-%d",    # รูปแบบหลักจาก Front-end
+            "%d/%m/%Y",    # เผื่อไว้ถ้ามีคนใช้รูปแบบเก่า
+            "%m/%d/%Y",
+            "%Y/%m/%d",
+            "%d-%m-%Y",
+            # ถ้า Front-end อาจส่งเป็น d MMM yyyy (เช่น "28 ก.ค. 2568" หรือ "28 Jul 2025")
+            # ถ้า Locale ของ Back-end ไม่ใช่ไทย อาจต้องระบุ locale ใน strptime
+            # "%d %b %Y",  # For "28 Jul 2025" (English short month)
+            # "%d %B %Y",  # For "28 July 2025" (English full month)
+            # ถ้าเป็นภาษาไทย อาจต้องใช้ไลบรารีอื่นช่วย parse หรือกำหนด Locale
+        ]
+        
+        # เพิ่มการลอง parse แบบ ISO standard ที่ไม่ขึ้นกับ locale
+        try:
+            birthday = datetime.fromisoformat(birthday_str).strftime("%Y-%m-%d")
+        except ValueError:
+            # ถ้า fromisoformat ไม่ได้ผล ให้ลองวิธีอื่น
+            for fmt in date_formats:
+                try:
+                    birthday = datetime.strptime(birthday_str, fmt).strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+
+        if birthday is None:
+            return jsonify({"error": "รูปแบบวันเกิดไม่ถูกต้อง โปรดระบุในรูปแบบ YYYY-MM-DD"}), 400
+        # --- จบส่วนจัดการวันเกิด ---
+
+        # --- ส่วนจัดการและตรวจสอบรูปภาพโปรไฟล์ด้วย AI ---
+        profile_image_path = None
+        if profile_image_file and profile_image_file.filename:
+            try:
+                filename = secure_filename(profile_image_file.filename)
+                temp_image_path = os.path.join(UPLOAD_FOLDER, filename)
+                profile_image_file.save(temp_image_path)
+
+                print(f"Processing new profile image: {filename}")
+                is_nude, result = nude_predict_image(temp_image_path)
+
+                if is_nude:
+                    print(f"NSFW detected in profile image {filename}")
+                    if os.path.exists(temp_image_path):
+                        os.remove(temp_image_path)
+                    return jsonify({
+                        "status": "warning",
+                        "message": "กรุณาเปลี่ยนภาพแล้วลองใหม่อีกครั้ง",
+                        "details": result
+                    }), 400
+                else:
+                    print(f"Profile image {filename} is safe")
+                    profile_image_path = f'/uploads/{filename}'
+            except Exception as e:
+                print(f"Error processing profile image {profile_image_file.filename}: {e}")
+                if temp_image_path and os.path.exists(temp_image_path):
+                    os.remove(temp_image_path)
+                return jsonify({
+                    "error": "ไม่สามารถประมวลผลภาพโปรไฟล์ได้",
+                    "details": str(e)
+                }), 500
+        # --- จบส่วนจัดการรูปภาพโปรไฟล์ ---
+
+        check_username_query = text("""
+            SELECT id FROM users WHERE username = :username AND id != :user_id
+        """)
+        check_results = db.session.execute(check_username_query, {
+            'username': username,
+            'user_id': userId
+        }).fetchall()
+
+        if len(check_results) > 0:
+            return jsonify({"error": "ชื่อผู้ใช้นี้มีคนใช้แล้วงับ"}), 400
+
+        update_profile_query = """
+            UPDATE users SET username = :username, bio = :bio, gender = :gender, birthday = :birthday
+        """
+        update_data = {
+            'username': username,
+            'bio': bio,
+            'gender': gender,
+            'birthday': birthday,
+            'user_id': userId
+        }
+
+        if profile_image_path:
+            update_profile_query += ", picture = :picture"
+            update_data['picture'] = profile_image_path
+
+        update_profile_query += " WHERE id = :user_id"
+
+        try:
+            result = db.session.execute(text(update_profile_query), update_data)
+            db.session.commit()
+
+            if result.rowcount == 0:
+                return jsonify({"error": "ไม่พบผู้ใช้หรือไม่มีการเปลี่ยนแปลงข้อมูลงับ"}), 404
+
+            return jsonify({
+                "message": "อัปเดตโปรไฟล์สำเร็จงับ",
+                "profileImage": profile_image_path if profile_image_path else "No new image uploaded",
+                "username": username,
+                "bio": bio,
+                "gender": gender,
+                "birthday": birthday
+            }), 200
+
+        except Exception as db_error:
+            print(f"Database error during profile update: {db_error}")
+            db.session.rollback()
+            return jsonify({"error": "เกิดข้อผิดพลาดฐานข้อมูลขณะอัปเดตโปรไฟล์ผู้ใช้"}), 500
+
+    except Exception as error:
+        print(f"Internal server error: {error}")
+        return jsonify({"error": "เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์"}), 500
+
 
 # Web Scraping Route
 @app.route('/ai/search', methods=['GET'])
