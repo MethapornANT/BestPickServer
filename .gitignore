@@ -27,6 +27,8 @@ pids
 ALLPIC/
 data/
 TestPIC/
+nsfw_data/
+nsfw_data2/
 
 # Ignore the ALLPIC.zip file
 ALLPIC.zip
