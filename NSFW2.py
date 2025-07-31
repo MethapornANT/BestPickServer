@@ -1,192 +1,781 @@
 import os
 import torch
-from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms, models
-import torch.nn.functional as F
-import pandas as pd # สำหรับจัดการข้อมูลและบันทึกเป็น CSV/Excel
-from datetime import datetime # สำหรับตั้งชื่อไฟล์ผลลัพธ์
+from PIL import Image
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import shutil
+import glob
+import pandas as pd
+import time
+import logging
+import warnings
 
-# --- การตั้งค่าและโหลดโมเดล ---
-# กำหนดโฟลเดอร์สำหรับเก็บไฟล์รูปภาพที่จะทำนาย
-UPLOAD_FOLDER = './data'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True) # สร้างโฟลเดอร์ถ้ายังไม่มี
+# ================== CONFIG ==================
+TRAIN_DIR = './nsfw_data/train'
+VAL_DIR = './nsfw_data/val'
+TEST_DIR = './nsfw_data/test'
 
-# กำหนดเส้นทางไปยังไฟล์โมเดลที่เทรนมาแล้ว
-MODEL_PATH = 'vit_b_16_best.pth' 
-
-# Mapping id เป็น label (ต้องตรงกับ LABELS ที่ใช้ตอนเทรนโมเดล ViT-B_16_best.pth)
 LABELS = ['normal', 'hentai', 'porn', 'sexy', 'anime']
-idx2label = {idx: label for idx, label in enumerate(LABELS)}
+label2idx = {label: idx for idx, label in enumerate(LABELS)}
+idx2label = {idx: label for label, idx in label2idx.items()}
 
-# กำหนด Device ที่จะใช้ (GPU ถ้ามี, ไม่งั้นก็ CPU)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_NAMES = ['InceptionV3', 'DenseNet121', 'ShuffleNetV2']
 
-# --- โหลดโมเดล ViT-B_16 ที่เทรนมาแล้ว ---
-model = None # กำหนดค่าเริ่มต้นเป็น None
-print(f"กำลังโหลดโมเดล ViT-B_16 จากไฟล์: {MODEL_PATH}...")
-try:
-    model = models.vit_b_16(weights=None) 
-    model.heads = torch.nn.Sequential(
-        torch.nn.Dropout(0.2), 
-        torch.nn.Linear(model.heads.head.in_features, len(LABELS))
-    )
-    
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    model.eval() 
-    model.to(device) 
-    print(f"โหลดโมเดล {MODEL_PATH} เสร็จสมบูรณ์แล้วงับ! โมเดลทำงานอยู่บน: {device}")
+BASE_OUTPUT_DIR = './NSFW_Model_NewModels' # เปลี่ยนชื่อโฟลเดอร์หลักเพื่อแยกจากของเดิม
+RESULTS_BASE_DIR = os.path.join(BASE_OUTPUT_DIR, 'results')
+CHECKPOINT_DIR = os.path.join(BASE_OUTPUT_DIR, 'checkpoints')
 
-except FileNotFoundError:
-    print(f"❌ Error: ไม่พบไฟล์โมเดล '{MODEL_PATH}' โปรดตรวจสอบว่าไฟล์อยู่ในตำแหน่งที่ถูกต้องงับ")
-    exit() # ถ้าโมเดลหลักโหลดไม่ได้ก็จบโปรแกรม
-except Exception as e:
-    print(f"💔 เกิดข้อผิดพลาดในการโหลดหรือเตรียมโมเดลจาก '{MODEL_PATH}': {e}")
-    print("โปรดตรวจสอบว่าโมเดล ViT-B_16_best.pth เข้ากันได้กับโครงสร้างที่สร้างขึ้นงับ")
-    exit()
+PAUSE_SIGNAL_FILE = os.path.join(BASE_OUTPUT_DIR, 'PAUSE_SIGNAL.txt')
+STOP_SIGNAL_FILE = os.path.join(BASE_OUTPUT_DIR, 'STOP_SIGNAL.txt')
 
-# กำหนด transforms ที่ใช้ในการประเมินผล (ต้องเหมือนตอนเทรน)
-processor = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+# ================== LOGGING SETUP ==================
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+# Clear existing handlers to avoid duplicate logs when running multiple times in same session
+if logger.handlers:
+    for handler in logger.handlers:
+        logger.removeHandler(handler)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(console_handler)
 
-# --- ฟังก์ชันสำหรับทำนาย NSFW ---
-def nude_predict_image(image_path):
+# ================== SUPPRESS WARNINGS ==================
+warnings.filterwarnings("ignore", category=UserWarning, module='PIL.Image')
+
+# ================== HYPERPARAMETERS FOR EACH MODEL ==================
+def get_model_hyperparameters(model_name):
     """
-    ฟังก์ชันสำหรับทำนายภาพว่าเป็น NSFW หรือไม่ โดยใช้โมเดล vit_b_16_best.pth
-    พร้อมแสดงผลเปอร์เซ็นต์ของแต่ละหมวดหมู่
-    และระบุว่าภาพเป็น NSFW ตามเกณฑ์ Hentai > 20% หรือ Pornography > 20%
-
-    Args:
-        image_path (str): เส้นทางไปยังไฟล์รูปภาพ
-
-    Returns:
-        dict: Dictionary ที่แสดงเปอร์เซ็นต์ของแต่ละหมวดหมู่, is_nsfw,
-              หรือข้อความ error หากเกิดปัญหา
+    Returns a dictionary of hyperparameters for a given model name.
+    Includes 'image_size' now for specific models like InceptionV3.
     """
-    if not os.path.exists(image_path):
-        print(f"❌ Error: ไม่พบไฟล์รูปภาพที่ {image_path} งับ")
-        return {"error": "ไม่พบไฟล์รูปภาพ กรุณาตรวจสอบเส้นทางอีกครั้งงับ"}
+    common_hparams = {
+        'epochs': 100,
+        'lr': 0.0001,
+        'patience': 4, # ปรับตาม Output ของนาย
+        'scheduler_patience': 2, # ปรับตาม Output ของนาย
+        'batch_size': 128, # Default image size
+        'image_size': 224
+    }
 
-    try:
-        image = Image.open(image_path).convert("RGB")
-        
-        inputs = processor(image).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            outputs = model(inputs)
-            logits = outputs
-            probs = F.softmax(logits, dim=1).squeeze().tolist()
+    if model_name == 'InceptionV3':
+        common_hparams['image_size'] = 299
+        common_hparams['batch_size'] = 64 # InceptionV3 is larger, often needs smaller batch size
+        common_hparams['lr'] = 0.0001 # May need slightly different LR
+    elif model_name == 'DenseNet121':
+        common_hparams['image_size'] = 224
+        common_hparams['batch_size'] = 64 # ลด Batch Size เพื่อแก้ CUDA out of memory
+        common_hparams['lr'] = 0.0001
+    elif model_name == 'ShuffleNetV2':
+        common_hparams['image_size'] = 224
+        common_hparams['batch_size'] = 64 # ลด Batch Size เพื่อแก้ CUDA out of memory (เดิม 256)
+        common_hparams['lr'] = 0.0001 # May need slightly different LR
+    return common_hparams
 
-        if len(probs) != len(LABELS):
-            # print(f"⚠️ คำเตือน: จำนวน output จากโมเดล ({len(probs)}) ไม่ตรงกับจำนวน LABELS ที่กำหนด ({len(LABELS)}) งับ")
-            all_scores = {idx2label.get(i, f"Unknown_{i}"): round(probs[i]*100, 2) for i in range(len(probs))}
-        else:
-            all_scores = {idx2label[i]: round(probs[i]*100, 2) for i in range(len(probs))}
+# ================== DATASET ==================
+class NSFWImageDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.samples = []
+        self.transform = transform
+        
+        print(f"Loading data from: {root_dir}")
+        if not os.path.exists(root_dir):
+            logger.error(f"Error: Directory '{root_dir}' does not exist. Please run data splitting script first.")
+            return
 
-        hentai_score = all_scores.get("hentai", 0.0)
-        porn_score = all_scores.get("porn", 0.0)
-        
-        is_nsfw = hentai_score > 20 or porn_score > 20
-        
-        print(f"\n✨ ผลการตรวจสอบ NSFW สำหรับ: {os.path.basename(image_path)} ✨")
-        for label, score in all_scores.items():
-            print(f"  - {label.capitalize()}: {score:.2f}%") 
-        
-        print(f"--- สรุป: ภาพนี้ {'🔴 เป็น NSFW' if is_nsfw else '🟢 ไม่เป็น NSFW'} (Hentai > 20% หรือ Pornography > 20%) ---")
-        
-        return {"scores": all_scores, "is_nsfw": is_nsfw}
-        
-    except Exception as e:
-        print(f"💔 เกิดข้อผิดพลาดในการตรวจสอบ NSFW สำหรับ {image_path}: {e}")
-        return {"error": f"ไม่สามารถตรวจสอบภาพได้ กรุณาลองใหม่อีกครั้ง: {e}"}
-
-# --- ฟังก์ชันสำหรับเลือกโหมดการทำงาน ---
-def get_image_files_in_folder(folder_path):
-    """ดึงรายชื่อไฟล์รูปภาพทั้งหมดในโฟลเดอร์ที่กำหนด"""
-    image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp')
-    return [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
-            if os.path.isfile(os.path.join(folder_path, f)) and f.lower().endswith(image_extensions)]
-
-def main_menu():
-    """แสดงเมนูหลักและรับตัวเลือกจากผู้ใช้"""
-    
-    # กำหนด header สำหรับ CSV (ต้องตรงกับ LABELS)
-    # เพิ่ม 'Status' และ 'is_NSFW' ด้วย
-    csv_headers = ['Image_Name', 'Status'] 
-    for label in LABELS:
-        csv_headers.append(f'{label.capitalize()}_%')
-    csv_headers.append('is_NSFW')
-
-    while True:
-        print("\n--- เลือกโหมดการทำงาน (Custom Model) งับ ---")
-        print("1. ทำนายรูปภาพทั้งหมดในโฟลเดอร์ (./data) และบันทึกผล")
-        print("2. เลือกรูปภาพเดียวเพื่อทำนาย (ไม่บันทึกผล)")
-        print("3. ออกจากการทำงาน")
-        
-        choice = input("กรุณาป้อนตัวเลือก (1, 2, หรือ 3): ")
-
-        if choice == '1':
-            print(f"\nกำลังทำนายรูปภาพทั้งหมดในโฟลเดอร์: {UPLOAD_FOLDER} งับ...")
-            image_paths = get_image_files_in_folder(UPLOAD_FOLDER)
-            
-            if not image_paths:
-                print(f"❌ ไม่พบรูปภาพใดๆ ในโฟลเดอร์ '{UPLOAD_FOLDER}' งับ")
-                print("กรุณานำไฟล์รูปภาพไปใส่ไว้ในโฟลเดอร์นั้นก่อนนะงับ")
+        for label in os.listdir(root_dir):
+            label_dir = os.path.join(root_dir, label)
+            if not os.path.isdir(label_dir):
+                continue
+            if label not in label2idx:
+                logger.warning(f"Skipping directory {label_dir}: Label '{label}' not found in LABELS list.")
                 continue
 
-            # กำหนดชื่อไฟล์ CSV โดยใช้ Timestamp เพื่อไม่ให้ซ้ำกัน
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"custom_nsfw_results_{timestamp}.csv"
-            
-            # เก็บผลลัพธ์สำหรับการบันทึก
-            batch_results = [] 
-            
-            for img_path in image_paths:
-                result = nude_predict_image(img_path)
-                
-                row_data = {'Image_Name': os.path.basename(img_path)}
-                if "error" in result:
-                    row_data['Status'] = 'Error'
-                    for label in LABELS:
-                        row_data[f'{label.capitalize()}_%'] = 'N/A'
-                    row_data['is_NSFW'] = 'N/A'
-                    print(f"❌ เกิดข้อผิดพลาดสำหรับ {os.path.basename(img_path)}: {result['error']}")
-                else:
-                    row_data['Status'] = 'OK'
-                    for label_key, score_value in result['scores'].items():
-                        row_data[f'{label_key.capitalize()}_%'] = score_value # ชื่อคอลัมน์จะตรงกับ LABELS
-                    row_data['is_NSFW'] = result['is_nsfw']
-                
-                batch_results.append(row_data)
-            
-            # บันทึกผลลัพธ์ลง CSV/Excel
-            if batch_results:
-                df_new = pd.DataFrame(batch_results)
-                # บันทึกต่อท้ายไฟล์เดิม (ถ้ามี) หรือสร้างใหม่ ถ้ายังไม่มี
-                # เป็ดน้อยเปลี่ยนมาสร้างไฟล์ใหม่เสมอ เพื่อให้ข้อมูลแต่ละ batch แยกกันชัดเจน
-                df_new.to_csv(output_filename, index=False, encoding='utf-8-sig')
-                print(f"\n🎉 บันทึกผลลัพธ์การทำนายทั้งหมดลงในไฟล์: {output_filename} แล้วงับ!")
-            else:
-                print("\n⚠️ ไม่มีผลลัพธ์ให้บันทึก (อาจเกิดข้อผิดพลาดในการประมวลผลทุกภาพ) งับ")
+            for fname in os.listdir(label_dir):
+                if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    img_path = os.path.join(label_dir, fname)
+                    try:
+                        with Image.open(img_path) as img:
+                            img.verify()
+                        self.samples.append((img_path, label2idx[label]))
+                    except Exception as e:
+                        logger.warning(f"Skipping corrupted or unreadable file: {img_path} - {str(e)}")
+                        continue
+        print(f"Data loading complete: Found {len(self.samples)} images in {root_dir}")
 
-            print("\n--- การทำนายรูปภาพทั้งหมดในโฟลเดอร์เสร็จสิ้นแล้วงับ ---")
+    def __len__(self):
+        return len(self.samples)
 
-        elif choice == '2':
-            real_image_to_test = input("กรุณาป้อน Path ของรูปภาพที่คุณต้องการทำนาย (เช่น data/image.jpg หรือ D:/images/my_pic.png): ")
-            if os.path.exists(real_image_to_test):
-                nude_predict_image(real_image_to_test) # โหมดนี้ไม่บันทึกลง CSV
-            else:
-                print(f"❌ ไม่พบไฟล์รูปภาพที่ '{real_image_to_test}' งับ")
-                print("โปรดตรวจสอบ Path ของรูปภาพที่คุณป้อนอีกครั้งนะงับ")
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        try:
+            image = Image.open(img_path).convert('RGB')
+            if self.transform:
+                image = self.transform(image)
+            return image, label
+        except Exception as e:
+            logger.warning(f"Failed to load image: {img_path} - {str(e)}. Using fallback black image.")
+            # Fallback image size should match the transform's expected size,
+            # but transform.Resize handles the actual target size. Using a common default here.
+            fallback_image = Image.new('RGB', (256, 256), (0, 0, 0)) 
+            if self.transform:
+                fallback_image = self.transform(fallback_image)
+            return fallback_image, label
 
-        elif choice == '3':
-            print("ขอบคุณที่ใช้งานงับ! เป็ดน้อยไปแล้วนะ บ๊ายบาย! 👋")
-            break
+# ================== TRANSFORMS (ปรับให้รับ image_size) ==================
+def get_transforms(image_size=224):
+    transform_train = transforms.Compose([
+        transforms.RandomResizedCrop((image_size, image_size), scale=(0.8, 1.0)),
+        transforms.RandomRotation(15),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    transform_eval = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    return transform_train, transform_eval
+
+# ================== LOAD DATA (ปรับให้รับ image_size) ==================
+def get_dataloaders(batch_size=32, image_size=224): # เพิ่ม image_size
+    print("Preparing DataLoaders...")
+    transform_train, transform_eval = get_transforms(image_size) # ส่ง image_size เข้าไป
+
+    train_ds = NSFWImageDataset(TRAIN_DIR, transform=transform_train)
+    val_ds = NSFWImageDataset(VAL_DIR, transform=transform_eval)
+    test_ds = NSFWImageDataset(TEST_DIR, transform=transform_eval)
+    
+    if not train_ds:
+        logger.error(f"Train Dataset is empty. Please check '{TRAIN_DIR}' and data splitting process.")
+        exit()
+    if not val_ds:
+        logger.warning(f"Validation Dataset is empty. This might affect early stopping. Please check '{VAL_DIR}'.")
+    if not test_ds:
+        logger.warning(f"Test Dataset is empty. Evaluation on test set will not be possible. Please check '{TEST_DIR}'.")
+    
+    num_workers_to_use = os.cpu_count() // 2 
+    if num_workers_to_use == 0:
+        num_workers_to_use = 1 
+    
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers_to_use)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers_to_use)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers_to_use)
+    print("DataLoaders preparation complete.")
+    return train_loader, val_loader, test_loader
+
+# ================== MODEL (เพิ่มโมเดลใหม่: MobileViT_V2) ==================
+def get_model(model_name, num_classes):
+    print(f"Loading model: {model_name} with appropriate weights.")
+    model = None
+    if model_name == 'InceptionV3':
+        # แก้ไขตรงนี้: aux_logits ต้องเป็น True ตามที่ Error บอก
+        model = models.inception_v3(weights='IMAGENET1K_V1', aux_logits=True) 
+        # InceptionV3 มี classifier layer ชื่อ 'fc'
+        model.fc = torch.nn.Sequential(
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(model.fc.in_features, num_classes)
+        )
+    elif model_name == 'DenseNet121':
+        model = models.densenet121(weights='IMAGENET1K_V1')
+        # DenseNet121 มี classifier layer ชื่อ 'classifier'
+        model.classifier = torch.nn.Sequential(
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(model.classifier.in_features, num_classes)
+        )
+    elif model_name == 'ShuffleNetV2':
+        # ใช้ ShuffleNetV2_x1_0
+        model = models.shufflenet_v2_x1_0(weights='IMAGENET1K_V1')
+        # ShuffleNetV2 มี classifier layer ชื่อ 'fc'
+        model.fc = torch.nn.Sequential(
+            torch.nn.Dropout(0.2), # Dropout value might be different based on common practices
+            torch.nn.Linear(model.fc.in_features, num_classes)
+        )
+    else:
+        raise ValueError(f"Model '{model_name}' is not supported in this file.")
+    
+    if hasattr(torch, 'compile'):
+        try:
+            # model = torch.compile(model) 
+            logger.info(f"Model {model_name} compile functionality available but currently skipped for stability.") 
+        except Exception as e:
+            logger.warning(f"Failed to compile model {model_name} with torch.compile: {e}. Running without compilation.")
+
+    print(f"Model {model_name} loaded successfully.")
+    return model
+
+# ================== CHECKPOINTING ==================
+def save_checkpoint(state, filename="checkpoint.pth.tar", checkpoint_dir=CHECKPOINT_DIR):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    filepath = os.path.join(checkpoint_dir, filename)
+    torch.save(state, filepath)
+    logger.info(f"Checkpoint saved to: {filepath}")
+
+def load_checkpoint(model, optimizer, scheduler, filename="checkpoint.pth.tar", checkpoint_dir=CHECKPOINT_DIR, force_start_from_scratch=False):
+    filepath = os.path.join(checkpoint_dir, filename)
+    
+    start_epoch = 0
+    best_acc = 0
+    patience_counter = 0
+    history = {'train_loss': [], 'val_acc': [], 'val_loss': [], 'epoch_times': []}
+    total_training_time_overall = 0 
+
+    if force_start_from_scratch or not os.path.isfile(filepath):
+        logger.info(f"No checkpoint found at {filepath} or 'Start from Scratch' selected. Starting training from scratch.")
+        return start_epoch, best_acc, patience_counter, history, total_training_time_overall
+    else:
+        logger.info(f"Loading checkpoint from: {filepath}")
+        try:
+            checkpoint = torch.load(filepath, map_location=torch.device('cpu')) 
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+            
+            start_epoch = checkpoint['epoch']
+            best_acc = checkpoint['best_acc']
+            patience_counter = checkpoint['patience_counter']
+            history = checkpoint.get('history', {'train_loss': [], 'val_acc': [], 'val_loss': [], 'epoch_times': []})
+            total_training_time_overall = checkpoint.get('total_training_time_overall', 0) 
+
+            logger.info(f"Checkpoint loaded. Resuming from epoch {start_epoch + 1} with best_acc {best_acc:.4f}. Total training time so far: {total_training_time_overall:.2f} seconds.")
+            return start_epoch, best_acc, patience_counter, history, total_training_time_overall
+        except Exception as e:
+            logger.warning(f"Error loading checkpoint {filepath}: {e}. Starting training from scratch.")
+            return 0, 0, 0, {'train_loss': [], 'val_acc': [], 'val_loss': [], 'epoch_times': []}, 0
+
+# ================== GLOBAL PAUSE/STOP HANDLER ==================
+def handle_signals(model, optimizer, scheduler, epoch, current_batch_idx, best_acc, patience_counter, history, model_name_actual, checkpoint_filename_base, model_checkpoint_dir, device, total_training_time_overall_from_checkpoint):
+    if os.path.exists(PAUSE_SIGNAL_FILE):
+        logger.info(f"PAUSE_SIGNAL detected. Pausing operation for {model_name_actual} at Epoch {epoch+1}, Batch {current_batch_idx+1}.")
+        
+        original_device = next(model.parameters()).device 
+        model.to(torch.device('cpu')) 
+        
+        save_checkpoint({
+            'epoch': epoch, 
+            'batch_idx': current_batch_idx, 
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(), 
+            'scheduler': scheduler.state_dict(),
+            'best_acc': best_acc,
+            'patience_counter': patience_counter,
+            'history': history,
+            'total_training_time_overall': total_training_time_overall_from_checkpoint, 
+        }, filename=checkpoint_filename_base, checkpoint_dir=model_checkpoint_dir)
+        logger.info(f"State saved. Waiting for PAUSE_SIGNAL.txt to be removed...")
+        
+        while os.path.exists(PAUSE_SIGNAL_FILE):
+            time.sleep(5) 
+        
+        logger.info(f"PAUSE_SIGNAL cleared. Resuming operation for {model_name_actual}.")
+        
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(original_device)
+
+    if os.path.exists(STOP_SIGNAL_FILE):
+        logger.info(f"STOP_SIGNAL detected. Terminating training for {model_name_actual}.")
+        os.remove(STOP_SIGNAL_FILE) 
+        original_device = next(model.parameters()).device 
+        model.to(torch.device('cpu')) 
+        save_checkpoint({ 
+            'epoch': epoch, 
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_acc': best_acc,
+            'patience_counter': patience_counter,
+            'history': history,
+            'total_training_time_overall': total_training_time_overall_from_checkpoint, 
+        }, filename=checkpoint_filename_base, checkpoint_dir=model_checkpoint_dir)
+        logger.info(f"Training terminated by STOP_SIGNAL for {model_name_actual}. Final state saved.")
+        return True 
+
+    return False 
+
+# ================== TRAIN ==================
+def train_model(model, train_loader, val_loader, device, model_run_output_dir, model_name_actual, epochs, lr, patience, scheduler_patience, checkpoint_filename_base, force_start_from_scratch=False):
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=scheduler_patience, factor=0.5) 
+    
+    model_base_name = model_name_actual.lower().replace("-", "_") 
+    
+    model_checkpoint_dir = os.path.join(CHECKPOINT_DIR, model_base_name)
+    os.makedirs(model_checkpoint_dir, exist_ok=True)
+
+    start_epoch, best_acc, patience_counter, history, total_training_time_overall_from_checkpoint = load_checkpoint(
+        model, optimizer, scheduler, filename=checkpoint_filename_base, 
+        checkpoint_dir=model_checkpoint_dir, force_start_from_scratch=force_start_from_scratch
+    )
+    
+    model.to(device)
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
+    
+    final_best_epoch_overall = 0 
+    if history['val_acc']:
+        if best_acc in history['val_acc']:
+            initial_best_epoch_idx = np.where(np.array(history['val_acc']) == best_acc)[0][-1]
+            final_best_epoch_overall = initial_best_epoch_idx + 1 
         else:
-            print("⚠️ ตัวเลือกไม่ถูกต้องงับ! กรุณาป้อน 1, 2, หรือ 3 นะงับ")
+            final_best_epoch_overall = start_epoch 
 
-# --- เริ่มการทำงานเมื่อรันสคริปต์ ---
-if __name__ == "__main__":
-    main_menu()
+    best_model_saved_in_current_run = False
+    start_time_current_run = time.time() 
+
+    for epoch in range(start_epoch, epochs): 
+        epoch_start_time = time.time() 
+
+        if handle_signals(model, optimizer, scheduler, epoch, 0, best_acc, patience_counter, history, model_name_actual, checkpoint_filename_base, model_checkpoint_dir, device, total_training_time_overall_from_checkpoint):
+            train_time_taken_current_run = time.time() - start_time_current_run
+            total_training_time_overall = total_training_time_overall_from_checkpoint + train_time_taken_current_run
+            
+            model_save_dir = os.path.join(model_run_output_dir, 'models')
+            os.makedirs(model_save_dir, exist_ok=True)
+            best_model_current_filepath = os.path.join(model_save_dir, f"{model_base_name}_best.pth")
+            if not best_model_saved_in_current_run and not os.path.exists(best_model_current_filepath):
+                potential_best_paths = glob.glob(os.path.join(RESULTS_BASE_DIR, '*', model_base_name, 'models', f"{model_base_name}_best.pth"))
+                potential_best_paths.sort(key=os.path.getmtime, reverse=True)
+                if potential_best_paths:
+                    shutil.copy2(potential_best_paths[0], best_model_current_filepath)
+                    logger.info(f"Copied best model from previous run ({potential_best_paths[0]}) to current run folder: {best_model_current_filepath}")
+            
+            return best_acc, history, total_training_time_overall, optimizer, scheduler 
+            
+        model.train()
+        running_loss = 0
+        
+        with tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} (Train)", unit="batch") as pbar:
+            for batch_idx, (images, labels) in enumerate(pbar): 
+                if handle_signals(model, optimizer, scheduler, epoch, batch_idx, best_acc, patience_counter, history, model_name_actual, checkpoint_filename_base, model_checkpoint_dir, device, total_training_time_overall_from_checkpoint):
+                    train_time_taken_current_run = time.time() - start_time_current_run
+                    total_training_time_overall = total_training_time_overall_from_checkpoint + train_time_taken_current_run
+                    
+                    model_save_dir = os.path.join(model_run_output_dir, 'models')
+                    os.makedirs(model_save_dir, exist_ok=True)
+                    best_model_current_filepath = os.path.join(model_save_dir, f"{model_base_name}_best.pth")
+                    if not best_model_saved_in_current_run and not os.path.exists(best_model_current_filepath):
+                        potential_best_paths = glob.glob(os.path.join(RESULTS_BASE_DIR, '*', model_base_name, 'models', f"{model_base_name}_best.pth"))
+                        potential_best_paths.sort(key=os.path.getmtime, reverse=True)
+                        if potential_best_paths:
+                            shutil.copy2(potential_best_paths[0], best_model_current_filepath)
+                            logger.info(f"Copied best model from previous run ({potential_best_paths[0]}) to current run folder: {best_model_current_filepath}")
+                    
+                    return best_acc, history, total_training_time_overall, optimizer, scheduler 
+
+                images, labels = images.to(device), labels.to(device)
+                optimizer.zero_grad()
+                
+                # แก้ไขตรงนี้: InceptionV3 ส่งออก 2 ค่า ถ้า aux_logits=True
+                outputs = model(images)
+                if isinstance(outputs, models.inception.InceptionOutputs): # สำหรับ InceptionV3
+                    loss = criterion(outputs.logits, labels) + 0.4 * criterion(outputs.aux_logits, labels) # ใช้ทั้ง main และ auxiliary loss
+                    outputs = outputs.logits # ใช้ main output สำหรับ prediction
+                else:
+                    loss = criterion(outputs, labels)
+                
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item() * images.size(0)
+                pbar.set_postfix(loss=running_loss/((batch_idx + 1) * images.size(0)), refresh=True)
+            
+        avg_train_loss = running_loss / len(train_loader.dataset)
+        
+        if handle_signals(model, optimizer, scheduler, epoch, 0, best_acc, patience_counter, history, model_name_actual, checkpoint_filename_base, model_checkpoint_dir, device, total_training_time_overall_from_checkpoint):
+            train_time_taken_current_run = time.time() - start_time_current_run
+            total_training_time_overall = total_training_time_overall_from_checkpoint + train_time_taken_current_run
+            
+            model_save_dir = os.path.join(model_run_output_dir, 'models')
+            os.makedirs(model_save_dir, exist_ok=True)
+            best_model_current_filepath = os.path.join(model_save_dir, f"{model_base_name}_best.pth")
+            if not best_model_saved_in_current_run and not os.path.exists(best_model_current_filepath):
+                potential_best_paths = glob.glob(os.path.join(RESULTS_BASE_DIR, '*', model_base_name, 'models', f"{model_base_name}_best.pth"))
+                potential_best_paths.sort(key=os.path.getmtime, reverse=True)
+                if potential_best_paths:
+                    shutil.copy2(potential_best_paths[0], best_model_current_filepath)
+                    logger.info(f"Copied best model from previous run ({potential_best_paths[0]}) to current run folder: {best_model_current_filepath}")
+            
+            return best_acc, history, total_training_time_overall, optimizer, scheduler 
+
+        val_acc, avg_val_loss, _ = evaluate(model, val_loader, device, print_report=False, model_name=model_name_actual, 
+                                            check_pause_stop_signal=True, 
+                                            model_state=(model, optimizer, scheduler, epoch, best_acc, patience_counter, history, model_name_actual, checkpoint_filename_base, model_checkpoint_dir, device, total_training_time_overall_from_checkpoint))
+        
+        if val_acc is None: 
+            train_time_taken_current_run = time.time() - start_time_current_run
+            total_training_time_overall = total_training_time_overall_from_checkpoint + train_time_taken_current_run
+            return best_acc, history, total_training_time_overall, optimizer, scheduler
+            
+        history['train_loss'].append(avg_train_loss)
+        history['val_acc'].append(val_acc)
+        history['val_loss'].append(avg_val_loss) 
+
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
+        history['epoch_times'].append(epoch_duration) 
+        
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_acc:.4f} | Epoch Time: {epoch_duration:.2f}s")
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Current Learning Rate: {current_lr:.7f}") 
+        
+        scheduler.step(val_acc)
+        
+        if val_acc > best_acc:
+            best_acc = val_acc
+            final_best_epoch_overall = epoch + 1 
+            model_save_dir = os.path.join(model_run_output_dir, 'models')
+            os.makedirs(model_save_dir, exist_ok=True)
+            
+            best_model_current_filepath = os.path.join(model_save_dir, f"{model_base_name}_best.pth")
+            
+            if os.path.exists(best_model_current_filepath):
+                old_timestamp = time.strftime("%Y%m%d-%H%M%S")
+                old_model_new_name = os.path.join(model_save_dir, f"{model_base_name}_best_{old_timestamp}.pth")
+                shutil.move(best_model_current_filepath, old_model_new_name)
+                logger.info(f"Renamed previous best model to: {old_model_new_name}")
+            
+            torch.save(model.state_dict(), best_model_current_filepath)
+            best_model_saved_in_current_run = True
+            
+            patience_counter = 0
+            logger.info(f"New best model saved to: {best_model_current_filepath} (Val Acc: {best_acc:.4f}).")
+
+        else:
+            patience_counter += 1
+            
+        save_checkpoint({
+            'epoch': epoch + 1, 
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_acc': best_acc,
+            'patience_counter': patience_counter,
+            'history': history, 
+            'total_training_time_overall': total_training_time_overall_from_checkpoint + (time.time() - start_time_current_run), 
+        }, filename=checkpoint_filename_base, checkpoint_dir=model_checkpoint_dir)
+
+        if patience_counter >= patience:
+            logger.info(f"Early stopping: Training stopped at epoch {epoch+1} as validation accuracy did not improve for {patience} consecutive epochs.")
+            break
+            
+    end_time_current_run = time.time()
+    train_time_taken_current_run = end_time_current_run - start_time_current_run
+    total_training_time_overall = total_training_time_overall_from_checkpoint + train_time_taken_current_run
+    
+    logger.info(f"Training complete. Best Val Acc: {best_acc:.4f} (epoch {final_best_epoch_overall}). Total training time for this model: {total_training_time_overall:.2f} seconds.")
+
+    model_save_dir = os.path.join(model_run_output_dir, 'models')
+    os.makedirs(model_save_dir, exist_ok=True)
+    best_model_current_filepath = os.path.join(model_save_dir, f"{model_base_name}_best.pth")
+    if not best_model_saved_in_current_run and not os.path.exists(best_model_current_filepath):
+        potential_best_paths = glob.glob(os.path.join(RESULTS_BASE_DIR, '*', model_base_name, 'models', f"{model_base_name}_best.pth"))
+        potential_best_paths.sort(key=os.path.getmtime, reverse=True)
+        if potential_best_paths:
+            shutil.copy2(potential_best_paths[0], best_model_current_filepath)
+            logger.info(f"Copied best model from previous run ({potential_best_paths[0]}) to current run folder: {best_model_current_filepath}")
+        else:
+            logger.warning(f"Could not find any previous best model for {model_name_actual} to copy.")
+
+    return best_acc, history, total_training_time_overall, optimizer, scheduler
+
+# ================== EVALUATE ==================
+def evaluate(model, loader, device, print_report=True, output_plot_dir=None, model_name="", check_pause_stop_signal=False, model_state=None):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    total_loss = 0
+    criterion = torch.nn.CrossEntropyLoss()
+
+    eval_bar_format = '{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+    
+    with tqdm(loader, desc="Evaluating...", unit="batch", bar_format=eval_bar_format) as pbar:
+        with torch.no_grad():
+            for batch_idx, (images, labels) in enumerate(pbar):
+                if check_pause_stop_signal and model_state:
+                    model_obj, optimizer_obj, scheduler_obj, epoch_obj, best_acc_obj, patience_counter_obj, history_obj, model_name_actual_obj, checkpoint_filename_base_obj, model_checkpoint_dir_obj, device_obj, total_training_time_overall_from_checkpoint_obj = model_state
+                    
+                    if handle_signals(model_obj, optimizer_obj, scheduler_obj, epoch_obj, batch_idx, best_acc_obj, patience_counter_obj, history_obj, model_name_actual_obj, checkpoint_filename_base_obj, model_checkpoint_dir_obj, device_obj, total_training_time_overall_from_checkpoint_obj):
+                        logger.info(f"Evaluation for {model_name} interrupted by signal.")
+                        return None, None, None 
+
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                
+                # แก้ไขตรงนี้: InceptionV3 ส่งออก 2 ค่า ถ้า aux_logits=True
+                if isinstance(outputs, models.inception.InceptionOutputs):
+                    outputs = outputs.logits # ใช้แค่ main output สำหรับ evaluation
+                
+                loss = criterion(outputs, labels)
+                total_loss += loss.item() * images.size(0)
+
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(labels.cpu().numpy())
+            
+    acc = accuracy_score(all_labels, all_preds)
+    avg_loss = total_loss / len(loader.dataset)
+
+    report = None
+    if print_report:
+        logger.info(f"=== Classification Report ===")
+        report = classification_report(all_labels, all_preds, target_names=LABELS, output_dict=True)
+        logger.info("\n" + classification_report(all_labels, all_preds, target_names=LABELS))
+        logger.info(f"Overall Accuracy: {acc:.4f}")
+        
+        cm = confusion_matrix(all_labels, all_preds)
+        plt.figure(figsize=(8,6))
+        plt.imshow(cm, cmap='Blues')
+        plt.title(f'Confusion Matrix - {model_name}')
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.xticks(np.arange(len(LABELS)), LABELS, rotation=45)
+        plt.yticks(np.arange(len(LABELS)), LABELS)
+        plt.colorbar()
+        plt.tight_layout()
+
+        if output_plot_dir:
+            os.makedirs(output_plot_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            figure_filename = f'confusion_matrix_{model_name.lower().replace("-", "_")}_{timestamp}.png'
+            plt.savefig(os.path.join(output_plot_dir, figure_filename))
+            logger.info(f"Confusion Matrix saved to: {os.path.join(output_plot_dir, figure_filename)}")
+        else:
+            logger.warning("No output_plot_dir provided for Confusion Matrix. Plot will not be saved.")
+        plt.close()
+    return acc, avg_loss, report
+
+# ================== MAIN ==================
+if __name__ == '__main__':
+    os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
+
+    print(f"CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA Device Count: {torch.cuda.device_count()}")
+        print(f"CUDA Device Name: {torch.cuda.get_device_name(0)}")
+    else:
+        print("CUDA is not available. Please check your PyTorch and NVIDIA Driver installation.")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Running on Device: {device}")
+
+    current_run_timestamp = time.strftime("%Y%m%d-%H%M%S")
+    current_run_results_dir = os.path.join(RESULTS_BASE_DIR, current_run_timestamp)
+    os.makedirs(current_run_results_dir, exist_ok=True)
+    logger.info(f"Results for this run will be saved in: {current_run_results_dir}")
+
+    results = [] 
+
+    print("\n----- Training Options -----")
+    print("1. Start new training (delete ALL old results and checkpoints)")
+    print("2. Start new training (archive ALL old results and checkpoints with timestamp)")
+    print("3. Resume training from last checkpoint (per model)")
+    print("4. Exit")
+
+    choice = input("Please choose an option (1/2/3/4): ")
+
+    force_start_from_scratch_flag = False
+    
+    if choice == '1':
+        if os.path.exists(RESULTS_BASE_DIR):
+            shutil.rmtree(RESULTS_BASE_DIR)
+            logger.info(f"Removed existing results directory: {RESULTS_BASE_DIR}")
+        if os.path.exists(CHECKPOINT_DIR):
+            shutil.rmtree(CHECKPOINT_DIR)
+            logger.info(f"Removed existing checkpoint directory: {CHECKPOINT_DIR}")
+        os.makedirs(RESULTS_BASE_DIR, exist_ok=True)
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        force_start_from_scratch_flag = True
+        logger.info("Option 1 selected: Starting new training from scratch, all old files removed.")
+
+    elif choice == '2':
+        timestamp_for_archive = time.strftime("%Y%m%d-%H%M%S")
+        if os.path.exists(BASE_OUTPUT_DIR):
+            new_archived_base_dir = f"{BASE_OUTPUT_DIR}_archived_{timestamp_for_archive}"
+            os.rename(BASE_OUTPUT_DIR, new_archived_base_dir)
+            logger.info(f"Archived existing '{BASE_OUTPUT_DIR}' directory to: {new_archived_base_dir}")
+        
+        os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
+        os.makedirs(RESULTS_BASE_DIR, exist_ok=True) 
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True) 
+        
+        force_start_from_scratch_flag = True
+        logger.info("Option 2 selected: Starting new training from scratch, all old files archived.")
+
+    elif choice == '3':
+        force_start_from_scratch_flag = False
+        logger.info("Option 3 selected: Resuming training from last checkpoint (per model).")
+    elif choice == '4':
+        logger.info("Option 4 selected: Exiting the program. Goodbye!")
+        exit()
+    else:
+        logger.warning("Invalid choice. Defaulting to 'Resume training from last checkpoint'.")
+        force_start_from_scratch_flag = False
+
+    for model_name_to_train in MODEL_NAMES:
+        model_base_name_lower = model_name_to_train.lower().replace("-", "_") 
+        
+        model_run_output_dir = os.path.join(current_run_results_dir, model_base_name_lower)
+        os.makedirs(model_run_output_dir, exist_ok=True)
+        
+        checkpoint_filename = f'{model_base_name_lower}_checkpoint.pth.tar'
+
+        model_checkpoint_dir = os.path.join(CHECKPOINT_DIR, model_base_name_lower)
+        os.makedirs(model_checkpoint_dir, exist_ok=True) 
+
+        model_hparams = get_model_hyperparameters(model_name_to_train)
+        epochs_for_model = model_hparams['epochs']
+        lr_for_model = model_hparams['lr']
+        patience_for_model = model_hparams['patience']
+        scheduler_patience_for_model = model_hparams['scheduler_patience']
+        batch_size_for_model = model_hparams['batch_size']
+        image_size_for_model = model_hparams.get('image_size', 224) # ดึง image_size มาใช้
+
+        logger.info(f"\n{'='*50}")
+        logger.info(f"===== Starting training for model: {model_name_to_train} =====")
+        logger.info(f"Hyperparameters: Epochs={epochs_for_model}, LR={lr_for_model}, Patience={patience_for_model}, Scheduler Patience={scheduler_patience_for_model}, Batch Size={batch_size_for_model}, Image Size={image_size_for_model}")
+        logger.info(f"Results will be saved in: {model_run_output_dir}")
+        logger.info(f"{'='*50}")
+        
+        model = get_model(model_name_to_train, num_classes=len(LABELS))
+        
+        logger.info(f"Initiating training for {model_name_to_train}...")
+        
+        # ส่ง image_size เข้าไปใน get_dataloaders
+        train_loader, val_loader, test_loader = get_dataloaders(batch_size=batch_size_for_model, image_size=image_size_for_model)
+
+        best_val_acc, history, total_training_time_overall, optimizer, scheduler = train_model(
+            model, train_loader, val_loader, device, model_run_output_dir, model_name_to_train,
+            epochs=epochs_for_model, 
+            lr=lr_for_model, 
+            patience=patience_for_model, 
+            scheduler_patience=scheduler_patience_for_model,
+            checkpoint_filename_base=checkpoint_filename,
+            force_start_from_scratch=force_start_from_scratch_flag
+        )
+        
+        training_history_output_dir = os.path.join(model_run_output_dir, 'logs')
+        os.makedirs(training_history_output_dir, exist_ok=True)
+        
+        if history['train_loss'] and history['val_acc'] and history['val_loss'] and history['epoch_times']:
+            history_df = pd.DataFrame({
+                'Epoch': range(1, len(history['train_loss']) + 1), 
+                'Train Loss': history['train_loss'],
+                'Val Accuracy': history['val_acc'],
+                'Val Loss': history['val_loss'], 
+                'Epoch Duration (seconds)': history['epoch_times'] 
+            })
+            model_timestamp_for_files = time.strftime("%Y%m%d-%H%M%S")
+            history_csv_filename = os.path.join(training_history_output_dir, f'{model_base_name_lower}_training_history_{model_timestamp_for_files}.csv')
+            history_df.to_csv(history_csv_filename, index=False)
+            logger.info(f"Training history for {model_name_to_train} saved to: {history_csv_filename}")
+        else:
+            logger.warning(f"No complete training history data available for {model_name_to_train} to save.")
+        
+        logger.info(f"\n--- Evaluation of {model_name_to_train} on Test Set ---")
+        
+        model_models_dir = os.path.join(model_run_output_dir, 'models')
+        best_model_filepath_for_eval = os.path.join(model_models_dir, f"{model_base_name_lower}_best.pth")
+        
+        test_acc = 0
+        test_loss = 0
+        test_report = None
+
+        if os.path.exists(best_model_filepath_for_eval):
+            logger.info(f"Loading best model from current run folder: {best_model_filepath_for_eval}")
+            model.load_state_dict(torch.load(best_model_filepath_for_eval, map_location=device))
+            model.to(device) 
+            
+            confusion_matrix_output_dir = os.path.join(model_run_output_dir, 'plots')
+            current_epoch_for_state = len(history['train_loss']) if history['train_loss'] else 0
+            
+            test_acc, test_loss, test_report = evaluate(model, test_loader, device, print_report=True, 
+                                                         output_plot_dir=confusion_matrix_output_dir, 
+                                                         model_name=model_name_to_train,
+                                                         check_pause_stop_signal=True,
+                                                         model_state=(model, optimizer, scheduler, current_epoch_for_state, best_val_acc, patience_for_model, history, model_name_to_train, checkpoint_filename, model_checkpoint_dir, device, total_training_time_overall))
+        else:
+            logger.warning(f"No best model .pth file found in current run folder: {best_model_filepath_for_eval}.")
+            potential_best_paths = glob.glob(os.path.join(RESULTS_BASE_DIR, '*', model_base_name_lower, 'models', f"{model_base_name_lower}_best.pth"))
+            potential_best_paths.sort(key=os.path.getmtime, reverse=True)
+            
+            if potential_best_paths:
+                best_model_from_previous_run = potential_best_paths[0]
+                logger.info(f"Attempting to load best model from previous run: {best_model_from_previous_run}")
+                try:
+                    model.load_state_dict(torch.load(best_model_from_previous_run, map_location=device))
+                    model.to(device)
+                    shutil.copy2(best_model_from_previous_run, best_model_filepath_for_eval)
+                    logger.info(f"Copied {os.path.basename(best_model_from_previous_run)} to current run folder for evaluation: {best_model_filepath_for_eval}")
+                    
+                    confusion_matrix_output_dir = os.path.join(model_run_output_dir, 'plots')
+                    current_epoch_for_state = len(history['train_loss']) if history['train_loss'] else 0
+                    
+                    test_acc, test_loss, test_report = evaluate(model, test_loader, device, print_report=True, 
+                                                                 output_plot_dir=confusion_matrix_output_dir, 
+                                                                 model_name=model_name_to_train,
+                                                                 check_pause_stop_signal=True,
+                                                                 model_state=(model, optimizer, scheduler, current_epoch_for_state, best_val_acc, patience_for_model, history, model_name_to_train, checkpoint_filename, model_checkpoint_dir, device, total_training_time_overall))
+                except Exception as e:
+                    logger.error(f"Error loading best model from {best_model_from_previous_run}: {e}. Cannot perform test evaluation.")
+            else:
+                logger.error(f"No best model .pth file found at {best_model_filepath_for_eval} or in any previous run. Cannot perform test evaluation.")
+        
+        if test_report:
+            model_test_results_data = {
+                'Model': [model_name_to_train],
+                'Test Accuracy': [test_acc],
+                'Test Loss': [test_loss],
+                'Total Training Time (seconds)': [total_training_time_overall], 
+                'Best Validation Accuracy': [best_val_acc],
+                'Test Precision (Weighted Avg)': [test_report['weighted avg']['precision']],
+                'Test Recall (Weighted Avg)': [test_report['weighted avg']['recall']],
+                'Test F1-Score (Weighted Avg)': [test_report['weighted avg']['f1-score']]
+            }
+
+            for label_name in LABELS:
+                if label_name in test_report:
+                    model_test_results_data[f'Test Precision ({label_name})'] = [test_report[label_name]['precision']]
+                    model_test_results_data[f'Test Recall ({label_name})'] = [test_report[label_name]['recall']]
+                    model_test_results_data[f'Test F1-Score ({label_name})'] = [test_report[label_name]['f1-score']]
+            
+            model_test_results_df = pd.DataFrame(model_test_results_data)
+            
+            model_test_csv_filename = os.path.join(model_run_output_dir, f'test_evaluation_results_{model_base_name_lower}_{current_run_timestamp}.csv')
+            model_test_results_df.to_csv(model_test_csv_filename, index=False)
+            logger.info(f"Test evaluation results for {model_name_to_train} saved to: {model_test_csv_filename}")
+        else:
+            logger.warning(f"No test report generated for {model_name_to_train}. Skipping saving test evaluation CSV for this model.")
+
+        model_summary_results = {
+            'Model': model_name_to_train,
+            'Best Validation Accuracy': best_val_acc,
+            'Test Accuracy': test_acc,
+            'Total Training Time (seconds)': total_training_time_overall, 
+        }
+        if test_report:
+            model_summary_results['Test Loss'] = test_loss
+            model_summary_results['Test Precision (Weighted Avg)'] = test_report['weighted avg']['precision']
+            model_summary_results['Test Recall (Weighted Avg)'] = test_report['weighted avg']['recall']
+            model_summary_results['Test F1-Score (Weighted Avg)'] = test_report['weighted avg']['f1-score']
+        results.append(model_summary_results)
+
+
+    results_df = pd.DataFrame(results)
+    csv_filename = os.path.join(current_run_results_dir, f'model_comparison_results_{current_run_timestamp}.csv')
+    results_df.to_csv(csv_filename, index=False)
+    logger.info(f"\n--- All model comparisons completed! ---")
+    logger.info(f"Summary results saved to: {csv_filename}")
+
+    logger.info("\nSummary of Model Comparisons:")
+    logger.info(results_df.T.to_string())
