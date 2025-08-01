@@ -935,37 +935,38 @@ app.post("/api/google-signin", async (req, res) => {
 
 // POST /api/interactions - บันทึกการโต้ตอบใหม่
 app.post("/api/interactions", verifyToken, async (req, res) => {
-  const { post_id, action_type, content } = req.body;
-  const user_id = req.userId; // ดึง userId จาก Token
-
-  // ตรวจสอบข้อมูลที่ส่งมาว่าไม่ว่างเปล่า
-  const postIdValue = post_id ? post_id : null;
-
-  if (!user_id || !action_type) {
-    return res
-      .status(400)
-      .json({ error: "Missing required fields: user_id or action_type" });
-  }
-
-  const insertSql = `
+    const { post_id, action_type, content } = req.body;
+    const user_id = req.userId; // ดึง userId จาก Token
+  
+    // ตรวจสอบข้อมูลที่ส่งมาว่าไม่ว่างเปล่า
+    const postIdValue = post_id ? post_id : null;
+  
+    if (!user_id || !action_type) {
+      return res
+        .status(400)
+        .json({ error: "Missing required fields: user_id or action_type" });
+    }
+  
+    // ส่วนนี้ทำงานได้อยู่แล้ว
+    const insertSql = `
     INSERT INTO user_interactions (user_id, post_id, action_type, content)
     VALUES (?, ?, ?, ?);
   `;
-  const values = [user_id, postIdValue, action_type, content || null];
-
-  pool.query(insertSql, values, (error, results) => {
-    if (error) {
-      console.error("Database error:", error);
-      return res.status(500).json({ error: "Error saving interaction" });
-    }
-    res
-      .status(201)
-      .json({
-        message: "Interaction saved successfully",
-        interaction_id: results.insertId,
-      });
+    const values = [user_id, postIdValue, action_type, content || null];
+  
+    pool.query(insertSql, values, (error, results) => {
+      if (error) {
+        console.error("Database error:", error);
+        return res.status(500).json({ error: "Error saving interaction" });
+      }
+      res
+        .status(201)
+        .json({
+          message: "Interaction saved successfully",
+          interaction_id: results.insertId,
+        });
+    });
   });
-});
 
 
 // GET /api/interactions - ดึงข้อมูลการโต้ตอบทั้งหมด
@@ -1138,6 +1139,9 @@ app.get("/api/checkLikeStatus/:postId/:userId", verifyToken, (req, res) => {
     res.json({ isLiked });
   });
 });
+
+
+//########################################################   Post API  #######################################################
 
 
 // View All Posts with Token Verification
