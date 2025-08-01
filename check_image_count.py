@@ -18,23 +18,23 @@ def count_images_in_folder(folder_path):
     
     return count
 
-def check_picdata_folders():
-    """เช็คจำนวนภาพในแต่ละ folder ใน PicData"""
-    picdata_path = "PicData"
+def check_data2_folders():
+    """เช็คจำนวนภาพในแต่ละ folder ใน data2"""
+    data2_path = "data2"
     
-    if not os.path.exists(picdata_path):
-        print("❌ ไม่พบโฟลเดอร์ PicData")
+    if not os.path.exists(data2_path):
+        print("❌ ไม่พบโฟลเดอร์ data2")
         return
     
     print("=" * 50)
-    print("📊 รายงานจำนวนภาพใน PicData")
+    print("📊 รายงานจำนวนภาพใน data2")
     print("=" * 50)
     
     total_images = 0
     categories = ["anime", "hentai", "normal", "porn", "sexy"]
     
     for category in categories:
-        category_path = os.path.join(picdata_path, category)
+        category_path = os.path.join(data2_path, category)
         count = count_images_in_folder(category_path)
         total_images += count
         
@@ -48,7 +48,7 @@ def check_picdata_folders():
     # แสดงรายละเอียดเพิ่มเติม
     print("\n📋 รายละเอียดเพิ่มเติม:")
     for category in categories:
-        category_path = os.path.join(picdata_path, category)
+        category_path = os.path.join(data2_path, category)
         if os.path.exists(category_path):
             count = count_images_in_folder(category_path)
             if count > 0:
@@ -59,4 +59,4 @@ def check_picdata_folders():
             print(f"  • {category}: ไม่มีโฟลเดอร์")
 
 if __name__ == "__main__":
-    check_picdata_folders() 
+    check_data2_folders() 

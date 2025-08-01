@@ -8,20 +8,20 @@ from playwright.async_api import async_playwright
 import time
 
 # ================== CONFIG =====================
-DATA_FOLDER = "data"                # โฟลเดอร์หลักเก็บรูป
+DATA_FOLDER = "data2"                # โฟลเดอร์หลักเก็บรูป
 TIMEOUT_DURATION = 7                    # timeout ต่อ request (วินาที)
 CLEAR_FOLDER_BEFORE_RUN = True          # True = ลบไฟล์ภาพเก่าทั้งหมดก่อนรัน, False = โหลดต่อจากเดิม
 HEADLESS_BROWSER = True                # False = เปิด browser ให้เห็น, True = ซ่อน browser
 CATEGORY_SEARCHES = {
     "anime": ["anime", "anime girl", "anime boy", "anime love", "anime kiss", "cartoon charater", "anime AI", "anime cute", "anime beautiful"],
     "hentai": ["hentai", "hentai girl", "hentai boy", "hentai nude", "cartoon porn", "hentai fuck", "hentai cute", "hentai beautiful"],
-    "normal": ["boy", "girl", "women", "man", "man kiss women" , "beautiful girl", "handsome man", "cute girl", "beautiful women"],
+    "normal": ["boy", "girl", "women", "man", "cat" , "nature", "athlete", "footballer", "dog", "animal"],
     "porn": ["porn xxx", "nude porn", "pussy xxx", "cock xxx", "gay porn", "sex porn", "hardcore porn", "adult porn", "lesbian porn"],
     "sexy": ["bikini girl", "sexy girl", "bikini women", "sexy", "sexy man", "cartoon sexy", "underwear sexy", "hot girl", "lingeries"]
 }
-MAX_IMAGES_PER_CATEGORY = 1000          # จำนวนรูปต่อหมวดหมู่
+MAX_IMAGES_PER_CATEGORY = 3000          # จำนวนรูปต่อหมวดหมู่
 MAX_RELATED_DEPTH = 3                   # เพิ่มความลึกของ related search
-BATCH_SIZE = 15                         # โหลดรูปพร้อมกันกี่รูป (เพิ่มความเร็ว)
+BATCH_SIZE = 30                         # โหลดรูปพร้อมกันกี่รูป (เพิ่มความเร็ว)
 # ===============================================
 
 def calculate_image_hash(image_data: bytes) -> str:

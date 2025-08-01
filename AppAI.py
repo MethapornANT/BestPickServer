@@ -78,7 +78,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # โหลดโมเดลและ processor สำหรับ EfficientNetB0
 # กำหนดพาธของโมเดลให้ถูกต้องตามที่คุณให้มา
-MODEL_PATH = 'NSFW_Model/results/20250730-202827/efficientnetb0/models/efficientnetb0_best.pth'
+MODEL_PATH = 'NSFW_Model/results/20250801-100650/efficientnetb0/models/efficientnetb0_best.pth'
 
 # กำหนดโครงสร้าง EfficientNetB0 ที่ใช้ตอนเซฟโมเดล
 # สมมติว่าคุณเปลี่ยน classifier layer ให้มี output 5 คลาส

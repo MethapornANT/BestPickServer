@@ -7,16 +7,16 @@ import logging
 import numpy as np
 
 # ================== CONFIG ==================
-DATA_DIR = './data' # โฟลเดอร์ที่เก็บรูปทั้งหมด 5,000 รูป
-TRAIN_DIR = './nsfw_data2/train'
-VAL_DIR = './nsfw_data2/val'
-TEST_DIR = './nsfw_data2/test'
+DATA_DIR = './data2' 
+TRAIN_DIR = './nsfw_data3/train'
+VAL_DIR = './nsfw_data3/val'
+TEST_DIR = './nsfw_data3/test'
 
 LABELS = ['normal', 'hentai', 'porn', 'sexy', 'anime'] # ตรวจสอบให้แน่ใจว่าตรงกับชื่อโฟลเดอร์ใน DATA_DIR
 
-TRAIN_SPLIT = 0.7
-VAL_SPLIT = 0.15
-TEST_SPLIT = 0.15
+TRAIN_SPLIT = 0.8
+VAL_SPLIT = 0.1
+TEST_SPLIT = 0.1
 
 # ================== LOGGING SETUP ==================
 logging.basicConfig(level=logging.INFO, format='%(message)s')

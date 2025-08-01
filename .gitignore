@@ -26,9 +26,13 @@ pids
 # Ignore everything in the ALLPIC folder
 ALLPIC/
 data/
+data2/
 TestPIC/
 nsfw_data/
 nsfw_data2/
+nsfw_data3/
+nsfw_data_70_15_15/
+nsfw_data_80_10_10/
 
 # Ignore the ALLPIC.zip file
 ALLPIC.zip
