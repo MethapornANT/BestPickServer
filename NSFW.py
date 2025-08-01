@@ -15,9 +15,9 @@ import logging
 import warnings
 
 # ================== CONFIG ==================
-TRAIN_DIR = './nsfw_data2/train'
-VAL_DIR = './nsfw_data2/val'
-TEST_DIR = './nsfw_data2/test'
+TRAIN_DIR = './nsfw_data3/train'
+VAL_DIR = './nsfw_data3/val'
+TEST_DIR = './nsfw_data3/test'
 
 LABELS = ['normal', 'hentai', 'porn', 'sexy', 'anime']
 label2idx = {label: idx for idx, label in enumerate(LABELS)}
@@ -53,8 +53,8 @@ def get_model_hyperparameters(model_name):
     common_hparams = {
         'epochs': 100,
         'lr': 0.0001,
-        'patience': 7,
-        'scheduler_patience': 3,
+        'patience': 4,
+        'scheduler_patience': 2,
         'batch_size': 128
     }
 
