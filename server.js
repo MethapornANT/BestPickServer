@@ -4094,10 +4094,13 @@ app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req,
 });
 
 
+app.use('/api/Slip', express.static(path.join(__dirname, 'Slip')));
+
+
 // APi สำหรับแอดมินดูข้อมูลออเดอร์ทั้งหมด (Admin only)
 app.get("/api/admin/orders", authenticateToken, authorizeAdmin, (req, res) => {
   const sql = `
-      SELECT o.*, a.title, a.content, a.link, a.image, a.status AS ad_status
+      SELECT o.*, o.slip_image, a.title, a.content, a.link, a.image, a.status AS ad_status
       FROM orders o
       LEFT JOIN ads a ON o.id = a.order_id
       ORDER BY o.created_at DESC
