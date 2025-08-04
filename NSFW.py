@@ -53,7 +53,7 @@ def get_model_hyperparameters(model_name):
     common_hparams = {
         'epochs': 100,
         'lr': 0.0001,
-        'patience': 4,
+        'patience': 7,
         'scheduler_patience': 2,
         'batch_size': 128
     }
