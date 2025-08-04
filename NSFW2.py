@@ -55,9 +55,9 @@ def get_model_hyperparameters(model_name):
     common_hparams = {
         'epochs': 100,
         'lr': 0.0001,
-        'patience': 4, # ปรับตาม Output ของนาย
-        'scheduler_patience': 2, # ปรับตาม Output ของนาย
-        'batch_size': 128, # Default image size
+        'patience': 7,
+        'scheduler_patience': 2,
+        'batch_size': 128,
         'image_size': 224
     }
 
