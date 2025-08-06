@@ -8,7 +8,7 @@ from playwright.async_api import async_playwright
 import time
 
 # ================== CONFIG =====================
-DATA_FOLDER = "data2"                # โฟลเดอร์หลักเก็บรูป
+DATA_FOLDER = "data"                # โฟลเดอร์หลักเก็บรูป
 TIMEOUT_DURATION = 7                    # timeout ต่อ request (วินาที)
 CLEAR_FOLDER_BEFORE_RUN = True          # True = ลบไฟล์ภาพเก่าทั้งหมดก่อนรัน, False = โหลดต่อจากเดิม
 HEADLESS_BROWSER = True                # False = เปิด browser ให้เห็น, True = ซ่อน browser
