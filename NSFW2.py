@@ -15,9 +15,9 @@ import logging
 import warnings
 
 # ================== CONFIG ==================
-TRAIN_DIR = './nsfw_data3/train'
-VAL_DIR = './nsfw_data3/val'
-TEST_DIR = './nsfw_data3/test'
+TRAIN_DIR = './nsfw_data/train'
+VAL_DIR = './nsfw_data/val'
+TEST_DIR = './nsfw_data/test'
 
 LABELS = ['normal', 'hentai', 'porn', 'sexy', 'anime']
 label2idx = {label: idx for idx, label in enumerate(LABELS)}
