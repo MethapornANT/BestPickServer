@@ -5314,6 +5314,101 @@ app.patch('/api/ads/:adId/user-delete', async (req, res) => {
 //########################################################   Ads API  ########################################################
 
 
+// GET /api/my/ads  (User-only)
+app.get('/api/my/ads', authenticateToken, async (req, res) => {
+  const userId = req.user.id; // มาจาก token
+
+  const {
+    status,              // 'pending' | 'approved' | 'paid' | 'active' | 'rejected' | 'expired' | 'userdelete' | 'all'
+    includeDeleted,      // 'true' เพื่อให้รวม userdelete
+    from,                // 'YYYY-MM-DD' หรือ datetime
+    to,                  // 'YYYY-MM-DD' หรือ datetime
+    sort = 'created_at', // 'created_at' | 'show_at' | 'expiration_date'
+    order = 'desc',      // 'asc' | 'desc'
+    page = 1,
+    limit = 20
+  } = req.query;
+
+  // ป้องกัน SQL injection ด้วย whitelist
+  const sortMap = { created_at: 'a.created_at', show_at: 'a.show_at', expiration_date: 'a.expiration_date' };
+  const sortCol = sortMap[sort] || 'a.created_at';
+  const dir = (order || '').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+  const offset = (pageNum - 1) * pageSize;
+
+  const where = ['a.user_id = ?'];
+  const params = [userId];
+
+  // ดีฟอลต์ไม่เอา userdelete
+  const wantIncludeDeleted = String(includeDeleted).toLowerCase() === 'true';
+  if (!wantIncludeDeleted) where.push(`a.status <> 'userdelete'`);
+
+  // สถานะ: ถ้าระบุและไม่ใช่ 'all' ให้กรอง
+  if (status && status !== 'all') {
+    where.push('a.status = ?');
+    params.push(status);
+  }
+
+  if (from) { where.push('a.created_at >= ?'); params.push(from); }
+  if (to)   { where.push('a.created_at <= ?'); params.push(to); }
+
+  const baseFromJoin = `
+    FROM ads a
+    LEFT JOIN orders o ON o.id = a.order_id
+    WHERE ${where.join(' AND ')}
+  `;
+
+  const listSql = `
+    SELECT
+      a.id, a.user_id, a.order_id, a.title, a.content, a.link, a.image,
+      a.status, a.show_at, a.created_at, a.updated_at, a.expiration_date,
+      a.display_count,
+      o.amount, o.status AS order_status, o.show_at AS order_show_at
+    ${baseFromJoin}
+    ORDER BY
+      FIELD(a.status,'pending','approved','paid','active','rejected','expired','userdelete'),
+      ${sortCol} ${dir}
+    LIMIT ? OFFSET ?;
+  `;
+
+  const countSql = `SELECT COUNT(*) AS total ${baseFromJoin};`;
+
+  const getConn = () => new Promise((resolve, reject) => {
+    pool.getConnection((e, c) => e ? reject(e) : resolve(c));
+  });
+  const q = (c, sql, p=[]) => new Promise((resolve, reject) => {
+    c.query(sql, p, (e, r) => e ? reject(e) : resolve(r));
+  });
+
+  let conn;
+  try {
+    conn = await getConn();
+    const [rows, countRows] = await Promise.all([
+      q(conn, listSql, [...params, pageSize, offset]),
+      q(conn, countSql, params)
+    ]);
+    const total = countRows[0]?.total || 0;
+
+    res.json({
+      data: rows,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: pageSize,
+        pages: Math.ceil(total / pageSize)
+      }
+    });
+  } catch (err) {
+    console.error('[GET /api/my/ads] Error:', err);
+    res.status(500).json({ error: 'Error fetching user ads' });
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+
+
 // GET /api/ad-packages
 app.get("/api/ad-packages", (req, res) => {
     console.log('[INFO] Received GET /api/ad-packages request');
