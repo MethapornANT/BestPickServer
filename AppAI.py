@@ -107,7 +107,7 @@ try:
     # **** ส่วนที่แก้ไข: โหลด state_dict เข้าสู่ self.efficientnet โดยตรง ****
     # ไฟล์ .pth ของคุณน่าจะบันทึก state_dict ของ `models.efficientnet_b0` โดยตรง
     # ไม่ใช่ state_dict ของ `CustomEfficientNetB0` ทั้งก้อน
-    state_dict_from_file = torch.load(MODEL_PATH)
+    state_dict_from_file = torch.load(MODEL_PATH, map_location=torch.device('cpu'))
     model.efficientnet.load_state_dict(state_dict_from_file) # โหลดเข้าสู่ EfficientNet ภายใน CustomEfficientNetB0
     print("โหลด state_dict เข้าสู่ model.efficientnet โดยตรงสำเร็จงับ!")
 

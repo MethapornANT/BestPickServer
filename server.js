@@ -4994,65 +4994,77 @@ app.post("/api/check-block-status", (req, res) => {
 
 
 // POST /api/orders
-app.post("/api/orders", (req, res) => {
-  console.log('[INFO] Received POST /api/orders request');
-  const { user_id, package_id, title, content, link, image, prompay_number, ad_start_date } = req.body; // Add prompay_number
-  if (!user_id || !package_id || !title || !content || !prompay_number) { // Make prompay_number mandatory
-    console.warn('[WARN] Missing required fields for order creation.');
-    return res.status(400).json({ error: 'Missing required fields (user_id, package_id, title, content, prompay_number)' });
-  }
-  // ตรวจสอบ ad_start_date
-  if (!ad_start_date) {
-    return res.status(400).json({ error: 'กรุณาเลือกวันที่ต้องการลงโฆษณา' });
-  }
-  const today = new Date();
-  const minDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 2);
-  const userDate = new Date(ad_start_date);
+app.post("/api/orders", upload.single('image'), (req, res) => {
+    console.log('[INFO] Received POST /api/orders request');
+    
+    // ข้อมูลที่เป็นข้อความจะถูก multer แยกมาไว้ใน req.body
+    const { user_id, package_id, title, content, link, prompay_number, ad_start_date } = req.body;
+    
+    // ข้อมูลไฟล์รูปภาพจะถูก multer แยกมาไว้ใน req.file
+    const imageFile = req.file;
 
-  if (userDate < minDate) {
-    return res.status(400).json({ error: 'วันที่เริ่มโฆษณาต้องถัดจากวันนี้อย่างน้อย 2 วัน' });
-  }
-  // ดึงข้อมูล package
-  pool.query('SELECT * FROM ad_packages WHERE package_id = ?', [package_id], (err, pkg) => {
-    if (err) {
-      console.error('[ERROR] Database error fetching package:', err);
-      return res.status(500).json({ error: 'Database error' });
+    // Log ข้อมูลเพื่อตรวจสอบความถูกต้อง
+    console.log('Received Body:', req.body);
+    console.log('Received File:', req.file);
+
+    // --- การตรวจสอบข้อมูล (Validation) ---
+    if (!user_id || !package_id || !title || !content || !prompay_number) {
+        if (imageFile) fs.unlinkSync(imageFile.path); // ถ้ามีไฟล์อัปโหลดมาแล้วแต่ข้อมูลไม่ครบ ให้ลบทิ้ง
+        return res.status(400).json({ error: 'Missing required text fields' });
     }
-    if (pkg.length === 0) {
-      console.warn(`[WARN] Invalid package_id: ${package_id}`);
-      return res.status(400).json({ error: 'Invalid package' });
+    if (!ad_start_date) {
+        if (imageFile) fs.unlinkSync(imageFile.path);
+        return res.status(400).json({ error: 'กรุณาเลือกวันที่ต้องการลงโฆษณา' });
     }
-    const amount = pkg[0].price;
-    const duration = pkg[0].duration_days;
-    // สร้าง order
-    // เพิ่ม prompay_number ใน SQL query และ VALUES
-    const sql = `
-          INSERT INTO orders (user_id, amount, status, created_at, updated_at, prompay_number)
-          VALUES (?, ?, 'pending', NOW(), NOW(), ?)
-      `;
-    pool.query(sql, [user_id, amount, prompay_number], (err, result) => { // เพิ่ม prompay_number ที่นี่
-      if (err) {
-        console.error('[ERROR] Database error creating order:', err);
-        return res.status(500).json({ error: 'Database error' });
-      }
-      const order_id = result.insertId;
-      console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);
-      // สร้างโฆษณาแบบ pending (รอจ่ายเงิน)
-      const adSql = `
-            INSERT INTO ads (user_id, order_id, title, content, link, image, status, show_at, created_at, expiration_date)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW(), DATE_ADD(?, INTERVAL ? DAY))
-        `;
-      pool.query(adSql, [user_id, order_id, title, content, link || '', image || '', ad_start_date, ad_start_date, duration], (err2) => {
-        if (err2) {
-          console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
-          return res.status(500).json({ error: 'Database error (ads)' });
+    if (!imageFile) {
+        return res.status(400).json({ error: 'Missing required image file' });
+    }
+    
+    const imagePath = `/uploads/${imageFile.filename}`; // สร้าง Path ที่จะเก็บลงฐานข้อมูล
+
+    // --- ส่วนตรรกะการทำงานกับฐานข้อมูล ---
+    pool.query('SELECT * FROM ad_packages WHERE package_id = ?', [package_id], (err, pkg) => {
+        if (err || pkg.length === 0) {
+            fs.unlinkSync(imageFile.path); // ลบไฟล์ถ้ามีปัญหา
+            return res.status(err ? 500 : 400).json({ error: err ? 'Database error' : 'Invalid package' });
         }
-        console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
-        res.status(201).json({ order_id, amount, duration });
-      });
+        
+       const amount = pkg[0].price;
+        const duration = pkg[0].duration_days;
+
+        // [ จุดที่ต้องแก้ไข ]
+        // เพิ่ม package_id เข้าไปในคำสั่ง INSERT
+        const orderSql = `
+          INSERT INTO orders (user_id, amount, status, created_at, updated_at, prompay_number, package_id)
+          VALUES (?, ?, 'pending', NOW(), NOW(), ?, ?)
+        `;
+        // เพิ่ม package_id เป็นค่าสุดท้ายใน array นี้
+        pool.query(orderSql, [user_id, amount, prompay_number, package_id], (err, result) => {
+            if (err) {
+                fs.unlinkSync(imageFile.path);
+                return res.status(500).json({ error: 'Database error creating order' });
+            }
+            
+            const order_id = result.insertId;
+            console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);;
+
+            const adSql = `
+              INSERT INTO ads (user_id, order_id, title, content, link, image, status, show_at, created_at, expiration_date)
+              VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW(), DATE_ADD(?, INTERVAL ? DAY))
+            `;
+            pool.query(adSql, [user_id, order_id, title, content, link || '', imagePath, ad_start_date, ad_start_date, duration], (err2) => {
+                if (err2) {
+                    // หากการสร้าง ad ล้มเหลว ควรลบ order ที่สร้างไปแล้ว (rollback logic)
+                    console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
+                    return res.status(500).json({ error: 'Database error creating ad' });
+                }
+                console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
+                res.status(201).json({ order_id, amount, duration });
+            });
+        });
     });
-  });
 });
+
 
 
 // GET /api/orders/:orderId - สำหรับ user ดูข้อมูลออเดอร์
@@ -5193,16 +5205,19 @@ app.post("/api/orders/:orderId/upload-slip", upload.single('slip_image'), (req, 
 
 // GET /api/ad-packages
 app.get("/api/ad-packages", (req, res) => {
-  console.log('[INFO] Received GET /api/ad-packages request');
-  const sql = 'SELECT * FROM ad_packages ORDER BY duration_days ASC';
-  pool.query(sql, (err, results) => {
-      if (err) {
-          console.error('[ERROR] Database error fetching ad packages:', err);
-          return res.status(500).json({ error: 'Database error' });
-      }
-      console.log(`[INFO] Fetched ${results.length} ad packages.`);
-      res.json(results);
-  });
+    console.log('[INFO] Received GET /api/ad-packages request');
+    
+    // ✅ แก้ไข SQL จาก SELECT * ให้เป็นแบบนี้
+    const sql = 'SELECT package_id AS id, name, price, duration_days FROM ad_packages ORDER BY duration_days ASC';
+    
+    pool.query(sql, (err, results) => {
+        if (err) {
+            console.error('[ERROR] Database error fetching ad packages:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        console.log(`[INFO] Fetched ${results.length} ad packages.`);
+        res.json(results);
+    });
 });
 
 
