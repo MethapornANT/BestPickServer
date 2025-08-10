@@ -166,7 +166,7 @@ function sendOtpEmail(email, otp, callback) {
         </div>
         <p>This code will expire in 10 minutes.</p>
         <p>If you didnt request this, please ignore this email.</p>
-        <p style="margin-top: 20px;">Thanks, <br> The Team</p>
+        <p style="margin-top: 20px;">Thanks, <br> BestPick Team</p>
         <hr>
         <p style="font-size: 12px; color: #999;">This is an automated email, please do not reply.</p>
       </div>
@@ -3228,68 +3228,101 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 
-// Admin Dashboard: New Users per Day and Total Posts per Day
+// Admin Dashboard: All Data in one API
 app.get("/api/admin/dashboard", authenticateToken, authorizeAdmin, (req, res) => {
-  // Query to get new users count per day and total users
-  const newUsersQuery = `
-      SELECT 
-          DATE(created_at) AS date, 
-          COUNT(*) AS new_users 
-      FROM users 
-      WHERE role = 'user'
-      GROUP BY DATE(created_at)
-      ORDER BY DATE(created_at) DESC;
-  `;
-
-  // Query to get total posts per day and total posts
-  const totalPostsQuery = `
-      SELECT 
-          DATE(updated_at) AS date, 
-          COUNT(*) AS total_posts 
-      FROM posts
-      GROUP BY DATE(updated_at)
-      ORDER BY DATE(updated_at) DESC;
-  `;
-
-  // Execute both queries in parallel
-  pool.query(newUsersQuery, (newUsersError, newUsersResults) => {
-      if (newUsersError) {
-          console.error("Database error fetching new users:", newUsersError);
-          return res.status(500).json({ error: "Error fetching new users data" });
-      }
-
-      pool.query(totalPostsQuery, (totalPostsError, totalPostsResults) => {
-          if (totalPostsError) {
-              console.error("Database error fetching total posts:", totalPostsError);
-              return res.status(500).json({ error: "Error fetching total posts data" });
-          }
-
-          res.json({
-              new_users_per_day: newUsersResults,
-              total_posts_per_day: totalPostsResults,
-          });
-      });
+    const newUsersQuery = "SELECT DATE_FORMAT(created_at, '%Y-%m') AS month_year, COUNT(*) AS new_users FROM users WHERE role = 'user' GROUP BY month_year ORDER BY month_year DESC;";
+    const totalPostsQuery = "SELECT DATE_FORMAT(updated_at, '%Y-%m') AS month_year, COUNT(*) AS total_posts FROM posts GROUP BY month_year ORDER BY month_year DESC;";
+    
+    // แก้ไข: เพิ่ม OtherEngagement ใน query
+    const categoryPopularityQuery = "SELECT CASE WHEN Electronics_Gadgets = 1 THEN 'Electronics & Gadgets' WHEN Furniture = 1 THEN 'Furniture' WHEN Outdoor_Gear = 1 THEN 'Outdoor Gear' WHEN Beauty_Products = 1 THEN 'Beauty Products' WHEN Accessories = 1 THEN 'Accessories' ELSE 'Other' END AS CategoryName, SUM(PostEngagement) AS TotalEngagement, SUM(CASE WHEN Male = 1 THEN PostEngagement ELSE 0 END) AS MaleEngagement, SUM(CASE WHEN Female = 1 THEN PostEngagement ELSE 0 END) AS FemaleEngagement, SUM(CASE WHEN Male = 0 AND Female = 0 THEN PostEngagement ELSE 0 END) AS OtherEngagement FROM contentbasedview GROUP BY CategoryName ORDER BY TotalEngagement DESC;";
+  
+    const ageInterestQuery = "SELECT CASE WHEN Age BETWEEN 18 AND 25 THEN '18-25' WHEN Age BETWEEN 26 AND 35 THEN '26-35' WHEN Age > 35 THEN '36+' ELSE 'Other' END AS AgeGroup, CASE WHEN Electronics_Gadgets = 1 THEN 'Electronics & Gadgets' WHEN Furniture = 1 THEN 'Furniture' WHEN Outdoor_Gear = 1 THEN 'Outdoor Gear' WHEN Beauty_Products = 1 THEN 'Beauty Products' WHEN Accessories = 1 THEN 'Accessories' ELSE 'Other' END AS CategoryName, SUM(PostEngagement) AS TotalEngagement FROM contentbasedview GROUP BY AgeGroup, CategoryName ORDER BY AgeGroup, TotalEngagement DESC;";
+  
+    pool.query(newUsersQuery, (newUsersError, newUsersResults) => {
+        if (newUsersError) {
+            console.error("Database error fetching new users:", newUsersError);
+            return res.status(500).json({ error: "Error fetching new users data" });
+        }
+  
+        pool.query(totalPostsQuery, (totalPostsError, totalPostsResults) => {
+            if (totalPostsError) {
+                console.error("Database error fetching total posts:", totalPostsError);
+                return res.status(500).json({ error: "Error fetching total posts data" });
+            }
+  
+            pool.query(categoryPopularityQuery, (categoryPopularityError, categoryPopularityResults) => {
+                if (categoryPopularityError) {
+                    console.error("Database error fetching category popularity:", categoryPopularityError);
+                    return res.status(500).json({ error: "Error fetching category popularity data" });
+                }
+  
+                pool.query(ageInterestQuery, (ageInterestError, ageInterestResults) => {
+                    if (ageInterestError) {
+                        console.error("Database error fetching age interest data:", ageInterestError);
+                        return res.status(500).json({ error: "Error fetching age interest data" });
+                    }
+                    
+                    res.json({
+                        new_users_per_month: newUsersResults,
+                        total_posts_per_month: totalPostsResults,
+                        category_popularity: categoryPopularityResults,
+                        age_interest: ageInterestResults,
+                    });
+                });
+            });
+        });
+    });
   });
-});
 
 
-// Fetch All Active Ads in Random Order
-app.get("/api/ads/random", (req, res) => {
-  const fetchRandomAdsSql = `
-      SELECT * FROM ads 
+  app.get("/api/ads/random", (req, res) => {
+    const fetchAdSql = `
+      SELECT *
+      FROM ads
       WHERE status = 'active'
-      ORDER BY RAND();
-  `;
-
-  pool.query(fetchRandomAdsSql, (err, results) => {
+      ORDER BY display_count ASC, RAND()
+      LIMIT 1;
+    `;
+  
+    pool.query(fetchAdSql, (err, results) => {
       if (err) {
-          console.error("Database error during fetching random ads:", err);
-          return res.status(500).json({ error: "Error fetching random ads" });
+        console.error("Database error during fetching random ad:", err);
+        return res.status(500).json({ error: "Error fetching random ad" });
       }
-
+  
+      // Return the single ad in an array, or an empty array if not found
       res.json(results);
+    });
   });
-});
+
+
+  app.post("/api/ads/track", (req, res) => {
+    const adId = req.body.id;
+  
+    if (!adId) {
+      return res.status(400).json({ error: "Ad ID is required" });
+    }
+  
+    const updateAdCountSql = `
+      UPDATE ads
+      SET display_count = display_count + 1
+      WHERE id = ?;
+    `;
+  
+    pool.query(updateAdCountSql, [adId], (err, results) => {
+      if (err) {
+        console.error("Database error during ad count update:", err);
+        return res.status(500).json({ error: "Error updating ad count" });
+      }
+      
+      // Check if any row was affected
+      if (results.affectedRows === 0) {
+        return res.status(404).json({ error: "Ad not found or not updated" });
+      }
+  
+      res.json({ message: "Ad count updated successfully" });
+    });
+  });
 
 
 // Serve images from the uploads directory
