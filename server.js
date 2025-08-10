@@ -5028,75 +5028,69 @@ app.post("/api/check-block-status", (req, res) => {
 
 // POST /api/orders
 app.post("/api/orders", upload.single('image'), (req, res) => {
-    console.log('[INFO] Received POST /api/orders request');
-    
-    // ข้อมูลที่เป็นข้อความจะถูก multer แยกมาไว้ใน req.body
-    const { user_id, package_id, title, content, link, prompay_number, ad_start_date } = req.body;
-    
-    // ข้อมูลไฟล์รูปภาพจะถูก multer แยกมาไว้ใน req.file
-    const imageFile = req.file;
+  console.log('[INFO] Received POST /api/orders request');
+  
+  const { user_id, package_id, title, content, link, prompay_number, ad_start_date } = req.body;
+  const imageFile = req.file;
 
-    // Log ข้อมูลเพื่อตรวจสอบความถูกต้อง
-    console.log('Received Body:', req.body);
-    console.log('Received File:', req.file);
+  console.log('Received Body:', req.body);
+  console.log('Received File:', req.file);
 
-    // --- การตรวจสอบข้อมูล (Validation) ---
-    if (!user_id || !package_id || !title || !content || !prompay_number) {
-        if (imageFile) fs.unlinkSync(imageFile.path); // ถ้ามีไฟล์อัปโหลดมาแล้วแต่ข้อมูลไม่ครบ ให้ลบทิ้ง
-        return res.status(400).json({ error: 'Missing required text fields' });
-    }
-    if (!ad_start_date) {
-        if (imageFile) fs.unlinkSync(imageFile.path);
-        return res.status(400).json({ error: 'กรุณาเลือกวันที่ต้องการลงโฆษณา' });
-    }
-    if (!imageFile) {
-        return res.status(400).json({ error: 'Missing required image file' });
-    }
-    
-    const imagePath = `/uploads/${imageFile.filename}`; // สร้าง Path ที่จะเก็บลงฐานข้อมูล
+  // --- Validation ---
+  if (!user_id || !package_id || !title || !content || !prompay_number) {
+      if (imageFile) fs.unlinkSync(imageFile.path);
+      return res.status(400).json({ error: 'Missing required text fields' });
+  }
+  if (!ad_start_date) {
+      if (imageFile) fs.unlinkSync(imageFile.path);
+      return res.status(400).json({ error: 'กรุณาเลือกวันที่ต้องการลงโฆษณา' });
+  }
+  if (!imageFile) {
+      return res.status(400).json({ error: 'Missing required image file' });
+  }
+  
+  const imagePath = `/uploads/${imageFile.filename}`;
 
-    // --- ส่วนตรรกะการทำงานกับฐานข้อมูล ---
-    pool.query('SELECT * FROM ad_packages WHERE package_id = ?', [package_id], (err, pkg) => {
-        if (err || pkg.length === 0) {
-            fs.unlinkSync(imageFile.path); // ลบไฟล์ถ้ามีปัญหา
-            return res.status(err ? 500 : 400).json({ error: err ? 'Database error' : 'Invalid package' });
-        }
-        
-       const amount = pkg[0].price;
-        const duration = pkg[0].duration_days;
+  pool.query('SELECT * FROM ad_packages WHERE package_id = ?', [package_id], (err, pkg) => {
+      if (err || pkg.length === 0) {
+          fs.unlinkSync(imageFile.path);
+          return res.status(err ? 500 : 400).json({ error: err ? 'Database error' : 'Invalid package' });
+      }
+      
+      const amount = pkg[0].price;
+      const duration = pkg[0].duration_days;
 
-        // [ จุดที่ต้องแก้ไข ]
-        // เพิ่ม package_id เข้าไปในคำสั่ง INSERT
-        const orderSql = `
-          INSERT INTO orders (user_id, amount, status, created_at, updated_at, prompay_number, package_id)
-          VALUES (?, ?, 'pending', NOW(), NOW(), ?, ?)
-        `;
-        // เพิ่ม package_id เป็นค่าสุดท้ายใน array นี้
-        pool.query(orderSql, [user_id, amount, prompay_number, package_id], (err, result) => {
-            if (err) {
-                fs.unlinkSync(imageFile.path);
-                return res.status(500).json({ error: 'Database error creating order' });
-            }
-            
-            const order_id = result.insertId;
-            console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);;
+      // แก้ INSERT ให้มี show_at
+      const orderSql = `
+        INSERT INTO orders (user_id, amount, status, created_at, updated_at, prompay_number, package_id, show_at)
+        VALUES (?, ?, 'pending', NOW(), NOW(), ?, ?, ?)
+      `;
+      pool.query(orderSql, [user_id, amount, prompay_number, package_id, ad_start_date], (err, result) => {
+          if (err) {
+              fs.unlinkSync(imageFile.path);
+              return res.status(500).json({ error: 'Database error creating order' });
+          }
+          
+          const order_id = result.insertId;
+          console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);
 
-            const adSql = `
-              INSERT INTO ads (user_id, order_id, title, content, link, image, status, show_at, created_at, expiration_date)
-              VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW(), DATE_ADD(?, INTERVAL ? DAY))
-            `;
-            pool.query(adSql, [user_id, order_id, title, content, link || '', imagePath, ad_start_date, ad_start_date, duration], (err2) => {
-                if (err2) {
-                    // หากการสร้าง ad ล้มเหลว ควรลบ order ที่สร้างไปแล้ว (rollback logic)
-                    console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
-                    return res.status(500).json({ error: 'Database error creating ad' });
-                }
-                console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
-                res.status(201).json({ order_id, amount, duration });
-            });
-        });
-    });
+          const adSql = `
+            INSERT INTO ads (user_id, order_id, title, content, link, image, status, show_at, created_at, expiration_date)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW(), DATE_ADD(?, INTERVAL ? DAY))
+          `;
+          pool.query(adSql, [user_id, order_id, title, content, link || '', imagePath, ad_start_date, ad_start_date, duration], (err2) => {
+              if (err2) {
+                  console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
+                  return res.status(500).json({ error: 'Database error creating ad' });
+              }
+              console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
+              res.status(201).json({ order_id, amount, duration });
+          });
+      });
+  });
 });
+
+
 
 
 
