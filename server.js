@@ -5091,9 +5091,6 @@ app.post("/api/orders", upload.single('image'), (req, res) => {
 });
 
 
-
-
-
 // GET /api/orders/:orderId - สำหรับ user ดูข้อมูลออเดอร์
 app.get("/api/orders/:orderId", (req, res) => {
   const { orderId } = req.params;
@@ -5224,6 +5221,93 @@ app.post("/api/orders/:orderId/upload-slip", upload.single('slip_image'), (req, 
           });
       });
   });
+});
+
+
+// PATCH /api/ads/:adId/user-delete
+app.patch('/api/ads/:adId/user-delete', async (req, res) => {
+  const adId = Number(req.params.adId);
+  if (!Number.isInteger(adId)) {
+    return res.status(400).json({ error: 'Invalid ad id' });
+  }
+
+  const getConn = () => new Promise((resolve, reject) => {
+    pool.getConnection((err, c) => (err ? reject(err) : resolve(c)));
+  });
+  const q = (c, sql, params) => new Promise((resolve, reject) => {
+    c.query(sql, params, (err, r) => (err ? reject(err) : resolve(r)));
+  });
+
+  let conn;
+  try {
+    conn = await getConn();
+    await q(conn, 'START TRANSACTION');
+
+    // 1) อ่านข้อมูล ads + orders
+    const rows = await q(
+      conn,
+      `
+      SELECT a.id AS ad_id, a.status AS ad_status,
+             o.id AS order_id, o.status AS order_status
+      FROM ads a
+      JOIN orders o ON o.id = a.order_id
+      WHERE a.id = ?
+      FOR UPDATE
+      `,
+      [adId]
+    );
+
+    if (rows.length === 0) {
+      await q(conn, 'ROLLBACK');
+      return res.status(404).json({ error: 'Ad not found' });
+    }
+
+    const { ad_status, order_status, order_id } = rows[0];
+    const blocked = new Set(['paid', 'active']);
+    if (blocked.has(ad_status) || blocked.has(order_status)) {
+      await q(conn, 'ROLLBACK');
+      return res.status(409).json({
+        error: 'Cannot mark as deleted: status is paid or active',
+        ad_status,
+        order_status
+      });
+    }
+
+    // 2) อัปเดต ads
+    const updateAds = await q(
+      conn,
+      `UPDATE ads SET status='userdelete', updated_at=NOW() WHERE id=? LIMIT 1`,
+      [adId]
+    );
+    if (updateAds.affectedRows !== 1) {
+      await q(conn, 'ROLLBACK');
+      return res.status(500).json({ error: 'Failed to update ads status' });
+    }
+
+    // 3) อัปเดต orders
+    const updateOrders = await q(
+      conn,
+      `UPDATE orders SET status='userdelete', updated_at=NOW() WHERE id=? LIMIT 1`,
+      [order_id]
+    );
+    if (updateOrders.affectedRows !== 1) {
+      await q(conn, 'ROLLBACK');
+      return res.status(500).json({ error: 'Failed to update orders status' });
+    }
+
+    await q(conn, 'COMMIT');
+    return res.status(200).json({
+      message: 'Ad and order marked as userdelete',
+      ad_id: adId,
+      order_id
+    });
+  } catch (err) {
+    if (conn) try { await q(conn, 'ROLLBACK'); } catch {}
+    console.error(err);
+    return res.status(500).json({ error: 'Server error' });
+  } finally {
+    if (conn) conn.release();
+  }
 });
 
 
