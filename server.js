@@ -5409,6 +5409,38 @@ app.get('/api/my/ads', authenticateToken, async (req, res) => {
 
 
 
+// PUT /api/my/ads/:adId/delete (User-only soft delete)   สำหรับลบโฆษณาในแอป
+app.put('/api/my/ads/:adId/delete', authenticateToken, async (req, res) => {
+    const { adId } = req.params;
+    const userId = req.user.id;
+
+    console.log(`[INFO] User ${userId} is requesting to delete Ad ID: ${adId}`);
+
+    const sql = `
+        UPDATE ads 
+        SET status = 'userdelete' 
+        WHERE id = ? AND user_id = ? AND status <> 'active'
+    `;
+
+    pool.query(sql, [adId, userId], (err, result) => {
+        if (err) {
+            console.error('[ERROR] Database error during soft delete:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        
+        if (result.affectedRows === 0) {
+            // อาจจะหาโฆษณาไม่เจอ, ไม่ใช่เจ้าของ, หรือโฆษณา active อยู่
+            return res.status(404).json({ error: 'Ad not found, you are not the owner, or the ad is already active and cannot be deleted.' });
+        }
+
+        console.log(`[SUCCESS] Ad ID ${adId} was soft-deleted by User ID ${userId}.`);
+        res.status(200).json({ message: 'Ad has been deleted successfully.' });
+    });
+});
+
+
+
+
 // GET /api/ad-packages
 app.get("/api/ad-packages", (req, res) => {
     console.log('[INFO] Received GET /api/ad-packages request');
