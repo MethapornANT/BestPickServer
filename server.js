@@ -3700,43 +3700,64 @@ app.get("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) =>
 });
 
 
-// Update post status by admin (Admin only)
+const uploadRoot = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadRoot)) fs.mkdirSync(uploadRoot, { recursive: true });
+
+
+app.post(
+  '/api/admin/uploads',
+  authenticateToken,
+  authorizeAdmin,
+  upload.array('images', 20), // field name ต้องเป็น 'images'
+  (req, res) => {
+    const files = Array.isArray(req.files) ? req.files : [];
+    const paths = files.map(f => `/uploads/${f.filename}`); // คืน path แบบที่ frontend ใช้ต่อได้
+    res.json({ paths });
+  }
+);
+
+
 app.put("/api/admin/posts/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
-  const { Title, content, status, ProductName } = req.body;
+  const { Title, content, status, ProductName, photo_url } = req.body;
 
-  // Build dynamic update query
   const updateFields = [];
   const updateValues = [];
 
   if (Title !== undefined) { updateFields.push('Title = ?'); updateValues.push(Title); }
   if (content !== undefined) { updateFields.push('content = ?'); updateValues.push(content); }
-  if (status !== undefined) { updateFields.push('status = ?'); updateValues.push(status); }
+  if (status !== undefined) {
+    const allowed = new Set(['active','deactive']);
+    if (!allowed.has(String(status).toLowerCase())) {
+      return res.status(400).json({ error: "Invalid status. Use 'active' or 'deactive'." });
+    }
+    updateFields.push('status = ?'); updateValues.push(status);
+  }
   if (ProductName !== undefined) { updateFields.push('ProductName = ?'); updateValues.push(ProductName); }
 
-  updateFields.push('updated_at = NOW()'); // Always update updated_at
-
-  if (updateFields.length === 1 && updateFields[0] === 'updated_at = NOW()') {
-      return res.status(400).json({ error: 'No meaningful fields to update besides updated_at' });
+  if (photo_url !== undefined) {
+    const arr = Array.isArray(photo_url) ? photo_url
+              : (typeof photo_url === 'string' && photo_url ? [photo_url] : []);
+    updateFields.push('photo_url = CAST(? AS JSON)'); // ถ้า column เป็น JSON
+    updateValues.push(JSON.stringify(arr));
   }
 
-  const updatePostSql = `
-      UPDATE posts 
-      SET ${updateFields.join(', ')} 
-      WHERE id = ?`;
+  updateFields.push('updated_at = NOW()');
+
+  if (updateFields.length === 1) {
+    return res.status(400).json({ error: 'No meaningful fields to update besides updated_at' });
+  }
+
+  const sql = `UPDATE posts SET ${updateFields.join(', ')} WHERE id = ?`;
   updateValues.push(id);
 
-  pool.query(updatePostSql, updateValues, (err, results) => {
-      if (err) {
-          console.error("Database error during updating post:", err);
-          return res.status(500).json({ error: "Error updating post" });
-      }
-      if (results.affectedRows === 0) {
-          return res.status(404).json({ error: "Post not found" });
-      }
-      res.json({ message: "Post updated successfully" });
+  pool.query(sql, updateValues, (err, results) => {
+    if (err) { console.error(err); return res.status(500).json({ error: "Error updating post" }); }
+    if (results.affectedRows === 0) return res.status(404).json({ error: "Post not found" });
+    res.json({ message: "Post updated successfully" });
   });
 });
+
 
 
 // Delete post by admin (Admin only)
