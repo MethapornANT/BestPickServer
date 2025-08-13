@@ -5377,6 +5377,7 @@ app.get('/api/my/ads', authenticateToken, async (req, res) => {
   const baseFromJoin = `
     FROM ads a
     LEFT JOIN orders o ON o.id = a.order_id
+    LEFT JOIN ad_packages p ON p.package_id = o.package_id
     WHERE ${where.join(' AND ')}
   `;
 
@@ -5385,7 +5386,8 @@ app.get('/api/my/ads', authenticateToken, async (req, res) => {
       a.id, a.user_id, a.order_id, a.title, a.content, a.link, a.image,
       a.status, a.show_at, a.created_at, a.updated_at, a.expiration_date,
       a.display_count,
-      o.amount, o.status AS order_status, o.show_at AS order_show_at
+      o.amount, o.status AS order_status, o.show_at AS order_show_at,
+      p.name AS package_name, p.price AS package_price, p.duration_days AS package_duration
     ${baseFromJoin}
     ORDER BY
       FIELD(a.status,'pending','approved','paid','active','rejected','expired','userdelete'),
