@@ -163,7 +163,7 @@ def nude_predict_image(image_path):
             else:
                 result_dict[f"Class_{i}"] = round(probs[i]*100, 2) # กรณีไม่เจอ label (ไม่น่าจะเกิดขึ้นถ้า LABELS ถูกต้อง)
         
-        return hentai_score > 20 or porn_score > 20, result_dict
+        return hentai_score > 25 or porn_score > 20, result_dict
     except Exception as e:
         print(f"Error in NSFW detection for {image_path}: {e}")
         return False, {"error": f"ไม่สามารถตรวจสอบภาพได้งับ: {e}"}
