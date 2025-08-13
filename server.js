@@ -2358,41 +2358,31 @@ app.get("/api/notifications", verifyToken, (req, res) => {
 
 // API สำหรับอัปเดตสถานะการอ่านของ Notification ตาม ID
 app.put("/api/notifications/:id/read", verifyToken, (req, res) => {
-  const { id } = req.params;  // รับ notification ID จาก URL พารามิเตอร์
-  const userId = req.userId;  // รับ userId ที่ได้จาก verifyToken middleware
+  const { id } = req.params;
+  const userId = req.userId; // ผู้รับ noti จาก token
 
-  // log ค่า ID และ userId สำหรับการดีบัก
   console.log("Notification ID:", id);
-  console.log("User ID from Token (Post Owner):", userId);
+  console.log("User ID from Token (Receiver):", userId);
 
-  // คำสั่ง SQL สำหรับการอัปเดตสถานะการอ่านของ Notification โดยตรวจสอบว่า userId คือเจ้าของโพสต์
-  const updateReadStatusSql = `
-    UPDATE notifications n
-    JOIN posts p ON n.post_id = p.id
-    SET n.read_status = 1
-    WHERE n.id = ? AND p.user_id = ?;
+  const sql = `
+    UPDATE notifications
+    SET read_status = 1
+    WHERE id = ? AND user_id = ?;
   `;
 
-  // เรียกคำสั่ง SQL
-  pool.query(updateReadStatusSql, [id, userId], (error, results) => {
+  pool.query(sql, [id, userId], (error, results) => {
     if (error) {
-      // หากเกิดข้อผิดพลาดในการทำงานกับฐานข้อมูล
-      console.error("Database error during updating read status:", error);
+      console.error("DB error while updating read status:", error);
       return res.status(500).json({ error: "Error updating read status" });
     }
-    
-    // ตรวจสอบว่ามีการอัปเดตหรือไม่
     if (results.affectedRows === 0) {
-      // log กรณีไม่พบ notification หรือตรวจสอบว่า user ไม่ใช่เจ้าของโพสต์
-      console.warn(`Notification not found or you are not the owner of the post (User ID: ${userId})`);
-      return res.status(404).json({ message: "Notification not found or you are not the owner of the post" });
+      return res.status(404).json({ message: "Notification not found or not yours" });
     }
-
-    // หากอัปเดตสำเร็จ
     console.log("Notification marked as read for ID:", id);
     res.json({ message: "Notification marked as read" });
   });
 });
+
 
 
 // API สำหรับลบ Notification
@@ -2433,7 +2423,7 @@ app.post("/api/ads/:id/notify-status-change", verifyToken, (req, res) => {
     const ad = adResults[0];
 
     // สร้างข้อความแจ้งเตือน
-    let content = `โฆษณาของคุณ (${ad.title}) มีการเปลี่ยนสถานะเป็น "${new_status}"`;
+    let content = `Your Ad (${ad.title}) Has change to "${new_status}"`;
     if (new_status === "rejected" && admin_notes) {
       content += `\nเหตุผลที่ถูกปฏิเสธ: ${admin_notes}`;
     }
@@ -2510,10 +2500,10 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
                       });
                   }
                   console.log(`[INFO] Ad ${renewAdsId} successfully renewed and set to 'active' via order ${orderId}.`);
-                  console.log(`[INFO] โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันแล้วงับ!`); // เพิ่ม log ตรงนี้
+                  console.log(`[INFO] Your ad has been renewed. ${duration_days} วันแล้วงับ!`); // เพิ่ม log ตรงนี้
 
                   // เพิ่มการแจ้งเตือนหลังต่ออายุสำเร็จ (ข้อความใหม่)
-                  const notiMsg = `โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วัน สำเร็จแล้ว`;
+                  const notiMsg = `Your ad has been renewed. ${duration_days} วัน สำเร็จแล้ว`;
                   connection.query(
                     `SELECT user_id FROM ads WHERE id = ?`,
                     [renewAdsId],
@@ -2531,14 +2521,14 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
                                     }
                                     connection.commit(() => {
                                         connection.release();
-                                        res.json({ message: `อัปโหลดสลิปสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันเรียบร้อยแล้ว`, slip_path: slipImagePath });
+                                        res.json({ message: `Slip uploaded successfully! Your ad has been renewed for ${duration_days} days.`, slip_path: slipImagePath });
                                     });
                                 }
                             );
                         } else {
                             connection.commit(() => {
                                 connection.release();
-                                res.json({ message: `อัปโหลดสลิปสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันเรียบร้อยแล้ว`, slip_path: slipImagePath });
+                                res.json({ message: `Slip uploaded successfully! Your ad has been renewed for ${duration_days} days.`, slip_path: slipImagePath });
                             });
                         }
                     }
@@ -2637,7 +2627,7 @@ function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
                           const formattedExpirationDate = formatThaiDate(expiration_date);
 
                           // สร้างข้อความแจ้งเตือนการต่ออายุที่ละเอียดขึ้น
-                          content = `โฆษณาของคุณได้รับการต่ออายุ ${renewedDays} วันสำเร็จแล้ว โฆษณานี้ขยายหมดอายุเป็นวันที่ ${formattedExpirationDate}`;
+                          content = `Your ad has been successfully renewed for ${renewedDays} 7 days. The new expiration date is ${formattedExpirationDate}.`;
 
                           // ขั้นตอนสุดท้าย: บันทึกข้อมูลการแจ้งเตือนลงในตาราง notifications
                           pool.query(
@@ -2652,26 +2642,26 @@ function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
                   // ให้ใช้ switch case เดิม เพื่อกำหนดข้อความตามสถานะปกติ
                   switch (newStatus) {
                       case 'approved':
-                          content = 'โฆษณาของคุณได้รับการตรวจสอบแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา';
+                          content = 'Your ad has been reviewed. Please transfer payment to display it.';
                           break;
                       case 'active':
                           // ข้อความนี้จะใช้เฉพาะกรณีที่ 'active' แต่ไม่ใช่การต่ออายุครั้งแรก
-                          content = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว';
+                          content = 'Your ad has been approved for display.';
                           break;
                       case 'rejected':
-                          content = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${adminNotes || '-'}`;
+                          content = `Your ad was rejected. Reason: ${adminNotes || '-'}`;
                           break;
                       case 'paid':
-                          content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ';
+                          content = 'Your ad payment has been completed. Waiting for admin review.';
                           break;
                       case 'expired':
-                          content = 'โฆษณาของคุณหมดอายุแล้ว';
+                          content = 'Your ad has expired.';
                           break;
                       case 'expiring_soon':
-                          content = 'โฆษณาของคุณจะหมดอายุในอีก 3 วัน กรุณาต่ออายุเพื่อการแสดงผลอย่างต่อเนื่อง';
+                          content = 'Your ad will expire in 3 days. Please renew to ensure continuous display.';
                           break;
                       default:
-                          content = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${newStatus}`;
+                          content = `Your ad status has changed to ${newStatus}`;
                   }
 
                   // ขั้นตอนสุดท้าย: บันทึกข้อมูลการแจ้งเตือนลงในตาราง notifications
@@ -5432,11 +5422,10 @@ app.get('/api/my/ads', authenticateToken, async (req, res) => {
   const where = ['a.user_id = ?'];
   const params = [userId];
 
-  // ดีฟอลต์ไม่เอา userdelete
   const wantIncludeDeleted = String(includeDeleted).toLowerCase() === 'true';
-  if (!wantIncludeDeleted) where.push(`a.status <> 'userdelete'`);
-
-  // สถานะ: ถ้าระบุและไม่ใช่ 'all' ให้กรอง
+  if (!(status === 'userdelete') && !wantIncludeDeleted) {
+    where.push(`a.status <> 'userdelete'`);
+  }
   if (status && status !== 'all') {
     where.push('a.status = ?');
     params.push(status);
@@ -5504,6 +5493,38 @@ app.get('/api/my/ads', authenticateToken, async (req, res) => {
   }
 });
 
+
+// GET /api/my/ads/:id  (ดึงโฆษณาตาม id)
+app.get('/api/my/ads/:id', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const adId = req.params.id;
+
+  const sql = `
+    SELECT a.id, a.user_id, a.order_id, a.title, a.content, a.link, a.image,
+           a.status,
+           DATE_FORMAT(a.show_at, "%Y-%m-%d") AS show_at,  
+           a.created_at, a.updated_at,
+           DATE_FORMAT(a.expiration_date, "%Y-%m-%d") AS expiration_date, 
+           a.display_count,
+           o.amount, o.status AS order_status,
+           p.name AS package_name, p.price AS package_price, p.duration_days AS package_duration
+    FROM ads a
+    LEFT JOIN orders o ON o.id = a.order_id
+    LEFT JOIN ad_packages p ON p.package_id = o.package_id
+    WHERE a.id = ? AND a.user_id = ?;
+  `;
+
+  pool.query(sql, [adId, userId], (err, results) => {
+    if (err) {
+      console.error('Error fetching ad detail:', err);
+      return res.status(500).json({ error: 'Error fetching ad detail' });
+    }
+    if (results.length === 0) {
+      return res.status(404).json({ error: 'Ad not found or you do not own it' });
+    }
+    res.json(results[0]);
+  });
+});
 
 
 // PUT /api/my/ads/:adId/delete (User-only soft delete)   สำหรับลบโฆษณาในแอป
