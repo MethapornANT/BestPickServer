@@ -3275,54 +3275,47 @@ app.get("/api/admin/dashboard", authenticateToken, authorizeAdmin, (req, res) =>
   });
 
 
-  app.get("/api/ads/random", (req, res) => {
-    const fetchAdSql = `
-      SELECT *
-      FROM ads
-      WHERE status = 'active'
-      ORDER BY display_count ASC, RAND()
-      LIMIT 1;
-    `;
-  
-    pool.query(fetchAdSql, (err, results) => {
-      if (err) {
-        console.error("Database error during fetching random ad:", err);
-        return res.status(500).json({ error: "Error fetching random ad" });
-      }
-  
-      // Return the single ad in an array, or an empty array if not found
-      res.json(results);
-    });
-  });
-
-
-  app.post("/api/ads/track", (req, res) => {
-    const adId = req.body.id;
-  
-    if (!adId) {
-      return res.status(400).json({ error: "Ad ID is required" });
+  // random ad: เลือกจาก active โดยถ่วงน้ำหนักตาม display_count ต่ำก่อน + สุ่ม
+app.get('/api/ads/random', (req, res) => {
+  const sql = `
+    SELECT *
+    FROM ads
+    WHERE status = 'active'
+    ORDER BY display_count ASC, RAND()
+    LIMIT 1
+  `;
+  pool.query(sql, (err, rows) => {
+    if (err) {
+      console.error('Database error during fetching random ad:', err);
+      return res.status(500).json({ error: 'Error fetching random ad' });
     }
-  
-    const updateAdCountSql = `
-      UPDATE ads
-      SET display_count = display_count + 1
-      WHERE id = ?;
-    `;
-  
-    pool.query(updateAdCountSql, [adId], (err, results) => {
-      if (err) {
-        console.error("Database error during ad count update:", err);
-        return res.status(500).json({ error: "Error updating ad count" });
-      }
-      
-      // Check if any row was affected
-      if (results.affectedRows === 0) {
-        return res.status(404).json({ error: "Ad not found or not updated" });
-      }
-  
-      res.json({ message: "Ad count updated successfully" });
-    });
+    // คืนเป็น array เหมือนเดิม
+    res.json(rows);
   });
+});
+
+// track impression: เพิ่ม display_count และอัปเดต last_shown
+app.post('/api/ads/track', (req, res) => {
+  const adId = req.body.id;
+  if (!adId) return res.status(400).json({ error: 'Ad ID is required' });
+
+  const sql = `
+    UPDATE ads
+    SET display_count = display_count + 1,
+        last_shown = NOW()
+    WHERE id = ?
+  `;
+  pool.query(sql, [adId], (err, result) => {
+    if (err) {
+      console.error('Database error during ad count update:', err);
+      return res.status(500).json({ error: 'Error updating ad count' });
+    }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Ad not found or not updated' });
+    }
+    res.json({ message: 'Ad count updated successfully' });
+  });
+});
 
 
 // Serve images from the uploads directory
