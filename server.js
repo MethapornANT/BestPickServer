@@ -3426,6 +3426,84 @@ app.put("/api/admin/ads/:id", authenticateToken, authorizeAdmin, upload.single('
 });
 
 
+// PUT /api/admin/ads/:adId/status (Admin-only status update)
+app.put('/api/admin/ads/:adId/status', authenticateToken, (req, res) => {
+    // 1. ตรวจสอบก่อนว่าคนที่ส่งคำขอมาเป็น Admin หรือไม่
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden: Admins only' });
+    }
+
+    const { adId } = req.params;
+    const { status, admin_notes } = req.body;
+
+    // 2. ตรวจสอบว่าค่า status ที่ส่งมานั้นถูกต้อง
+    const allowedStatus = ['approved', 'rejected', 'active'];
+    if (!allowedStatus.includes(status)) {
+        return res.status(400).json({ error: 'Invalid status value.' });
+    }
+    
+    // 3. ถ้าสถานะคือ 'active' ให้จัดการเรื่องวันที่เป็นพิเศษ
+    if (status === 'active') {
+        // ดึงข้อมูล 'duration_days' ของแพ็กเกจมาก่อน
+        const getAdInfoSql = `
+            SELECT p.duration_days 
+            FROM ads a
+            JOIN orders o ON a.order_id = o.id
+            JOIN ad_packages p ON o.package_id = p.package_id
+            WHERE a.id = ?
+        `;
+        
+        pool.query(getAdInfoSql, [adId], (err, results) => {
+            if (err) return res.status(500).json({ error: 'Database error fetching ad info' });
+            if (results.length === 0) return res.status(404).json({ error: 'Ad not found or package info missing.' });
+
+            const duration = results[0].duration_days;
+            
+            // คำนวณวันที่เริ่ม (อีก 2 วันจากนี้) และวันหมดอายุใหม่
+            const showAtDate = new Date();
+            showAtDate.setDate(showAtDate.getDate() + 2);
+            
+            const expirationDate = new Date(showAtDate);
+            expirationDate.setDate(showAtDate.getDate() + duration);
+
+            // จัดรูปแบบวันที่สำหรับ SQL (YYYY-MM-DD)
+            const showAtForSql = showAtDate.toISOString().split('T')[0];
+            const expirationForSql = expirationDate.toISOString().split('T')[0];
+            
+            const updateSql = `
+                UPDATE ads 
+                SET status = 'active', show_at = ?, expiration_date = ? 
+                WHERE id = ?
+            `;
+            
+            pool.query(updateSql, [showAtForSql, expirationForSql, adId], (updateErr, updateResult) => {
+                if (updateErr) return res.status(500).json({ error: 'Database error activating ad' });
+                res.status(200).json({ message: 'Ad activated successfully with new dates.' });
+            });
+        });
+
+    } else {
+        // 4. ถ้าเป็นสถานะ 'approved' หรือ 'rejected' ให้อัปเดตตามปกติ
+        let sql = 'UPDATE ads SET status = ?';
+        const params = [status];
+
+        if (status === 'rejected' && admin_notes) {
+            sql += ', admin_notes = ?';
+            params.push(admin_notes);
+        }
+        sql += ' WHERE id = ?';
+        params.push(adId);
+
+        pool.query(sql, params, (err, result) => {
+            if (err) return res.status(500).json({ error: 'Database error' });
+            if (result.affectedRows === 0) return res.status(404).json({ error: 'Ad not found.' });
+            res.status(200).json({ message: 'Status updated successfully.' });
+        });
+    }
+});
+
+
+
 // Delete an Ad (Admin only)
 app.delete("/api/ads/:id", authenticateToken, authorizeAdmin, (req, res) => {
   const { id } = req.params;
@@ -5377,9 +5455,12 @@ app.get('/api/my/ads', authenticateToken, async (req, res) => {
   const listSql = `
     SELECT
       a.id, a.user_id, a.order_id, a.title, a.content, a.link, a.image,
-      a.status, a.show_at, a.created_at, a.updated_at, a.expiration_date,
+      a.status,
+      DATE_FORMAT(a.show_at, "%Y-%m-%d") AS show_at,  
+      a.created_at, a.updated_at,
+      DATE_FORMAT(a.expiration_date, "%Y-%m-%d") AS expiration_date, 
       a.display_count,
-      o.amount, o.status AS order_status, o.show_at AS order_show_at,
+      o.amount, o.status AS order_status,
       p.name AS package_name, p.price AS package_price, p.duration_days AS package_duration
     ${baseFromJoin}
     ORDER BY
