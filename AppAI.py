@@ -854,21 +854,21 @@ def notify_ads_status_change(db, ad_id: int, new_status: str, admin_notes: str =
 
             if duration_to_use is not None:
                 formatted_expiration_date = format_thai_date(expiration_date)
-                content = f"โฆษณาของคุณได้รับการต่ออายุ {duration_to_use} วันสำเร็จแล้ว โฆษณานี้ขยายหมดอายุเป็นวันที่ {formatted_expiration_date}"
+                content = f"Your ad has been successfully renewed for {duration_to_use} days. This ad's expiration date is extended to {formatted_expiration_date}"
             else:
-                content = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว'
+                content = 'Your ad has been approved for display'
         elif new_status == 'paid':
-            content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ'
+            content = 'Your ad payment has been completed. Waiting for admin review'
         elif new_status == 'approved':
-            content = 'โฆษณาของคุณได้รับการตรวจสอบแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา'
+            content = 'Your ad has been reviewed. Please transfer payment to display it'
         elif new_status == 'rejected':
-            content = f'โฆษณาของคุณถูกปฏิเสธ เหตุผล: {admin_notes or "-"}'
+            content = f'Your ad was rejected. Reason: {admin_notes or "-"}'
         elif new_status == 'expired':
-            content = 'โฆษณาของคุณหมดอายุแล้ว'
+            content = 'Your ad has expired'
         elif new_status == 'expiring_soon':
-            content = 'โฆษณาของคุณจะหมดอายุในอีก 3 วัน กรุณาต่ออายุเพื่อการแสดงผลอย่างต่อเนื่อง'
+            content = 'Your ad will expire in 3 days. Please renew to ensure continuous display'
         else:
-            content = f'สถานะโฆษณาของคุณเปลี่ยนเป็น {new_status}'
+            content = f'Your ad status has changed to {new_status}'
 
         insert_notification_query = text("""
             INSERT INTO notifications (user_id, action_type, content, ads_id)
@@ -888,239 +888,141 @@ def notify_ads_status_change(db, ad_id: int, new_status: str, admin_notes: str =
         db.session.rollback()
         return False
 
-# ฟังก์ชันนี้ใช้ตรวจสอบสลิปการโอนเงินและอัปเดตสถานะของคำสั่งซื้อและโฆษณา
-# รองรับทั้งการชำระเงินสำหรับโฆษณาใหม่และการต่ออายุโฆษณา โดยจะเรียกใช้ SlipOK API เพื่อยืนยันความถูกต้องของสลิป
 def verify_payment_and_update_status(order_id, slip_image_path, payload_from_client, db):
-    print(f"\n--- Processing payment for Order ID: {order_id} ---")
-    print(f"Slip image path: {slip_image_path}")
-    print(f"Payload (from client - original QR data): {payload_from_client}")
+    """
+    Call SlipOK and update our order/ad. Return concise EN messages for client.
+    """
+    print(f"[INFO] process order={order_id}")
 
     order = find_order_by_id(order_id)
     if not order:
-        print(f"❌ [ERROR] Order ID {order_id} not found.")
-        return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
+        return {"success": False, "message": "Order not found."}
+    if not can_upload_slip(order):
+        return {"success": False, "message": "Slip upload not allowed for this order status."}
+    if not os.path.exists(slip_image_path):
+        return {"success": False, "message": "Slip file missing on server."}
 
+    # pick associated ad (new or renew) and basic guards
+    ad_related = None
+    if order.get("renew_ads_id") is not None:
+        ad_related = find_ad_by_id(order["renew_ads_id"])
+        if not ad_related:
+            return {"success": False, "message": "Ad for renewal not found."}
+    else:
+        already = find_ad_by_order_id(order_id)
+        if already and already.get('status') in ['active', 'rejected', 'paid']:
+            return {"success": False, "message": "This order was already processed."}
+
+    # SlipOK config
+    SLIP_OK_API_ENDPOINT = os.getenv("SLIP_OK_API_ENDPOINT", "https://api.slipok.com/api/line/apikey/49130")
+    SLIP_OK_API_KEY = os.getenv("SLIP_OK_API_KEY", "SLIPOKKBE52WN")  # make sure env is set in prod
+
+    # call SlipOK
     try:
-        if not can_upload_slip(order):
-            log_message = f"❌ [WARN] Cannot upload slip for Order ID {order_id}. Current status: {order.get('status')}."
-            if order.get("status") == 'pending' and order.get("renew_ads_id") is None:
-                log_message += " (New ad order not yet approved by admin)."
-                print(log_message)
-                return {"success": False, "message": "ไม่สามารถอัปโหลดสลิปได้ ต้องรอให้แอดมินอนุมัติเนื้อหาก่อน"}
-            else:
-                log_message += " (Invalid order status)."
-                print(log_message)
-                return {"success": False, "message": "ไม่สามารถอัปโหลดสลิปได้ สถานะคำสั่งซื้อไม่ถูกต้อง"}
-
-        ad_related = None
-        if order.get("renew_ads_id") is not None:
-            ad_related = find_ad_by_id(order["renew_ads_id"])
-            if not ad_related:
-                print(f"❌ [ERROR] Associated ad for renewal (ID {order['renew_ads_id']}) not found for Order ID {order_id}.")
-                return {"success": False, "message": "ไม่พบโฆษณาที่ต้องการต่ออายุ"}
-
-            today = datetime.now().date()
-            if isinstance(ad_related.get('expiration_date'), date) and ad_related['expiration_date'] < today:
-                print(f"❌ [WARN] Cannot renew ad ID {ad_related['id']} for Order ID {order_id}. Ad has expired on {ad_related['expiration_date'].strftime('%Y-%m-%d')}.")
-                return {"success": False, "message": "ไม่สามารถต่ออายุโฆษณาได้ เนื่องจากโฆษณาหมดอายุแล้ว"}
-
-            if ad_related.get('status') not in ['active', 'expiring_soon', 'paused']:
-                print(f"❌ [WARN] Associated ad ID {ad_related['id']} for Order ID {order_id} is not in a renewable status. Current ad status: {ad_related['status']}.")
-                return {"success": False, "message": "โฆษณาสำหรับคำสั่งซื้อนี้ไม่อยู่ในสถานะที่สามารถต่ออายุได้"}
-        else:
-            ad_related = find_ad_by_order_id(order_id)
-            if ad_related and ad_related.get('status') in ['active', 'rejected', 'paid']:
-                print(f"❌ [WARN] Associated ad for Order ID {order_id} is already processed. Current ad status: {ad_related['status']}.")
-                return {"success": False, "message": "โฆษณาสำหรับคำสั่งซื้อนี้มีการดำเนินการไปแล้ว"}
-
-        SLIP_OK_API_ENDPOINT = os.getenv("SLIP_OK_API_ENDPOINT", "https://api.slipok.com/api/line/apikey/49130")
-        SLIP_OK_API_KEY = os.getenv("SLIP_OK_API_KEY", "SLIPOKKBE52WN")
-
-        if not os.path.exists(slip_image_path):
-            print(f"❌ [ERROR] Slip image file not found at '{slip_image_path}'")
-            return {"success": False, "message": "ไม่พบไฟล์รูปภาพสลิป"}
-
-        response = None
         with open(slip_image_path, 'rb') as img_file:
-            files = {'files': img_file}
-            form_data_for_slipok = {
-                'log': 'true',
-                'amount': str(float(order["amount"]))
-            }
-            headers = {
-                "x-authorization": SLIP_OK_API_KEY,
-            }
-            print(f"Sending request to SlipOK API: {SLIP_OK_API_ENDPOINT}")
-            print(f"Headers sent: {headers}")
-            print(f"Form Data sent to SlipOK: {form_data_for_slipok}")
+            files = {'files': (os.path.basename(slip_image_path), img_file, 'image/jpeg')}
+            data = {'log': 'true', 'amount': str(float(order["amount"]))}
+            headers = {'x-authorization': SLIP_OK_API_KEY}
+            r = requests.post(SLIP_OK_API_ENDPOINT, files=files, data=data, headers=headers, timeout=30)
+            text_body = r.text  # keep for debug
+            r.raise_for_status()
+            resp = r.json()
+    except requests.exceptions.Timeout:
+        print(f"[ERR] SlipOK timeout order={order_id}")
+        return {"success": False, "message": "Verification service timeout. Please try again."}
+    except requests.exceptions.HTTPError as e:
+        # try to surface short, clear reason
+        msg = "Verification failed."
+        try:
+            j = r.json()
+            code = j.get('code')
+            slipok_msg = j.get('message', '')
+            # common codes → short EN
+            if code == 1002:
+                msg = "Verification provider rejected our credentials. Contact support."
+            elif code == 1012:
+                msg = "Duplicate slip. This slip was already submitted."
+            else:
+                msg = slipok_msg or msg
+        except Exception:
+            msg = f"Verification failed: HTTP {r.status_code}"
+        print(f"[ERR] SlipOK HTTP {r.status_code} order={order_id} msg={msg} body={text_body[:200]}")
+        return {"success": False, "message": msg}
+    except requests.exceptions.RequestException as e:
+        print(f"[ERR] SlipOK connect error order={order_id}: {e}")
+        return {"success": False, "message": "Cannot reach verification service. Please try again."}
+    except Exception as e:
+        print(f"[ERR] SlipOK call unexpected order={order_id}: {e}")
+        return {"success": False, "message": "Unexpected error during verification."}
 
-            response = requests.post(SLIP_OK_API_ENDPOINT, files=files, data=form_data_for_slipok, headers=headers, timeout=30)
-            response.raise_for_status()
+    # validate SlipOK response
+    if not resp.get("success"):
+        msg = resp.get("message") or "Verification failed."
+        # map known code if present
+        code = resp.get("code")
+        if code == 1012:
+            msg = "Duplicate slip. This slip was already submitted."
+        return {"success": False, "message": msg}
 
-            print(f"DEBUG: Full SlipOK response text: {response.text}")
-            slip_ok_response_data = response.json()
-            print(f"Received response from SlipOK: {slip_ok_response_data}")
+    data = resp.get("data") or {}
+    slip_amount = float(data.get("amount", 0))
+    trans_ref = data.get("transRef")
 
-            if not slip_ok_response_data.get("success"):
-                error_message = slip_ok_response_data.get("message", "Unknown error from SlipOK API")
-                print(f"❌ Log: Error from SlipOK API: {error_message}")
-                return {"success": False, "message": f"การตรวจสอบสลิปไม่สำเร็จ: {error_message}"}
+    if not trans_ref:
+        return {"success": False, "message": "Slip verification returned no transaction ID."}
 
-            slipok_data = slip_ok_response_data.get("data")
-            if not slipok_data:
-                print(f"❌ Log: Unexpected response format from SlipOK API: 'data' field is missing or empty.")
-                return {"success": False, "message": "รูปแบบข้อมูลจากระบบตรวจสอบสลิปไม่ถูกต้อง (ไม่พบข้อมูลสลิป)"}
+    if abs(slip_amount - float(order.get("amount"))) > 0.01:
+        return {"success": False, "message": f"Incorrect amount. Expected {order.get('amount'):.2f}, got {slip_amount:.2f}."}
 
-            slip_transaction_id_from_api = slipok_data.get("transRef")
-            slip_amount = float(slipok_data.get("amount", 0.0))
-
-            if not slip_transaction_id_from_api:
-                print(f"❌ Log: Missing 'transRef' in SlipOK 'data' object.")
-                return {"success": False, "message": "รูปแบบข้อมูลจากระบบตรวจสอบสลิปไม่ถูกต้อง (ไม่พบ Transaction ID)"}
-
-        if abs(slip_amount - float(order.get("amount"))) > 0.01:
-            print(f"❌ [WARN] Amount mismatch. Order: {order.get('amount')}, Slip: {slip_amount}")
-            return {"success": False, "message": f"ยอดเงินไม่ถูกต้อง (ต้องการ {order.get('amount'):.2f} บาท แต่ได้รับ {slip_amount:.2f} บาท)"}
-
-        if not update_status_and_slip_info(order_id, "paid", slip_image_path, slip_transaction_id_from_api):
-            raise Exception("Failed to update order status and slip info.")
+    # update our order/ad
+    try:
+        ok = update_status_and_slip_info(order_id, "paid", slip_image_path, trans_ref)
+        if not ok:
+            raise RuntimeError("Update order failed")
 
         ad_id_to_return = None
-        ad_new_status_for_notification = None
-
         if order.get("renew_ads_id") is not None:
-            current_ad = find_ad_by_id(order["renew_ads_id"])
-            if not current_ad:
-                raise Exception(f"Ad with ID {order['renew_ads_id']} not found for renewal processing after order update.")
-
+            # renewal: compute new expiration by package
             duration_days = get_ad_package_duration(order["package_id"])
             if duration_days is None:
-                raise Exception(f"Ad package duration not found for package_id {order['package_id']} for renewal.")
-
-            original_expiration = current_ad.get('expiration_date')
-
-            renewal_start_date_candidate = None
-
-            if original_expiration:
-                if isinstance(original_expiration, date) and not isinstance(original_expiration, datetime):
-                    renewal_start_date_candidate = datetime.combine(original_expiration, datetime.min.time())
-                elif isinstance(original_expiration, datetime):
-                    renewal_start_date_candidate = original_expiration
-
-            if original_expiration:
-                if renewal_start_date_candidate:
-                    calculated_renewal_start = renewal_start_date_candidate + timedelta(days=1)
-                else:
-                    calculated_renewal_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-
-                if calculated_renewal_start.date() < datetime.now().date():
-                    actual_renewal_start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                else:
-                    actual_renewal_start_date = calculated_renewal_start
-
-                new_expiration_date = actual_renewal_start_date + timedelta(days=duration_days - 1)
-
-            else:
-                order_show_at = order.get('show_at')
-                actual_start_date_for_new_ad = None
-                if order_show_at:
-                    if isinstance(order_show_at, date) and not isinstance(order_show_at, datetime):
-                        actual_start_date_for_new_ad = datetime.combine(order_show_at, datetime.min.time())
-                    elif isinstance(order_show_at, datetime):
-                        actual_start_date_for_new_ad = order_show_at
-
-                if actual_start_date_for_new_ad is None:
-                    actual_start_date_for_new_ad = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-
-                new_expiration_date = actual_start_date_for_new_ad + timedelta(days=duration_days - 1)
-
-            if not update_ad_for_renewal(current_ad['id'], "active", new_expiration_date.date()):
-                raise Exception("Failed to update existing ad status and expiration date for renewal.")
-
+                raise RuntimeError("Missing package duration")
+            current_ad = find_ad_by_id(order["renew_ads_id"])
+            start = current_ad.get('expiration_date') or datetime.now().date()
+            if isinstance(start, datetime):
+                start = start.date()
+            new_exp = datetime.combine(start, datetime.min.time()).date() + timedelta(days=duration_days)
+            if not update_ad_for_renewal(current_ad['id'], "active", new_exp):
+                raise RuntimeError("Renewal update failed")
             ad_id_to_return = current_ad['id']
-            ad_new_status_for_notification = 'active'
-
+            notify_ads_status_change(db, ad_id_to_return, 'active')
+            message = f"Payment verified. Your ad was renewed for {duration_days} days."
         else:
-            ad_id = None
             ad = find_ad_by_order_id(order_id)
             if ad:
-                ad_id = ad['id']
-                if not update_ad_status(ad_id, "paid"):
-                    raise Exception("Failed to update existing ad status to 'paid' for new ad.")
+                if not update_ad_status(ad['id'], "paid"):
+                    raise RuntimeError("Ad status update failed")
+                ad_id_to_return = ad['id']
             else:
-                ad_id = create_advertisement_db(order)
-                if ad_id is None:
-                    raise Exception("Failed to create new advertisement.")
-
-            ad_id_to_return = ad_id
-            ad_new_status_for_notification = 'paid'
+                new_id = create_advertisement_db(order)
+                if not new_id:
+                    raise RuntimeError("Ad creation failed")
+                ad_id_to_return = new_id
+            notify_ads_status_change(db, ad_id_to_return, 'paid')
+            message = "Payment verified. Please wait for admin to activate the ad."
 
         db.session.commit()
-        print(f"✅ [INFO] Transaction committed successfully for Order ID: {order_id}.")
-
-        if ad_id_to_return and ad_new_status_for_notification:
-            notify_ads_status_change(db, ad_id_to_return, ad_new_status_for_notification)
-
-        if order.get("renew_ads_id") is not None:
-            duration_days = get_ad_package_duration(order["package_id"])
-            message = f"ชำระเงินสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก {duration_days} วันเรียบร้อยแล้ว"
-        else:
-            message = "ชำระเงินสำเร็จ! กรุณารอแอดมินตรวจสอบ"
-
+        print(f"[INFO] order={order_id} verified, ad_id={ad_id_to_return}, transRef={trans_ref}")
         return {"success": True, "message": message, "ad_id": ad_id_to_return}
 
-    except requests.exceptions.Timeout:
-        try:
-            db.session.rollback()
-        except Exception as rollback_e:
-            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
-        print(f"❌ [API ERROR] SlipOK Timeout: API ไม่ตอบกลับภายในเวลาที่กำหนดสำหรับ Order ID: {order_id}.")
-        return {"success": False, "message": "ระบบตรวจสอบสลิปตอบกลับช้าเกินไป โปรดลองอีกครั้ง"}
-    except requests.exceptions.HTTPError as e:
-        try:
-            db.session.rollback()
-        except Exception as rollback_e:
-            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
-
-        slipok_error_message = "ไม่ทราบข้อผิดพลาดจาก SlipOK API"
-        if response is not None:
-            try:
-                error_details = response.json()
-                slipok_error_message = error_details.get('message', 'ไม่พบข้อความผิดพลาดจาก SlipOK')
-                print(f"❌ [API ERROR] HTTP Error {e.response.status_code} for Order ID: {order_id}. SlipOK Message: {slipok_error_message}. URL: {e.request.url}")
-                print(f"    Full SlipOK Response Body: {response.text}")
-            except Exception as json_e:
-                print(f"❌ [API ERROR] HTTP Error {e.response.status_code} for Order ID: {order_id}. URL: {e.request.url}. Cannot parse SlipOK response as JSON. Error: {json_e}")
-                print(f"    Full SlipOK Response Text (Non-JSON): {response.text}")
-                slipok_error_message = f"เกิดข้อผิดพลาดในการประมวลผลคำตอบจาก SlipOK: {response.text[:100]}..."
-        else:
-            print(f"❌ [API ERROR] HTTP Error for Order ID: {order_id}. Error: {e}. (No SlipOK response object found)")
-
-        return {"success": False, "message": f"การตรวจสอบสลิปไม่สำเร็จ: {slipok_error_message}"}
-
-    except requests.exceptions.RequestException as e:
-        try:
-            db.session.rollback()
-        except Exception as rollback_e:
-            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
-        print(f"❌ [API ERROR] Connection Error: ไม่สามารถเชื่อมต่อกับ SlipOK API สำหรับ Order ID: {order_id}. Error: {e}")
-        return {"success": False, "message": f"เกิดข้อผิดพลาดในการเชื่อมต่อกับระบบตรวจสอบสลิป: {e}"}
-    except ValueError:
-        try:
-            db.session.rollback()
-        except Exception as rollback_e:
-            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
-        print(f"❌ [API ERROR] Data Parsing Error: ไม่สามารถอ่านยอดเงินจาก SlipOK response ได้สำหรับ Order ID: {order_id}.")
-        return {"success": False, "message": "รูปแบบยอดเงินจากระบบตรวจสอบสลิปไม่ถูกต้อง"}
     except Exception as e:
         try:
             if db and hasattr(db, 'session'):
                 db.session.rollback()
-        except Exception as rollback_e:
-            print(f"⚠️ [WARN] Error during rollback: {rollback_e}")
+        except Exception as rb:
+            print(f"[WARN] rollback error: {rb}")
+        print(f"[ERR] post-verify update failed order={order_id}: {e}")
+        return {"success": False, "message": "Internal update failed after verification."}
 
-        print(f"❌ [APP ERROR] Transaction failed for Order ID: {order_id}. Rolling back changes. Error: {e}")
-        return {"success": False, "message": f"เกิดข้อผิดพลาดในการทำรายการ: {e}"}
 
 # ==================== FLASK ROUTES ====================
 
@@ -1706,54 +1608,37 @@ def api_generate_qrcode(order_id):
 
 @app.route('/api/verify-slip/<int:order_id>', methods=['POST'])
 def api_verify_slip(order_id):
-    """
-    API สำหรับตรวจสอบสลิปการโอนเงินและอัปเดตสถานะคำสั่งซื้อ/โฆษณา.
-    จะรองรับทั้งการชำระเงินสำหรับโฆษณาใหม่และการต่ออายุโฆษณา.
-    """
-    if 'slip_image' not in request.files:
-        print(f"❌ [WARN] API Verify Slip: No 'slip_image' file found in request for order ID {order_id}.")
-        return jsonify({'success': False, 'message': 'กรุณาอัปโหลดไฟล์สลิปการโอนเงิน'}), 400
-    
-    file = request.files['slip_image']
-    if file.filename == '':
-        print(f"❌ [WARN] API Verify Slip: Empty filename for 'slip_image' for order ID {order_id}.")
-        return jsonify({'success': False, 'message': 'ไม่ได้เลือกไฟล์สลิป'}), 400
-    
-    if 'payload' not in request.form:
-        print(f"❌ [WARN] API Verify Slip: No 'payload' (QR Code data) found in request form for order ID {order_id}.")
-        return jsonify({'success': False, 'message': 'ต้องระบุ payload (ข้อมูล QR Code ที่สร้าง) เพื่อตรวจสอบสลิป'}), 400
-    
-    payload = request.form['payload']
+    """Receive slip + payload, call SlipOK, update order/ad, return short EN messages."""
+    # basic input check
+    file = request.files.get('slip_image')
+    if not file or file.filename == '':
+        return jsonify({'success': False, 'message': 'No slip received. Attach a slip image.'}), 400
 
+    payload = request.form.get('payload')
+    if not payload:
+        return jsonify({'success': False, 'message': 'Missing payload (QR data).'}), 400
+
+    # order check
     order = find_order_by_id(order_id)
     if not order:
-        print(f"❌ [WARN] API Verify Slip: Order ID {order_id} not found.")
-        return jsonify({'success': False, 'message': 'ไม่พบคำสั่งซื้อนี้'}), 404
-
+        return jsonify({'success': False, 'message': 'Order not found.'}), 404
     if not can_upload_slip(order):
-        order_status = order.get('status', 'N/A') 
-        renew_ad_id = order.get('renew_ads_id', 'N/A') 
-        print(f"❌ [WARN] API Verify Slip: Order ID {order_id} not eligible for slip upload. Current status: {order_status}. Renew Ad: {renew_ad_id}.")
-        return jsonify({'success': False, 'message': 'ไม่สามารถอัปโหลดสลิปได้ เนื่องจากสถานะคำสั่งซื้อไม่ถูกต้อง หรือยังไม่ได้รับการอนุมัติ'}), 400
+        return jsonify({'success': False, 'message': 'Slip upload not allowed for this order status.'}), 400
 
-    # สร้างชื่อไฟล์ที่ไม่ซ้ำกัน และบันทึกสลิปงับ
-    unique_filename = f"{uuid.uuid4()}_{file.filename}"
+    # save file
     slip_dir = 'Slip'
-    if not os.path.exists(slip_dir):
-        os.makedirs(slip_dir)
+    os.makedirs(slip_dir, exist_ok=True)
+    unique_filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
     save_path = os.path.join(slip_dir, unique_filename)
     file.save(save_path)
-    
-    print(f"✅ [INFO] API Verify Slip: Slip image uploaded to {save_path} for Order ID {order_id}.")
-    print(f"✅ [INFO] API Verify Slip: Payload from client (QR Code data): {payload}.")
 
-    # เรียกใช้ฟังก์ชันตรวจสอบการชำระเงินและอัปเดตสถานะงับ
+    # concise server logs (mask sensitive)
+    print(f"[INFO] verify-slip: order={order_id}, file={unique_filename}, payload_len={len(payload)}")
+
+    # process
     result = verify_payment_and_update_status(order_id, save_path, payload, db)
-
-    if not result.get('success'):
-        return jsonify(result), 400
-
-    return jsonify(result), 200
+    status = 200 if result.get('success') else 400
+    return jsonify(result), status
 
 
 if __name__ == '__main__':
