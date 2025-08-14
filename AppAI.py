@@ -21,6 +21,11 @@ import seaborn as sns
 import numpy as np
 import locale # สำหรับการแสดงวันที่ภาษาไทย
 
+from datetime import date, datetime, timedelta
+from sqlalchemy import text
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
+
 import os
 import torch
 import torch.nn as nn
@@ -813,7 +818,6 @@ def format_thai_date(date_obj):
 
     return formatted_date
 
-# ฟังก์ชันนี้ใช้สร้างและบันทึกการแจ้งเตือนเมื่อสถานะโฆษณาเปลี่ยนแปลง
 # เพื่อแจ้งให้ผู้ใช้ทราบถึงความคืบหน้าหรือการเปลี่ยนแปลงที่เกิดขึ้นกับโฆษณาของตน
 def notify_ads_status_change(db, ad_id: int, new_status: str, admin_notes: str = None, duration_days_from_renewal: int = None) -> bool:
     try:
@@ -910,7 +914,7 @@ def verify_payment_and_update_status(order_id, slip_image_path, payload_from_cli
             return {"success": False, "message": "Ad for renewal not found."}
     else:
         already = find_ad_by_order_id(order_id)
-        if already and already.get('status') in ['active', 'rejected', 'paid']:
+        if already and already.get('status') in ['active']:
             return {"success": False, "message": "This order was already processed."}
 
     # SlipOK config
@@ -1022,6 +1026,78 @@ def verify_payment_and_update_status(order_id, slip_image_path, payload_from_cli
             print(f"[WARN] rollback error: {rb}")
         print(f"[ERR] post-verify update failed order={order_id}: {e}")
         return {"success": False, "message": "Internal update failed after verification."}
+
+
+def check_ads_expiring_soon(db, today_date: date = None):
+    # ใช้ today_date แค่คำนวณ target_date ส่วนกันซ้ำใช้ CURDATE() ฝั่ง DB
+    if today_date is None:
+        today_date = date.today()
+    target_date = today_date + timedelta(days=3)
+
+    lockname = f"expiring_run_{today_date.isoformat()}"
+    conn = db.engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        # ล็อกทั้งรอบ ป้องกันเรียกซ้อน
+        cur.execute("SELECT GET_LOCK(%s, 5)", (lockname,))
+        got = cur.fetchone()[0]
+        if not got:
+            print(f"[INFO] skip: another run holds lock {lockname}")
+            return 0, []
+
+        # กันซ้ำต่อวันด้วย anti-join ที่อิงวันที่ของ DB เอง (CURDATE())
+        sql = """
+        INSERT INTO notifications (user_id, action_type, content, ads_id, created_at, read_status)
+        SELECT a.user_id,
+               'ads_status_change',
+               'Your ad will expire in 3 days. Please renew to ensure continuous display',
+               a.id,
+               NOW(),
+               0
+          FROM ads a
+     LEFT JOIN notifications n
+            ON n.ads_id = a.id
+           AND n.action_type = 'ads_status_change'
+           AND n.content = 'Your ad will expire in 3 days. Please renew to ensure continuous display'
+           AND DATE(n.created_at) = CURDATE()
+         WHERE DATE(a.expiration_date) = %s
+           AND a.status IN ('active')
+           AND n.id IS NULL
+        """
+        cur.execute(sql, (target_date.isoformat(),))
+        inserted = cur.rowcount or 0
+        conn.commit()
+
+        if inserted == 0:
+            print("[INFO] no eligible ads (already notified today or none match)")
+        else:
+            print(f"[INFO] notified {inserted} ad(s) for expiring_soon")
+
+        return inserted, []
+    except Exception as e:
+        conn.rollback()
+        print("[ERR] expiring_soon atomic insert:", e)
+        return 0, []
+    finally:
+        try:
+            cur.execute("SELECT RELEASE_LOCK(%s)", (lockname,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        try: cur.close()
+        except: pass
+        try: conn.close()
+        except: pass
+
+
+# ตั้ง scheduler ให้รันทุกวัน 00:00 Asia/Bangkok
+def start_expiry_scheduler(db):
+    tz = pytz.timezone('Asia/Bangkok')
+    sched = BackgroundScheduler(timezone=tz)
+    # cron ที่เวลา 00:00 ทุกวัน
+    sched.add_job(lambda: check_ads_expiring_soon(db), 'cron', hour=0, minute=0)
+    sched.start()
+    print("⏰ Expiry scheduler started (runs 00:00 Asia/Bangkok)")
 
 
 # ==================== FLASK ROUTES ====================
@@ -1641,5 +1717,36 @@ def api_verify_slip(order_id):
     return jsonify(result), status
 
 
+# (ทดสอบด้วย endpoint) — ใส่ใน AppAI.py ตรงส่วน Flask routes
+@app.route('/internal/run-expiry-check', methods=['POST'])
+def internal_run_expiry_check():
+    """
+    Body (JSON) optional: {"now": "YYYY-MM-DD"}  -> ใช้สำหรับ mock วันที่ทดสอบ
+    Returns: {count: n, ad_ids: [...]}
+    """
+    payload = request.get_json(silent=True) or {}
+    now_str = payload.get('now')
+    try:
+        if now_str:
+            today_date = datetime.fromisoformat(now_str).date()
+        else:
+            today_date = date.today()
+    except Exception:
+        return jsonify({'success': False, 'message': 'invalid date format for now. use YYYY-MM-DD'}), 400
+
+    count, ad_ids = check_ads_expiring_soon(db, today_date)
+    return jsonify({'success': True, 'count': count, 'ad_ids': ad_ids}), 200
+
+_scheduler_started = False
+
+def start_scheduler_once():
+    global _scheduler_started
+    if not _scheduler_started:
+        start_expiry_scheduler(db)
+        _scheduler_started = True
+
 if __name__ == '__main__':
+    # ป้องกันการรันซ้ำเมื่อ Flask debug reloader สตาร์ทสองครั้ง
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not app.debug:
+        start_scheduler_once()
     app.run(host='0.0.0.0', port=5005)
