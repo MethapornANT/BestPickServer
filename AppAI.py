@@ -114,11 +114,11 @@ try:
     # ไม่ใช่ state_dict ของ `CustomEfficientNetB0` ทั้งก้อน
     state_dict_from_file = torch.load(MODEL_PATH, map_location=torch.device('cpu'))
     model.efficientnet.load_state_dict(state_dict_from_file) # โหลดเข้าสู่ EfficientNet ภายใน CustomEfficientNetB0
-    print("โหลด state_dict เข้าสู่ model.efficientnet โดยตรงสำเร็จงับ!")
+    print("โหลด state_dict เข้าสู่ model.efficientnet โดยตรงสำเร็จ!")
 
 except Exception as e:
     print(f"เกิดข้อผิดพลาดในการโหลดโมเดล: {e}")
-    print("โปรดตรวจสอบว่าไฟล์โมเดลถูกต้องและโครงสร้างโมเดล 'CustomEfficientNetB0' ตรงกับที่ใช้ในการเทรนงับ")
+    print("โปรดตรวจสอบว่าไฟล์โมเดลถูกต้องและโครงสร้างโมเดล 'CustomEfficientNetB0' ตรงกับที่ใช้ในการเทรน")
     # คุณอาจจะต้องเพิ่มการจัดการข้อผิดพลาดที่นี่ หรือทำให้โปรแกรมหยุดทำงาน
     exit() # หยุดการทำงานหากโหลดโมเดลไม่ได้
 
@@ -150,7 +150,7 @@ def nude_predict_image(image_path):
         # ดึงคะแนน Hentai และ Pornography โดยใช้อ้างอิงจาก label2idx
         # ตรวจสอบว่า index มีอยู่ใน list ของ probs หรือไม่
         if label2idx['hentai'] >= len(probs) or label2idx['porn'] >= len(probs):
-             raise IndexError("ไม่พบ Index ของ 'hentai' หรือ 'porn' ในผลลัพธ์การคาดการณ์งับ")
+             raise IndexError("ไม่พบ Index ของ 'hentai' หรือ 'porn' ในผลลัพธ์การคาดการณ์")
 
         hentai_score = probs[label2idx['hentai']] * 100
         porn_score = probs[label2idx['porn']] * 100
@@ -171,7 +171,7 @@ def nude_predict_image(image_path):
         return hentai_score > 25 or porn_score > 20, result_dict
     except Exception as e:
         print(f"Error in NSFW detection for {image_path}: {e}")
-        return False, {"error": f"ไม่สามารถตรวจสอบภาพได้งับ: {e}"}
+        return False, {"error": f"ไม่สามารถตรวจสอบภาพได้: {e}"}
 
 # ==================== DATABASE SETUP ====================
 # กำหนดค่า URI สำหรับการเชื่อมต่อฐานข้อมูล
@@ -722,7 +722,7 @@ def generate_promptpay_qr_for_order(order_id):
     order = find_order_by_id(order_id)
     if not order:
         print(f"❌ [WARN] Order ID {order_id} not found for QR generation.")
-        return {"success": False, "message": "ไม่พบคำสั่งซื้อ"}
+        return {"success": False, "message": "Order not found."}
 
     is_new_ad_approved = order["status"] == 'approved' and order.get("renew_ads_id") is None
     is_renewal_ad_pending = order["status"] == 'pending' and order.get("renew_ads_id") is not None
@@ -733,27 +733,27 @@ def generate_promptpay_qr_for_order(order_id):
         log_message = f"❌ [WARN] Cannot generate QR for order {order_id}. Current status: '{order['status']}'."
         if order["status"] == 'pending' and order.get("renew_ads_id") is None:
             log_message += " (New ad order not yet approved by admin)."
-            return {"success": False, "message": "ไม่สามารถสร้าง QR Code ได้ ต้องรอให้แอดมินอนุมัติเนื้อหาก่อน"}
+            return {"success": False, "message": "Cannot generate a QR code. Please wait until an admin approves the content."}
         else:
             log_message += " (Invalid status for QR generation)."
-            return {"success": False, "message": "ไม่สามารถสร้าง QR Code ได้ สถานะคำสั่งซื้อไม่ถูกต้อง"}
+            return {"success": False, "message": "Cannot generate a QR code. Invalid order status."}
         print(log_message)
 
     amount = float(order["amount"])
     if promptpay_qrcode is None:
         print(f"❌ [ERROR] promptpay_qrcode library not found.")
-        return {"success": False, "message": "ไม่พบไลบรารี promptpay กรุณาติดตั้งก่อน"}
+        return {"success": False, "message": "PromptPay library not found. Please install it first."}
 
     promptpay_id = os.getenv("PROMPTPAY_ID")
     if not promptpay_id:
         print(f"❌ [ERROR] PROMPTPAY_ID environment variable not set.")
-        return {"success": False, "message": "ไม่พบ PromptPay ID ในการตั้งค่า"}
+        return {"success": False, "message": "PromptPay ID not found in settings."}
 
     original_scannable_payload = promptpay_qrcode.generate_payload(promptpay_id, amount)
 
     if not update_order_with_promptpay_payload_db(order_id, original_scannable_payload):
         print(f"❌ [ERROR] Failed to save QR Code payload to database for order {order_id}.")
-        return {"success": False, "message": "ไม่สามารถบันทึกข้อมูล QR Code ลงฐานข้อมูลได้"}
+        return {"success": False, "message": "Failed to save QR code data to the database."}
 
     print(f"✅ Generated PromptPay payload (stored in DB): {original_scannable_payload}")
     qr = qrcode.QRCode(
@@ -771,7 +771,7 @@ def generate_promptpay_qr_for_order(order_id):
     else:
         img.save(buffered, "PNG")
     img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    return {"success": True, "message": "สร้าง QR Code สำเร็จ", "qrcode_base64": img_b64, "payload": original_scannable_payload}
+    return {"success": True, "message": "QR code generated successfully.", "qrcode_base64": img_b64, "payload": original_scannable_payload}
 
 # ฟังก์ชันนี้ใช้ตรวจสอบว่าคำสั่งซื้อ (Order) สามารถอัปโหลดสลิปได้หรือไม่
 # โดยพิจารณาจากสถานะของคำสั่งซื้อว่าเป็นโฆษณาใหม่ที่ได้รับการอนุมัติ หรือโฆษณาต่ออายุที่รอชำระ
@@ -788,7 +788,7 @@ def can_upload_slip(order):
 # เพื่อให้แสดงผลวันที่ในรูปแบบที่เข้าใจง่ายสำหรับผู้ใช้
 def format_thai_date(date_obj):
     if not isinstance(date_obj, (datetime, date, str)):
-        return "วันที่ไม่ถูกต้อง"
+        return "Incorrect Format"
 
     if isinstance(date_obj, str):
         try:
@@ -800,7 +800,7 @@ def format_thai_date(date_obj):
                 try:
                     date_obj = datetime.strptime(date_obj, '%Y-%m-%d').date()
                 except ValueError:
-                    return "วันที่ไม่ถูกต้อง"
+                    return "Incorrect Format"
 
     if isinstance(date_obj, date) and not isinstance(date_obj, datetime):
         date_obj = datetime(date_obj.year, date_obj.month, date_obj.day)
@@ -1090,14 +1090,25 @@ def check_ads_expiring_soon(db, today_date: date = None):
         except: pass
 
 
-# ตั้ง scheduler ให้รันทุกวัน 00:00 Asia/Bangkok
-def start_expiry_scheduler(db):
+# เดิม: def start_expiry_scheduler(db):
+def start_expiry_scheduler(app, db):
     tz = pytz.timezone('Asia/Bangkok')
     sched = BackgroundScheduler(timezone=tz)
-    # cron ที่เวลา 00:00 ทุกวัน
-    sched.add_job(lambda: check_ads_expiring_soon(db), 'cron', hour=0, minute=0)
+
+    def job():
+        # ต้องมี app context ทุกครั้งที่แตะ db.engine / session
+        with app.app_context():
+            inserted, _ = check_ads_expiring_soon(db)
+            if inserted == 0:
+                print("[CRON] no eligible ads (already notified today or none match)")
+            else:
+                print(f"[CRON] notified {inserted} ad(s) for expiring_soon")
+
+    # รัน 00:00 เวลาไทยทุกวัน
+    sched.add_job(job, 'cron', hour=0, minute=0)
     sched.start()
     print("⏰ Expiry scheduler started (runs 00:00 Asia/Bangkok)")
+
 
 
 # ==================== FLASK ROUTES ====================
@@ -1114,11 +1125,11 @@ def create_post():
         photos = request.files.getlist('photo')
         videos = request.files.getlist('video')
 
-        # ตรวจสอบ user_id: ต้องมี user_id ถึงจะสร้างโพสต์ได้งับ
+        # ตรวจสอบ user_id: ต้องมี user_id ถึงจะสร้างโพสต์ได้
         if not user_id:
             return jsonify({"error": "You are not authorized to create a post for this user"}), 403
 
-        # เริ่มต้นประมวลผลรูปภาพที่อัปโหลดงับ
+        # เริ่มต้นประมวลผลรูปภาพที่อัปโหลด
         photo_urls = []
         invalid_photos = []
         
@@ -1138,11 +1149,11 @@ def create_post():
                 
                 if is_nude:
                     print(f"NSFW detected in {filename}")
-                    # ลบไฟล์ภาพที่ไม่เหมาะสมที่ถูกตรวจพบงับ
+                    # ลบไฟล์ภาพที่ไม่เหมาะสมที่ถูกตรวจพบ
                     if os.path.exists(photo_path):
                         os.remove(photo_path)
                     
-                    # เก็บข้อมูลภาพที่ไม่เหมาะสมเพื่อนแจ้งกลับไปที่ Client งับ
+                    # เก็บข้อมูลภาพที่ไม่เหมาะสมเพื่อนแจ้งกลับไปที่ Client 
                     invalid_photos.append({
                         "filename": filename,
                         "reason": "พบภาพโป๊ (Hentai หรือ Pornography > 20%)",
@@ -1154,16 +1165,16 @@ def create_post():
                     
             except Exception as e:
                 print(f"Error processing photo {photo.filename}: {e}")
-                # หากประมวลผลผิดพลาด ให้ลบไฟล์แล้วแจ้งเตือนงับ
+                # หากประมวลผลผิดพลาด ให้ลบไฟล์แล้วแจ้งเตือน
                 if 'photo_path' in locals() and os.path.exists(photo_path):
                     os.remove(photo_path)
                 invalid_photos.append({
                     "filename": photo.filename,
-                    "reason": "ไม่สามารถประมวลผลภาพได้",
+                    "reason": "Unable to process the image.",
                     "details": {"error": str(e)}
                 })
         
-        # หากมีภาพที่ไม่เหมาะสม ให้แจ้งเตือนและยกเลิกการสร้างโพสต์งับ
+        # หากมีภาพที่ไม่เหมาะสม ให้แจ้งเตือนและยกเลิกการสร้างโพสต์
         print(f"Invalid photos found: {len(invalid_photos)}")
         print(f"Valid photos: {len(photo_urls)}")
         
@@ -1176,7 +1187,7 @@ def create_post():
                 "valid_photos": photo_urls
             }), 400
 
-        # ประมวลผล URL ของวิดีโอที่อัปโหลดงับ
+        # ประมวลผล URL ของวิดีโอที่อัปโหลด
         video_urls = []
         for video in videos:
             if not video or not video.filename:
@@ -1189,15 +1200,15 @@ def create_post():
         photo_urls_json = json.dumps(photo_urls)
         video_urls_json = json.dumps(video_urls)
 
-        # เริ่มบันทึกข้อมูลลงฐานข้อมูล MySQL งับ
+        # เริ่มบันทึกข้อมูลลงฐานข้อมูล MySQL 
         try:
-            # สร้าง SQL query สำหรับเพิ่มโพสต์ใหม่งับ
+            # สร้าง SQL query สำหรับเพิ่มโพสต์ใหม่
             insert_query = text("""
                 INSERT INTO posts (user_id, Title, content, ProductName, CategoryID, photo_url, video_url, status, updated_at)
                 VALUES (:user_id, :title, :content, :product_name, :category_id, :photo_urls, :video_urls, 'active', NOW())
             """)
             
-            # รัน query งับ
+            # รัน query 
             result = db.session.execute(insert_query, {
                 'user_id': user_id,
                 'title': title,
@@ -1208,10 +1219,10 @@ def create_post():
                 'video_urls': video_urls_json
             })
             
-            # Commit การเปลี่ยนแปลงลงฐานข้อมูลงับ
+            # Commit การเปลี่ยนแปลงลงฐานข้อมูล
             db.session.commit()
             
-            # ดึง post_id ที่เพิ่งสร้างงับ
+            # ดึง post_id ที่เพิ่งสร้าง
             post_id = result.lastrowid
             
             print(f"Post created successfully with ID: {post_id}, {len(photo_urls)} photos and {len(video_urls)} videos")
@@ -1245,11 +1256,11 @@ def update_post(id):
         CategoryID = request.form.get('CategoryID')
         user_id = request.form.get('user_id')
         
-        # รับรูปภาพและวิดีโอที่มีอยู่เดิม (ถ้ามี) จาก JSON string งับ
+        # รับรูปภาพและวิดีโอที่มีอยู่เดิม (ถ้ามี) จาก JSON string 
         existing_photos_str = request.form.get('existing_photos')
         existing_videos_str = request.form.get('existing_videos')
         
-        # แปลง JSON string เป็น Python list งับ
+        # แปลง JSON string เป็น Python list 
         existing_photos = json.loads(existing_photos_str) if existing_photos_str else []
         existing_videos = json.loads(existing_videos_str) if existing_videos_str else []
         
@@ -1259,26 +1270,26 @@ def update_post(id):
         if not user_id:
             return jsonify({"error": "You are not authorized to update this post"}), 403
 
-        # รวมรูปภาพเดิมและรูปภาพใหม่ที่อัปโหลดงับ
+        # รวมรูปภาพเดิมและรูปภาพใหม่ที่อัปโหลด
         photo_urls = existing_photos if existing_photos else []
         invalid_photos = []
 
         for photo in photos:
-            photo_path = None # กำหนด photo_path ไว้ก่อนเริ่ม try block งับ
+            photo_path = None # กำหนด photo_path ไว้ก่อนเริ่ม try block 
             if not photo or not photo.filename:
                 continue
                 
             try:
                 filename = secure_filename(photo.filename)
                 photo_path = os.path.join(UPLOAD_FOLDER, filename)
-                photo.save(photo_path) # บันทึกไฟล์ก่อนตรวจสอบ AI งับ
+                photo.save(photo_path) # บันทึกไฟล์ก่อนตรวจสอบ AI 
 
                 print(f"Processing new photo for update: {filename}")
                 is_nude, result = nude_predict_image(photo_path)
                 
                 if is_nude:
                     print(f"NSFW detected in {filename} during update")
-                    # ลบไฟล์ภาพที่ไม่เหมาะสมทันทีงับ
+                    # ลบไฟล์ภาพที่ไม่เหมาะสมทันที
                     if os.path.exists(photo_path):
                         os.remove(photo_path)
                     
@@ -1293,16 +1304,16 @@ def update_post(id):
                                         
             except Exception as e:
                 print(f"Error processing photo {photo.filename} during update: {e}")
-                # หากเกิดข้อผิดพลาด ให้ลบไฟล์แล้วแจ้งเตือนงับ
+                # หากเกิดข้อผิดพลาด ให้ลบไฟล์แล้วแจ้งเตือน
                 if photo_path and os.path.exists(photo_path): 
                     os.remove(photo_path)
                 invalid_photos.append({
                     "filename": photo.filename,
-                    "reason": "ไม่สามารถประมวลผลภาพได้",
+                    "reason": "Unable to process the image.",
                     "details": {"error": str(e)}
                 })
         
-        # หากมีภาพที่ไม่เหมาะสม ให้แจ้งเตือนและไม่อัปเดตโพสต์งับ
+        # หากมีภาพที่ไม่เหมาะสม ให้แจ้งเตือนและไม่อัปเดตโพสต์
         if invalid_photos:
             print("แจ้งเตือน user: พบภาพไม่เหมาะสมในระหว่างการอัปเดต")
             return jsonify({
@@ -1312,7 +1323,7 @@ def update_post(id):
                 "valid_photos": photo_urls
             }), 400
 
-        # รวมวิดีโอเดิมและวิดีโอใหม่ที่อัปโหลดงับ
+        # รวมวิดีโอเดิมและวิดีโอใหม่ที่อัปโหลด
         video_urls = existing_videos if existing_videos else []
         for video in videos:
             if not video or not video.filename:
@@ -1325,9 +1336,9 @@ def update_post(id):
         photo_urls_json = json.dumps(photo_urls)
         video_urls_json = json.dumps(video_urls)
 
-        # เริ่มอัปเดตข้อมูลในฐานข้อมูล MySQL งับ
+        # เริ่มอัปเดตข้อมูลในฐานข้อมูล MySQL 
         try:
-            # สร้าง SQL query สำหรับอัปเดตโพสต์งับ
+            # สร้าง SQL query สำหรับอัปเดตโพสต์
             update_query = text("""
                 UPDATE posts 
                 SET Title = :title, content = :content, ProductName = :product_name, 
@@ -1336,7 +1347,7 @@ def update_post(id):
                 WHERE id = :post_id AND user_id = :user_id
             """)
             
-            # รัน query งับ
+            # รัน query 
             result = db.session.execute(update_query, {
                 'post_id': id,
                 'user_id': user_id,
@@ -1348,10 +1359,10 @@ def update_post(id):
                 'video_urls': video_urls_json
             })
             
-            # Commit การเปลี่ยนแปลงงับ
+            # Commit การเปลี่ยนแปลง
             db.session.commit()
             
-            # ตรวจสอบว่ามีแถวที่ถูกอัปเดตหรือไม่ ถ้าไม่มีแปลว่าไม่พบโพสต์หรืองับ
+            # ตรวจสอบว่ามีแถวที่ถูกอัปเดตหรือไม่ ถ้าไม่มีแปลว่าไม่พบโพสต์หรือ
             if result.rowcount == 0:
                 return jsonify({"error": "ไม่พบโพสต์หรือไม่มีสิทธิ์อัปเดต"}), 404
             
@@ -1378,7 +1389,7 @@ def update_post(id):
 
 
 @app.route("/ai/users/<int:userId>/profile", methods=['PUT'])
-# @verifyToken # อย่าลืมเปิดใช้งาน middleware นี้ด้วยนะงับ
+# @verifyToken # อย่าลืมเปิดใช้งาน middleware นี้ด้วยนะ
 def update_user_profile(userId):
     try:
         username = request.form.get('username')
@@ -1390,24 +1401,24 @@ def update_user_profile(userId):
 
         if not all([username, bio, gender, birthday_str]):
             return jsonify({
-                "error": "กรุณากรอกข้อมูลให้ครบทุกช่องงับ: ชื่อผู้ใช้, ไบโอ, เพศ, และวันเกิด"
+                "error": "Please fill out all required fields: Username, Bio, Gender, and Date of Birth."
             }), 400
 
-        # จัดการและตรวจสอบรูปแบบวันเกิดงับ
+        # จัดการและตรวจสอบรูปแบบวันเกิด
         birthday = None
         date_formats = [
-            "%Y-%m-%d",    # รูปแบบหลักจาก Front-end งับ
-            "%d/%m/%Y",    # เผื่อไว้สำหรับรูปแบบอื่น ๆ งับ
+            "%Y-%m-%d",    # รูปแบบหลักจาก Front-end 
+            "%d/%m/%Y",    # เผื่อไว้สำหรับรูปแบบอื่น ๆ 
             "%m/%d/%Y",
             "%Y/%m/%d",
             "%d-%m-%Y",
         ]
         
-        # ลอง parse แบบ ISO standard ที่ไม่ขึ้นกับ locale งับ
+        # ลอง parse แบบ ISO standard ที่ไม่ขึ้นกับ locale 
         try:
             birthday = datetime.fromisoformat(birthday_str).strftime("%Y-%m-%d")
         except ValueError:
-            # ถ้าจาก fromisoformat ไม่ได้ผล ให้ลองวิธีอื่น ๆ งับ
+            # ถ้าจาก fromisoformat ไม่ได้ผล ให้ลองวิธีอื่น ๆ 
             for fmt in date_formats:
                 try:
                     birthday = datetime.strptime(birthday_str, fmt).strftime("%Y-%m-%d")
@@ -1416,9 +1427,9 @@ def update_user_profile(userId):
                     continue
 
         if birthday is None:
-            return jsonify({"error": "รูปแบบวันเกิดไม่ถูกต้อง โปรดระบุในรูปแบบ YYYY-MM-DD"}), 400
+            return jsonify({"error": "Invalid date of birth format. Please use the format: **YYYY-MM-DD**. "}), 400
         
-        # จัดการและตรวจสอบรูปภาพโปรไฟล์ด้วย AI งับ
+        # จัดการและตรวจสอบรูปภาพโปรไฟล์ด้วย AI 
         profile_image_path = None
         if profile_image_file and profile_image_file.filename:
             try:
@@ -1450,7 +1461,7 @@ def update_user_profile(userId):
                     "details": str(e)
                 }), 500
 
-        # ตรวจสอบว่า username ซ้ำกับคนอื่นไหมงับ (ยกเว้นตัวเอง)
+        # ตรวจสอบว่า username ซ้ำกับคนอื่นไหม (ยกเว้นตัวเอง)
         check_username_query = text("""
             SELECT id FROM users WHERE username = :username AND id != :user_id
         """)
@@ -1460,9 +1471,9 @@ def update_user_profile(userId):
         }).fetchall()
 
         if len(check_results) > 0:
-            return jsonify({"error": "ชื่อผู้ใช้นี้มีคนใช้แล้วงับ"}), 400
+            return jsonify({"error": "ชื่อผู้ใช้นี้มีคนใช้แล้ว"}), 400
 
-        # สร้าง SQL query สำหรับอัปเดตโปรไฟล์งับ
+        # สร้าง SQL query สำหรับอัปเดตโปรไฟล์
         update_profile_query = """
             UPDATE users SET username = :username, bio = :bio, gender = :gender, birthday = :birthday
         """
@@ -1474,7 +1485,7 @@ def update_user_profile(userId):
             'user_id': userId
         }
 
-        # ถ้ามีรูปโปรไฟล์ใหม่ ก็เพิ่มใน query งับ
+        # ถ้ามีรูปโปรไฟล์ใหม่ ก็เพิ่มใน query 
         if profile_image_path:
             update_profile_query += ", picture = :picture"
             update_data['picture'] = profile_image_path
@@ -1482,15 +1493,15 @@ def update_user_profile(userId):
         update_profile_query += " WHERE id = :user_id"
 
         try:
-            # รัน query และ commit การเปลี่ยนแปลงงับ
+            # รัน query และ commit การเปลี่ยนแปลง
             result = db.session.execute(text(update_profile_query), update_data)
             db.session.commit()
 
             if result.rowcount == 0:
-                return jsonify({"error": "ไม่พบผู้ใช้หรือไม่มีการเปลี่ยนแปลงข้อมูลงับ"}), 404
+                return jsonify({"error": "ไม่พบผู้ใช้หรือไม่มีการเปลี่ยนแปลงข้อมูล"}), 404
 
             return jsonify({
-                "message": "อัปเดตโปรไฟล์สำเร็จงับ",
+                "message": "อัปเดตโปรไฟล์สำเร็จ",
                 "profileImage": profile_image_path if profile_image_path else "No new image uploaded",
                 "username": username,
                 "bio": bio,
@@ -1515,16 +1526,16 @@ def recommend():
         user_id = request.user_id
         now = datetime.now()
 
-        # ตรวจสอบว่ามีการร้องขอ refresh หรือไม่ (จาก client) งับ
+        # ตรวจสอบว่ามีการร้องขอ refresh หรือไม่ (จาก client) 
         refresh_requested = request.args.get('refresh', 'false').lower() == 'true'
 
         if refresh_requested:
-            # ลบข้อมูล cache สำหรับ user นี้ เพื่อให้ระบบคำนวณใหม่ งับ
+            # ลบข้อมูล cache สำหรับ user นี้ เพื่อให้ระบบคำนวณใหม่ 
             if user_id in recommendation_cache:
                 del recommendation_cache[user_id]
             print(f"Cache for user_id: {user_id} invalidated due to client-side refresh request. Impression history RETAINED.") 
 
-        # ตรวจสอบ Cache ปกติ ถ้าข้อมูลยังสดใหม่ ก็ใช้จาก cache เลยงับ
+        # ตรวจสอบ Cache ปกติ ถ้าข้อมูลยังสดใหม่ ก็ใช้จาก cache เลย
         if user_id in recommendation_cache and not refresh_requested: 
             cached_data, cache_timestamp = recommendation_cache[user_id]
             if (now - cache_timestamp).total_seconds() < (CACHE_EXPIRY_TIME_SECONDS / 2):
@@ -1532,16 +1543,16 @@ def recommend():
                 return jsonify(cached_data)
             print(f"Cached recommendations for user_id: {user_id} are still valid but slightly old. Recalculating for freshness.")
 
-        # โหลดข้อมูลที่จำเป็นสำหรับการแนะนำโพสต์จากฐานข้อมูลงับ
+        # โหลดข้อมูลที่จำเป็นสำหรับการแนะนำโพสต์จากฐานข้อมูล
         content_based_data, collaborative_data = load_data_from_db()
 
         try:
-            # โหลดโมเดล AI ที่ใช้ในการแนะนำงับ
+            # โหลดโมเดล AI ที่ใช้ในการแนะนำ
             knn = joblib.load('KNN_Model.pkl')
             collaborative_model = joblib.load('Collaborative_Model.pkl')
             tfidf = joblib.load('TFIDF_Model.pkl')
             
-            # ตรวจสอบและประมวลผลข้อมูล Engagement และ Comment ก่อนส่งให้โมเดลใช้ งับ
+            # ตรวจสอบและประมวลผลข้อมูล Engagement และ Comment ก่อนส่งให้โมเดลใช้ 
             if 'NormalizedEngagement' not in content_based_data.columns:
                 content_based_data = normalize_engagement(content_based_data, user_column='owner_id', engagement_column='PostEngagement')
             
@@ -1560,12 +1571,12 @@ def recommend():
             print(f"Error loading models: {e}")
             return jsonify({"error": "Model files not found"}), 500
 
-        # กำหนดหมวดหมู่ของสินค้าที่ใช้ในการแนะนำงับ
+        # กำหนดหมวดหมู่ของสินค้าที่ใช้ในการแนะนำ
         categories = [
             'Electronics_Gadgets', 'Furniture', 'Outdoor_Gear', 'Beauty_Products', 'Accessories'
         ]
 
-        # คำนวณคำแนะนำแบบ Hybrid (Content-based + Collaborative Filtering) งับ
+        # คำนวณคำแนะนำแบบ Hybrid (Content-based + Collaborative Filtering) 
         recommendations = recommend_hybrid(
             user_id,
             content_based_data,
@@ -1580,14 +1591,14 @@ def recommend():
         if not recommendations:
             return jsonify({"error": "No recommendations found"}), 404
 
-        # ดึงประวัติการมีปฏิสัมพันธ์ของ user เพื่อกรองโพสต์ที่ไม่ควรแนะนำซ้ำ งับ
+        # ดึงประวัติการมีปฏิสัมพันธ์ของ user เพื่อกรองโพสต์ที่ไม่ควรแนะนำซ้ำ 
         user_interactions = collaborative_data[collaborative_data['user_id'] == user_id]['post_id'].tolist()
         
-        # ดึงประวัติการเห็นโพสต์ (impression history) ของ user งับ
+        # ดึงประวัติการเห็นโพสต์ (impression history) ของ user 
         current_impression_history = impression_history_cache.get(user_id, [])
         print(f"Current Impression History for user {user_id}: {[entry['post_id'] for entry in current_impression_history]}")
 
-        # กรองและจัดอันดับคำแนะนำสุดท้าย พร้อมส่งจำนวนโพสต์ทั้งหมดใน DB ด้วยงับ
+        # กรองและจัดอันดับคำแนะนำสุดท้าย พร้อมส่งจำนวนโพสต์ทั้งหมดใน DB ด้วย
         final_recommendations_ids = split_and_rank_recommendations(
             recommendations, 
             user_interactions, 
@@ -1595,7 +1606,7 @@ def recommend():
             len(content_based_data) 
         )
         
-        # สร้าง SQL query เพื่อดึงข้อมูลโพสต์ที่แนะนำจาก DB งับ
+        # สร้าง SQL query เพื่อดึงข้อมูลโพสต์ที่แนะนำจาก DB 
         placeholders = ', '.join([f':id_{i}' for i in range(len(final_recommendations_ids))])
         query = text(f"""
             SELECT posts.*, users.username, users.picture,
@@ -1609,7 +1620,7 @@ def recommend():
         result = db.session.execute(query, params).fetchall()
         posts = [row._mapping for row in result]
 
-        # จัดเรียงโพสต์ที่ได้จาก DB ตามลำดับที่ AI แนะนำงับ
+        # จัดเรียงโพสต์ที่ได้จาก DB ตามลำดับที่ AI แนะนำ
         sorted_posts = sorted(posts, key=lambda x: final_recommendations_ids.index(x['id']))
 
         output = []
@@ -1627,10 +1638,10 @@ def recommend():
                 "is_liked": post['is_liked'] > 0
             })
 
-        # เก็บผลลัพธ์ลง Cache งับ
+        # เก็บผลลัพธ์ลง Cache 
         recommendation_cache[user_id] = (output, now)
 
-        # อัปเดต Impression History ของ user งับ
+        # อัปเดต Impression History ของ user 
         if user_id not in impression_history_cache:
             impression_history_cache[user_id] = []
         
@@ -1667,13 +1678,13 @@ def api_generate_qrcode(order_id):
     จะสร้าง QR Code ได้หากคำสั่งซื้อเป็นโฆษณาใหม่ที่ 'approved'
     หรือเป็นคำสั่งซื้อต่ออายุที่ 'pending'.
     """
-    # เรียกใช้ฟังก์ชัน generate_promptpay_qr_for_order ที่ได้รับการปรับแก้แล้วงับ
+    # เรียกใช้ฟังก์ชัน generate_promptpay_qr_for_order ที่ได้รับการปรับแก้แล้ว
     result = generate_promptpay_qr_for_order(order_id)
     if not result['success']:
-        # หากไม่สำเร็จ จะส่งข้อความผิดพลาดและสถานะ HTTP 400 งับ
+        # หากไม่สำเร็จ จะส่งข้อความผิดพลาดและสถานะ HTTP 400 
         return jsonify(result), 400
     
-    # หากสำเร็จ จะส่งข้อมูล QR Code และ payload กลับไปงับ
+    # หากสำเร็จ จะส่งข้อมูล QR Code และ payload กลับไป
     return jsonify({
         'success': True,
         'order_id': order_id,
@@ -1746,7 +1757,5 @@ def start_scheduler_once():
         _scheduler_started = True
 
 if __name__ == '__main__':
-    # ป้องกันการรันซ้ำเมื่อ Flask debug reloader สตาร์ทสองครั้ง
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not app.debug:
-        start_scheduler_once()
+    start_expiry_scheduler(app, db)   # <- ต้องส่ง app เข้าไป
     app.run(host='0.0.0.0', port=5005)
