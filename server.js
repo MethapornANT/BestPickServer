@@ -888,7 +888,7 @@ app.post("/api/google-signin", async (req, res) => {
           const insertSql =
             "INSERT INTO users (google_id, email, username, status, role) VALUES (?, ?, '', 'active', 'user')";
           pool.query(insertSql, [googleId, email], (err, result) => {
-            // นี่คือบรรทัดที่ 756 ที่งับเจอ Error:
+            // นี่คือบรรทัดที่ 756 ที่เจอ Error:
             if (err) {
               console.error("Original database error during user insertion:", err); // <<-- เพิ่มบรรทัดนี้
               throw new Error("Database error during user insertion");
@@ -2509,10 +2509,10 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
                       });
                   }
                   console.log(`[INFO] Ad ${renewAdsId} successfully renewed and set to 'active' via order ${orderId}.`);
-                  console.log(`[INFO] Your ad has been renewed. ${duration_days} วันแล้วงับ!`); // เพิ่ม log ตรงนี้
+                  console.log(`[INFO] Your ad has been renewed ${duration_days} days!`); // เพิ่ม log ตรงนี้
 
                   // เพิ่มการแจ้งเตือนหลังต่ออายุสำเร็จ (ข้อความใหม่)
-                  const notiMsg = `Your ad has been renewed. ${duration_days} วัน สำเร็จแล้ว`;
+                  const notiMsg = `Your ad has been renewed ${duration_days} days!.`;
                   connection.query(
                     `SELECT user_id FROM ads WHERE id = ?`,
                     [renewAdsId],
