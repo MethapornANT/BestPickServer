@@ -2428,14 +2428,14 @@ app.post("/api/ads/:id/notify-status-change", verifyToken, (req, res) => {
   const getAdSql = `SELECT * FROM ads WHERE id = ?`;
   pool.query(getAdSql, [adId], (adErr, adResults) => {
     if (adErr || adResults.length === 0) {
-      return res.status(404).json({ error: "ไม่พบโฆษณานี้" });
+      return res.status(404).json({ error: "Ad not found" });
     }
     const ad = adResults[0];
 
     // สร้างข้อความแจ้งเตือน
-    let content = `โฆษณาของคุณ (${ad.title}) มีการเปลี่ยนสถานะเป็น "${new_status}"`;
+    let content = `Your Ad (${ad.title}) Has change to "${new_status}"`;
     if (new_status === "rejected" && admin_notes) {
-      content += `\nเหตุผลที่ถูกปฏิเสธ: ${admin_notes}`;
+      content += `\nReason: ${admin_notes}`;
     }
 
     // เพิ่ม notification
@@ -2448,9 +2448,9 @@ app.post("/api/ads/:id/notify-status-change", verifyToken, (req, res) => {
       [ad.user_id, "ads_status_change", content],
       (notiErr, notiResults) => {
         if (notiErr) {
-          return res.status(500).json({ error: "บันทึกแจ้งเตือนไม่สำเร็จ" });
+          return res.status(500).json({ error: "Failed to save notification" });
         }
-        res.status(201).json({ message: "แจ้งเตือนสถานะโฆษณาสำเร็จ" });
+        res.status(201).json({ message: "Ad status notification sent successfully" });
       }
     );
   });
@@ -2462,7 +2462,7 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
   if (!canUpload) {
       return connection.rollback(() => {
           connection.release();
-          res.status(400).json({ error: 'ไม่สามารถอัปโหลดสลิปได้ เนื่องจากสถานะไม่ถูกต้อง' });
+          res.status(400).json({ error: 'Cannot upload slip due to invalid status' });
       });
   }
 
@@ -2472,7 +2472,7 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
           return connection.rollback(() => {
               connection.release();
               console.error(`[ERROR] Database error updating slip_image for order ${orderId}:`, updateOrderErr);
-              res.status(500).json({ error: 'เกิดข้อผิดพลาดในการบันทึกสลิป' });
+              res.status(500).json({ error: 'Error saving slip' });
           });
       }
 
@@ -2483,7 +2483,7 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
                   console.error(`[ERROR] Failed to get duration for package ${packageId} on order ${orderId}:`, durationErr || 'No package info found');
                   return connection.commit(() => {
                       connection.release();
-                      res.json({ message: 'อัปโหลดสลิปสำเร็จ แต่มีปัญหาในการต่ออายุโฆษณา กรุณาติดต่อแอดมิน', slip_path: slipImagePath });
+                      res.json({ message: 'Slip uploaded successfully, but there was a problem renewing the ad. Please contact admin', slip_path: slipImagePath });
                   });
               }
               const duration_days = durationResults[0].duration_days;
@@ -2495,7 +2495,6 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
               const updateAdsSql = `
                   UPDATE ads
                   SET status = 'active',
-                      -- ไม่ต้องอัปเดต show_at ถ้าเป็นการต่ออายุ เพราะ show_at คือวันเริ่มแสดงครั้งแรก
                       expiration_date = ?,
                       updated_at = NOW()
                   WHERE id = ?;
@@ -2506,14 +2505,14 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
                       console.error(`[ERROR] Database error updating ad ${renewAdsId} for order ${orderId}:`, updateAdsErr);
                       return connection.commit(() => {
                           connection.release();
-                          res.json({ message: 'อัปโหลดสลิปสำเร็จ แต่มีปัญหาในการต่ออายุโฆษณา กรุณาติดต่อแอดมิน', slip_path: slipImagePath });
+                          res.json({ message: 'Slip uploaded successfully, but there was a problem renewing the ad. Please contact admin', slip_path: slipImagePath });
                       });
                   }
                   console.log(`[INFO] Ad ${renewAdsId} successfully renewed and set to 'active' via order ${orderId}.`);
-                  console.log(`[INFO] โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันแล้วงับ!`); // เพิ่ม log ตรงนี้
+                  console.log(`[INFO] Your ad has been renewed. ${duration_days} วันแล้วงับ!`); // เพิ่ม log ตรงนี้
 
                   // เพิ่มการแจ้งเตือนหลังต่ออายุสำเร็จ (ข้อความใหม่)
-                  const notiMsg = `โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วัน สำเร็จแล้ว`;
+                  const notiMsg = `Your ad has been renewed. ${duration_days} วัน สำเร็จแล้ว`;
                   connection.query(
                     `SELECT user_id FROM ads WHERE id = ?`,
                     [renewAdsId],
@@ -2530,16 +2529,16 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
                                         console.log(`[INFO] Sent notification for renewed ad ID ${renewAdsId}`);
                                     }
                                     connection.commit(() => {
-                                        connection.release();
-                                        res.json({ message: `อัปโหลดสลิปสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันเรียบร้อยแล้ว`, slip_path: slipImagePath });
-                                    });
-                                }
-                            );
-                        } else {
-                            connection.commit(() => {
-                                connection.release();
-                                res.json({ message: `อัปโหลดสลิปสำเร็จ! โฆษณาของคุณได้รับการต่ออายุเพิ่มอีก ${duration_days} วันเรียบร้อยแล้ว`, slip_path: slipImagePath });
-                            });
+                                      connection.release();
+                                      res.json({ message: `Slip uploaded successfully! Your ad has been renewed for ${duration_days} days.`, slip_path: slipImagePath });
+                                  });
+                              }
+                          );
+                      } else {
+                          connection.commit(() => {
+                              connection.release();
+                              res.json({ message: `Slip uploaded successfully! Your ad has been renewed for ${duration_days} days.`, slip_path: slipImagePath });
+                          });
                         }
                     }
                   );
@@ -2569,7 +2568,7 @@ function proceedUpdateOrderAndAd(connection, orderId, slipImagePath, renewAdsId,
                   }
                   connection.commit(() => {
                       connection.release();
-                      res.json({ message: 'อัปโหลดสลิปสำเร็จ! กรุณารอแอดมินตรวจสอบสลิป', slip_path: slipImagePath });
+                      res.json({ message: 'Slip uploaded successfully! Please wait for admin to review the slip', slip_path: slipImagePath });
                   });
               });
           });
@@ -2637,7 +2636,7 @@ function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
                           const formattedExpirationDate = formatThaiDate(expiration_date);
 
                           // สร้างข้อความแจ้งเตือนการต่ออายุที่ละเอียดขึ้น
-                          content = `โฆษณาของคุณได้รับการต่ออายุ ${renewedDays} วันสำเร็จแล้ว โฆษณานี้ขยายหมดอายุเป็นวันที่ ${formattedExpirationDate}`;
+                          content = `Your ad has been successfully renewed for ${renewedDays} days. The new expiration date is ${formattedExpirationDate}.`;
 
                           // ขั้นตอนสุดท้าย: บันทึกข้อมูลการแจ้งเตือนลงในตาราง notifications
                           pool.query(
@@ -2652,26 +2651,26 @@ function notifyAdsStatusChange(adId, newStatus, adminNotes = null, callback) {
                   // ให้ใช้ switch case เดิม เพื่อกำหนดข้อความตามสถานะปกติ
                   switch (newStatus) {
                       case 'approved':
-                          content = 'โฆษณาของคุณได้รับการตรวจสอบแล้ว กรุณาโอนเงินเพื่อแสดงโฆษณา';
+                          content = 'Your ad has been reviewed. Please transfer payment to display it.';
                           break;
                       case 'active':
                           // ข้อความนี้จะใช้เฉพาะกรณีที่ 'active' แต่ไม่ใช่การต่ออายุครั้งแรก
-                          content = 'โฆษณาของคุณได้รับการอนุมัติขึ้นแสดงแล้ว';
+                          content = 'Your ad has been approved for display.';
                           break;
                       case 'rejected':
-                          content = `โฆษณาของคุณถูกปฏิเสธ เหตุผล: ${adminNotes || '-'}`;
+                          content = `Your ad was rejected. Reason: ${adminNotes || '-'}`;
                           break;
                       case 'paid':
-                          content = 'โฆษณาของคุณชำระเงินเรียบร้อยแล้ว รอแอดมินตรวจสอบ';
+                          content = 'Your ad payment has been completed. Waiting for admin review.';
                           break;
                       case 'expired':
-                          content = 'โฆษณาของคุณหมดอายุแล้ว';
+                          content = 'Your ad has expired.';
                           break;
                       case 'expiring_soon':
-                          content = 'โฆษณาของคุณจะหมดอายุในอีก 3 วัน กรุณาต่ออายุเพื่อการแสดงผลอย่างต่อเนื่อง';
+                          content = 'Your ad will expire in 3 days. Please renew to ensure continuous display.';
                           break;
                       default:
-                          content = `สถานะโฆษณาของคุณเปลี่ยนเป็น ${newStatus}`;
+                          content = `Your ad status has changed to ${newStatus}`;
                   }
 
                   // ขั้นตอนสุดท้าย: บันทึกข้อมูลการแจ้งเตือนลงในตาราง notifications
@@ -3367,7 +3366,7 @@ app.put("/api/admin/ads/:id", authenticateToken, authorizeAdmin, upload.single('
         if (err) console.error('Error deleting uploaded image:', err);
       });
     }
-    return res.status(400).json({ error: 'กรุณาระบุเหตุผล (admin_notes) เมื่อปฏิเสธโฆษณา' });
+    return res.status(400).json({ error: 'Please provide a reason (admin_notes) when rejecting the ad' });
   }
 
   const updateFields = [];
@@ -4222,22 +4221,30 @@ app.put("/api/admin/update/poststatus", authenticateToken, authorizeAdmin, (req,
 app.use('/api/Slip', express.static(path.join(__dirname, 'Slip')));
 
 
-// APi สำหรับแอดมินดูข้อมูลออเดอร์ทั้งหมด (Admin only)
+// API สำหรับแอดมินดูข้อมูลออเดอร์ทั้งหมด (Admin only)
 app.get("/api/admin/orders", authenticateToken, authorizeAdmin, (req, res) => {
   const sql = `
-      SELECT o.*, o.slip_image, a.title, a.content, a.link, a.image, a.status AS ad_status
-      FROM orders o
-      LEFT JOIN ads a ON o.id = a.order_id
-      ORDER BY o.created_at DESC
+    SELECT
+      o.*,
+      COALESCE(a_new.title,  a_renew.title)   AS title,
+      COALESCE(a_new.content,a_renew.content) AS content,
+      COALESCE(a_new.link,   a_renew.link)    AS link,
+      COALESCE(a_new.image,  a_renew.image)   AS image,
+      COALESCE(a_new.status, a_renew.status)  AS ad_status
+    FROM orders o
+    LEFT JOIN ads a_new   ON a_new.order_id = o.id
+    LEFT JOIN ads a_renew ON a_renew.id     = o.renew_ads_id
+    ORDER BY o.created_at DESC
   `;
   pool.query(sql, (err, results) => {
-      if (err) {
-          console.error(`[ERROR] Database error fetching all orders:`, err);
-          return res.status(500).json({ error: 'Database error' });
-      }
-      res.json(results);
+    if (err) {
+      console.error('[ERROR] Database error fetching all orders:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    res.json(results);
   });
 });
+
 
 
 // PUT /api/admin/orders/:orderId - แก้ไขข้อมูลออเดอร์ (Admin only)
@@ -5232,7 +5239,7 @@ app.post("/api/orders/:orderId/upload-slip", upload.single('slip_image'), (req, 
 
   if (!req.file) {
       console.warn(`[WARN] No slip_image file uploaded for order ID ${orderId}.`);
-      return res.status(400).json({ error: 'กรุณาอัปโหลดสลิปการโอนเงิน' });
+      return res.status(400).json({ error: 'Please upload the payment slip' });
   }
 
   pool.getConnection((err, connection) => {
@@ -5255,13 +5262,13 @@ app.post("/api/orders/:orderId/upload-slip", upload.single('slip_image'), (req, 
                   return connection.rollback(() => {
                       connection.release();
                       console.error(`[ERROR] Database error checking order status for order ${orderId}:`, orderErr);
-                      res.status(500).json({ error: 'เกิดข้อผิดพลาดในการตรวจสอบสถานะออเดอร์' });
+                      res.status(500).json({ error: 'Error checking order status' });
                   });
               }
               if (orderResults.length === 0) {
                   return connection.rollback(() => {
                       connection.release();
-                      res.status(404).json({ error: 'ไม่พบออเดอร์นี้' });
+                      res.status(404).json({ error: 'Order not found' });
                   });
               }
 
@@ -5279,13 +5286,13 @@ app.post("/api/orders/:orderId/upload-slip", upload.single('slip_image'), (req, 
                           return connection.rollback(() => {
                               connection.release();
                               console.error(`[ERROR] Database error checking ad status for renewal ad ${renewAdsId}:`, adErr);
-                              res.status(500).json({ error: 'เกิดข้อผิดพลาดในการตรวจสอบสถานะโฆษณา' });
+                              res.status(500).json({ error: 'Error checking ad status' });
                           });
                       }
                       if (adResults.length === 0) {
                           return connection.rollback(() => {
                               connection.release();
-                              res.status(404).json({ error: 'ไม่พบโฆษณาที่ต้องการต่ออายุ' });
+                              res.status(404).json({ error: 'Ad to renew not found' });
                           });
                       }
 
@@ -5301,9 +5308,9 @@ app.post("/api/orders/:orderId/upload-slip", upload.single('slip_image'), (req, 
                           canUpload = true;
                       } else {
                           console.warn(`[WARN] Cannot upload slip for renewal order ${orderId}. Order status: ${orderStatus}, Ad expiration: ${adExpirationDate.toISOString().split('T')[0]}, Ad status: ${currentAdStatus}`);
-                          let errorMessage = 'ไม่สามารถอัปโหลดสลิปได้ สถานะออเดอร์ไม่ถูกต้อง';
+                          let errorMessage = 'Cannot upload slip because the order status is invalid';
                           if (adExpirationDate < today) {
-                              errorMessage = 'ไม่สามารถต่ออายุได้ เนื่องจากโฆษณาหมดอายุแล้ว';
+                              errorMessage = 'Cannot renew because the ad has already expired';
                           }
                           return connection.rollback(() => {
                               connection.release();
@@ -5322,7 +5329,7 @@ app.post("/api/orders/:orderId/upload-slip", upload.single('slip_image'), (req, 
                       console.warn(`[WARN] Cannot upload slip for new ad order ${orderId}. Current status: ${orderStatus}`);
                       return connection.rollback(() => {
                           connection.release();
-                          res.status(400).json({ error: 'ไม่สามารถอัปโหลดสลิปได้ ต้องรอให้แอดมินอนุมัติเนื้อหาก่อน' });
+                          res.status(400).json({ error: 'Cannot upload slip, please wait for admin to approve the content first' });
                       });
                   }
                   proceedUpdateOrderAndAd(connection, orderId, req.file.path, renewAdsId, packageId, null, null, canUpload, res); // ส่ง null สำหรับค่าที่ไม่เกี่ยวข้อง
@@ -5553,6 +5560,37 @@ app.put('/api/my/ads/:adId/delete', authenticateToken, async (req, res) => {
 });
 
 
+// GET /api/my/ads/:id  (ดึงโฆษณาตาม id)
+app.get('/api/my/ads/:id', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const adId = req.params.id;
+
+  const sql = `
+    SELECT a.id, a.user_id, a.order_id, a.title, a.content, a.link, a.image,
+           a.status,
+           DATE_FORMAT(a.show_at, "%Y-%m-%d") AS show_at,  
+           a.created_at, a.updated_at,
+           DATE_FORMAT(a.expiration_date, "%Y-%m-%d") AS expiration_date, 
+           a.display_count,
+           o.amount, o.status AS order_status,
+           p.name AS package_name, p.price AS package_price, p.duration_days AS package_duration
+    FROM ads a
+    LEFT JOIN orders o ON o.id = a.order_id
+    LEFT JOIN ad_packages p ON p.package_id = o.package_id
+    WHERE a.id = ? AND a.user_id = ?;
+  `;
+
+  pool.query(sql, [adId, userId], (err, results) => {
+    if (err) {
+      console.error('Error fetching ad detail:', err);
+      return res.status(500).json({ error: 'Error fetching ad detail' });
+    }
+    if (results.length === 0) {
+      return res.status(404).json({ error: 'Ad not found or you do not own it' });
+    }
+    res.json(results[0]);
+  });
+});
 
 
 // GET /api/ad-packages
@@ -5602,7 +5640,7 @@ app.post("/api/ads/:adId/renew", authenticateToken, (req, res) => {
 
   if (!package_id || !prompay_number) {
       console.warn('[WARN] Missing required fields for ad renewal.');
-      return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบถ้วน (package_id, prompay_number)' });
+      return res.status(400).json({ error: 'Please fill in all required fields (package_id, prompay_number)' });
   }
 
   pool.getConnection((err, connection) => {
@@ -5639,7 +5677,7 @@ app.post("/api/ads/:adId/renew", authenticateToken, (req, res) => {
                   return connection.rollback(() => {
                       connection.release();
                       console.error(`[ERROR] Database error deleting expired pending orders for ad ${adId}:`, deleteErr);
-                      res.status(500).json({ error: 'เกิดข้อผิดพลาดในการลบคำสั่งซื้อเก่า' });
+                      res.status(500).json({ error: 'Error deleting old order' });
                   });
               }
               if (deleteResult.affectedRows > 0) {
@@ -5660,7 +5698,7 @@ app.post("/api/ads/:adId/renew", authenticateToken, (req, res) => {
                       return connection.rollback(() => {
                           connection.release();
                           console.warn(`[WARN] Ad ID ${adId} not found or not owned by user ${user_id}.`);
-                          res.status(404).json({ error: 'ไม่พบโฆษณาหรือคุณไม่มีสิทธิ์ต่ออายุโฆษณานี้' });
+                          res.status(404).json({ error: 'Ad not found or you do not have permission to renew this ad' });
                       });
                   }
 
@@ -5677,7 +5715,7 @@ app.post("/api/ads/:adId/renew", authenticateToken, (req, res) => {
                       console.warn(`[WARN] Ad ID ${adId} has expired. Cannot renew.`);
                       return connection.rollback(() => {
                           connection.release();
-                          res.status(400).json({ error: 'ไม่สามารถต่ออายุได้ เนื่องจากโฆษณาหมดอายุแล้ว' });
+                          res.status(400).json({ error: 'Cannot renew because the ad has already expired' });
                       });
                   }
 
@@ -5704,7 +5742,7 @@ app.post("/api/ads/:adId/renew", authenticateToken, (req, res) => {
                           return connection.rollback(() => {
                               connection.release();
                               console.warn(`[WARN] Invalid package_id: ${package_id}`);
-                              res.status(400).json({ error: 'ไม่พบแพ็กเกจที่เลือก' });
+                              res.status(400).json({ error: 'Selected package not found' });
                           });
                       }
 
@@ -5720,7 +5758,7 @@ app.post("/api/ads/:adId/renew", authenticateToken, (req, res) => {
                               return connection.rollback(() => {
                                   connection.release();
                                   console.error('[ERROR] Database error creating renewal order:', orderErr);
-                                  res.status(500).json({ error: 'เกิดข้อผิดพลาดในการสร้างคำสั่งซื้อต่ออายุ' });
+                                  res.status(500).json({ error: 'Error creating renewal order' });
                               });
                           }
 
@@ -5737,7 +5775,7 @@ app.post("/api/ads/:adId/renew", authenticateToken, (req, res) => {
                               }
                               connection.release();
                               res.status(201).json({
-                                  message: 'สร้างคำสั่งซื้อต่ออายุสำเร็จ! กรุณาชำระเงินและอัปโหลดสลิป',
+                                  message: 'Renewal order created successfully! Please make payment and upload the slip',
                                   order_id,
                                   amount: price,
                                   duration: duration_days,
