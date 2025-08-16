@@ -51,6 +51,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import threading
+import qrcode
 
 
 import os, time, math, json, pickle, random, hashlib, threading
