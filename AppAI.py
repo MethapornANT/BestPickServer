@@ -5,10 +5,11 @@ from selenium.webdriver.chrome.service import Service
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
-from sqlalchemy import Enum as SAEnum
+from sqlalchemy import Enum as SAEnum, create_engine
 from sqlalchemy.sql import text
 from flask_sqlalchemy import SQLAlchemy
 from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import normalize as sk_normalize
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 from torchvision import models, transforms
 from flask import Flask, request, jsonify
@@ -20,37 +21,52 @@ from textblob import TextBlob
 from functools import wraps
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
 from pythainlp.tokenize import word_tokenize
 from PIL import Image, ImageOps, ImageFile
 from datetime import datetime, date, timedelta, timezone
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
-import traceback
-import requests
-import threading
-import seaborn as sns
-import joblib
-import locale
-import random
-import pickle
-import base64
-import qrcode
-import secrets
-import uuid
-import torch
-import torch.nn as nn
+
+
+
+import os
+import sys
+import re
+import io
 import time
 import json
 import pytz
-import re
-import io
-import sys
-import os
-
+import uuid
 import jwt
-from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
+import torch
+import torch.nn as nn
+import pickle
+import base64
+import random
+import locale
+import secrets
+import joblib
+import traceback
+import requests
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import threading
+
+
+import os, time, math, json, pickle, random, hashlib, threading
+from datetime import datetime
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import normalize as sk_normalize
+from scipy.sparse import csr_matrix
+from scipy.sparse import load_npz, save_npz
+from surprise import SVD, Dataset, Reader
 
 
 # optional deps / locale
@@ -79,11 +95,11 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 UPLOAD_FOLDER = './uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-MODEL_PATH = './NSFW_Model_archived_20250803-132149/results/20250801-100650 Best Model/efficientnetb0/models/efficientnetb0_best.pth'
+MODEL_PATH = './NSFW_Model/results/20250816-001345/efficientnetb0/models/efficientnetb0_best.pth'
 
 # === Threshold & device (ให้ค่าเดียวกันทั้ง print และ return) ===
-HENTAI_THRESHOLD = 25.0
-PORN_THRESHOLD = 20.0
+HENTAI_THRESHOLD = 34.0
+PORN_THRESHOLD = 35.0
 
 # === Model: Custom EfficientNetB0 (โครงเดียวกับตอนเทรน) ===
 class CustomEfficientNetB0(nn.Module):
@@ -286,9 +302,10 @@ if not JWT_SECRET:
 
 # ==================== RECOMMENDATION SYSTEM FUNCTIONS ====================
 
+# ===== Global config =====
+DB_URI = 'mysql+mysqlconnector://root:1234@localhost/bestpick'
 
-
-# === Global caches & params (คงชื่อเดิม) ===
+# ====== Global caches & params (คงชื่อเดิม) ======
 recommendation_cache = {}
 impression_history_cache = {}
 
@@ -296,39 +313,34 @@ CACHE_EXPIRY_TIME_SECONDS = 120
 IMPRESSION_HISTORY_TTL_SECONDS = 3600
 IMPRESSION_HISTORY_MAX_ENTRIES = 100
 
-# === เพิ่ม lock กัน race condition ระหว่าง thread กับ request ===
+# ====== Lock กัน race condition ======
 _cache_lock = threading.Lock()
 
-# === Background cache janitor: ล้างอย่างปลอดภัย ไม่ทำให้ thread ตาย ===
+# ====== Background cache janitor (no log) ======
 def clear_cache():
     while True:
         try:
             now = datetime.now()
             with _cache_lock:
-                # เคลียร์แคชหลักแบบ in-place เพื่อไม่ให้ reference อื่นหลุด
                 recommendation_cache.clear()
-
-                # TTL prune ของ impression history แบบ in-place
+                # TTL prune ของ impression history
                 to_delete = []
                 for user_id, items in impression_history_cache.items():
                     pruned = [e for e in items if (now - e['timestamp']).total_seconds() < IMPRESSION_HISTORY_TTL_SECONDS]
                     if pruned:
-                        # จำกัดจำนวนล่าสุดไว้ไม่เกิน MAX_ENTRIES
                         impression_history_cache[user_id] = pruned[-IMPRESSION_HISTORY_MAX_ENTRIES:]
                     else:
                         to_delete.append(user_id)
                 for uid in to_delete:
                     del impression_history_cache[uid]
-        except Exception as e:
-            # กัน thread ตายเงียบๆ
-            print(f"[CACHE JANITOR] error: {e}")
+        except Exception:
+            pass
         finally:
             time.sleep(CACHE_EXPIRY_TIME_SECONDS)
 
-# === Start daemon thread (ตามเดิม แต่ปลอดภัยขึ้น) ===
 threading.Thread(target=clear_cache, daemon=True).start()
 
-# === JWT verify: ตรวจ token แล้วผูก user_id/role เข้ากับ request ===
+# ====== JWT verify (คง signature เดิม) ======
 def verify_token(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -337,7 +349,7 @@ def verify_token(f):
             return jsonify({"error": "No token provided or incorrect format"}), 403
         token = auth_header.split(" ")[1]
         try:
-            decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            decoded = jwt.decode(token, os.getenv("JWT_SECRET", "changeme"), algorithms=["HS256"])
             request.user_id = decoded.get("id")
             request.role = decoded.get("role")
         except jwt.ExpiredSignatureError:
@@ -347,185 +359,360 @@ def verify_token(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# === DB loader: ดึงข้อมูล Content-based และ Collaborative จาก MySQL ด้วย pool ที่เสถียร ===
-def load_data_from_db():
+
+# ===================== RUNTIME RECOMMENDER (no evaluation) =====================
+
+
+# ====== ใช้ค่าเดิมจาก Global config ที่มึงมี ======
+# DB_URI มาจากบล็อก global config ของมึง
+CONTENT_VIEW = 'contentbasedview'
+EVENT_TABLE  = 'user_interactions'
+
+# คอลัมน์ข้อมูลคอนเทนต์
+TEXT_COL = 'Content'
+ENGAGE_COL = 'PostEngagement'
+
+# ตัวกรอง action
+POS_ACTIONS = {'like','comment','bookmark','share'}
+NEG_ACTIONS = {'unlike'}
+IGNORE_ACTIONS = {'view_profile','follow','unfollow'}
+VIEW_POS_MIN = 3
+
+# น้ำหนักสร้าง implicit rating สำหรับคอลลาบอราทีฟ
+ACTION_WEIGHT = {'view':1.0,'like':4.0,'comment':4.0,'bookmark':4.5,'share':5.0,'unlike':-3.0}
+RATING_MIN, RATING_MAX = 0.5, 5.0
+
+# พารามิเตอร์ที่ “ล็อกแล้ว” จากการจูน
+TFIDF_PARAMS = dict(analyzer='char_wb', ngram_range=(2,5), max_features=60000, min_df=2, max_df=0.95, stop_words=None)
+WEIGHTS = (0.3, 0.3, 0.4)  # (collab, item_content, user_content)
+POP_ALPHA = 5.0            # Bayesian smoothing สำหรับ engagement
+
+# ไดเรกทอรีแคชไฟล์โมเดล (แชร์กับที่เคยสร้างได้ ไม่งั้นมันจะสร้างใหม่เอง)
+OUT_DIR = './recsys_eval_final'
+CACHE_DIR = os.path.join(OUT_DIR, 'cache')
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# ====== DB ======
+def _connect():
+    return create_engine(DB_URI, pool_pre_ping=True, pool_recycle=1800)
+
+def _guess_ts_column(eng) -> Optional[str]:
     try:
-        engine = create_engine(
-            'mysql+mysqlconnector://root:1234@localhost/bestpick',
-            pool_pre_ping=True, pool_recycle=1800, pool_size=5, max_overflow=10
-        )
-        content_based_data = pd.read_sql("SELECT * FROM contentbasedview;", con=engine)
-        print("โหลดข้อมูล Content-Based สำเร็จ")
-        collaborative_data = pd.read_sql("SELECT * FROM collaborativeview;", con=engine)
-        print("โหลดข้อมูล Collaborative สำเร็จ")
-        return content_based_data, collaborative_data
-    except Exception as e:
-        print(f"ข้อผิดพลาดในการโหลดข้อมูลจากฐานข้อมูล: {str(e)}")
-        raise
+        one = pd.read_sql(f"SELECT * FROM {EVENT_TABLE} LIMIT 1", eng)
+    except Exception:
+        return None
+    for c in ['created_at','updated_at','ts','timestamp','event_time','inserted_at']:
+        if c in one.columns:
+            return c
+    return None
 
-# === Normalization utils: ทำให้คะแนนอยู่ในสเกล 0..1 ===
-def normalize_scores(series):
-    min_val, max_val = series.min(), series.max()
-    if max_val > min_val:
-        return (series - min_val) / (max_val - min_val)
-    return series
+def _load_content(eng) -> pd.DataFrame:
+    df = pd.read_sql(f"SELECT * FROM {CONTENT_VIEW}", eng)
+    if 'post_id' not in df.columns and 'id' in df.columns:
+        df = df.rename(columns={'id':'post_id'})
+    df['post_id'] = pd.to_numeric(df['post_id'], errors='coerce').dropna().astype(int)
 
-# === Engagement normalization: ปรับต่อกลุ่มผู้ใช้ ===
-def normalize_engagement(data, user_column='owner_id', engagement_column='PostEngagement'):
-    data = data.copy()
-    data['NormalizedEngagement'] = data.groupby(user_column)[engagement_column].transform(lambda x: normalize_scores(x))
-    return data
+    if TEXT_COL not in df.columns: df[TEXT_COL] = ''
+    if ENGAGE_COL not in df.columns: df[ENGAGE_COL] = 0.0
+    eng = pd.to_numeric(df[ENGAGE_COL], errors='coerce').fillna(0.0).astype(np.float32)
 
-# === Comment analyzer: นับคอมเมนต์จากข้อความคั่นด้วย ; ===
-def analyze_comments(comments_series):
-    comment_counts = []
-    for comment_text in comments_series:
-        if pd.isna(comment_text) or str(comment_text).strip() == '':
-            comment_counts.append(0)
-        else:
-            individual_comments = [c.strip() for c in str(comment_text).split(';') if c.strip()]
-            comment_counts.append(len(individual_comments))
-    return comment_counts
+    # Popularity prior + normalized engagement
+    prior = (eng + POP_ALPHA) / (eng.max() + POP_ALPHA)
+    df['PopularityPrior'] = _normalize(pd.Series(prior))
+    df['NormalizedEngagement'] = _normalize(pd.Series(eng))
 
-# === Content-based model: TF-IDF + KNN พร้อมถ่วงน้ำหนัก engagement/comment ===
-def create_content_based_model(data, text_column='Content', comment_column='Comments', engagement_column='PostEngagement'):
-    required_columns = [text_column, comment_column, engagement_column]
-    if not all(col in data.columns for col in required_columns):
-        missing = set(required_columns) - set(data.columns)
-        raise ValueError(f"ข้อมูลขาดคอลัมน์ที่จำเป็น: {missing}")
+    if 'owner_id' not in df.columns:
+        df['owner_id'] = -1
+    else:
+        df['owner_id'] = pd.to_numeric(df['owner_id'], errors='coerce').fillna(-1).astype(int)
 
-    data = data.copy()
-    train_data, test_data = train_test_split(data, test_size=0.25, random_state=42)
+    return df
 
-    tfidf = TfidfVectorizer(stop_words='english', max_features=6000, ngram_range=(1, 3), min_df=1, max_df=0.8)
-    tfidf_matrix = tfidf.fit_transform(train_data[text_column].fillna(''))
+def _load_events(eng, ts_col: Optional[str]) -> pd.DataFrame:
+    base = "user_id, post_id, action_type"
+    if ts_col: base += f", {ts_col} AS ts"
+    ev = pd.read_sql(f"SELECT {base} FROM {EVENT_TABLE}", eng)
+    ev = ev.dropna(subset=['user_id','post_id'])
+    ev['user_id'] = pd.to_numeric(ev['user_id'], errors='coerce').dropna().astype(int)
+    ev['post_id'] = pd.to_numeric(ev['post_id'], errors='coerce').dropna().astype(int)
+    ev['action_type'] = ev['action_type'].astype(str).str.lower()
+    if 'ts' in ev.columns: ev = ev.dropna(subset=['ts'])
+    ev = ev[~ev['action_type'].isin(IGNORE_ACTIONS)].copy()
+    return ev
 
+# ====== Utils ======
+def _normalize(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors='coerce').fillna(0.0).astype(np.float32)
+    mn, mx = float(s.min()), float(s.max())
+    return (s - mn) / (mx - mn + 1e-12)
+
+def _md5_of_df(df: pd.DataFrame, cols: List[str]) -> str:
+    snap = df[cols].copy().fillna(0)
+    h = hashlib.md5(pd.util.hash_pandas_object(snap, index=False).values).hexdigest()
+    return h
+
+# ====== Content models ======
+def _build_tfidf(content_df: pd.DataFrame, params: dict):
+    tfidf = TfidfVectorizer(**params, dtype=np.float32)
+    X = tfidf.fit_transform(content_df[TEXT_COL].fillna(''))
+    return tfidf, X.astype(np.float32)
+
+def _build_knn(X):
     knn = NearestNeighbors(n_neighbors=10, metric='cosine')
-    knn.fit(tfidf_matrix)
+    knn.fit(X)
+    return knn
 
-    train_data['CommentCount'] = analyze_comments(train_data[comment_column])
-    test_data['CommentCount'] = analyze_comments(test_data[comment_column])
+def _precompute_item_content_scores(knn, content_df: pd.DataFrame, X: csr_matrix) -> np.ndarray:
+    n = X.shape[0]
+    scores = np.zeros(n, dtype=np.float32)
+    n_neighbors = min(20, n)
+    dists, idxs = knn.kneighbors(X, n_neighbors=n_neighbors)
+    eng = content_df['NormalizedEngagement'].to_numpy(dtype=np.float32)
+    for i in range(n):
+        scores[i] = float(np.mean(eng[idxs[i]])) if idxs[i].size else 0.0
+    return scores
 
-    max_comment_count = int(train_data['CommentCount'].max()) if len(train_data) else 0
-    if max_comment_count > 0:
-        train_data['NormalizedCommentCount'] = train_data['CommentCount'] / max_comment_count
-        test_data['NormalizedCommentCount'] = test_data['CommentCount'] / max_comment_count
-    else:
-        train_data['NormalizedCommentCount'] = 0.0
-        test_data['NormalizedCommentCount'] = 0.0
+def _user_text_profiles(train_pos: pd.DataFrame, content_df: pd.DataFrame, X: csr_matrix) -> Dict[int, csr_matrix]:
+    pid_to_idx = {int(pid): i for i, pid in enumerate(content_df['post_id'].tolist())}
+    profiles = {}
+    for uid, g in train_pos.groupby('user_id'):
+        idxs = [pid_to_idx.get(p) for p in g['post_id'].tolist() if pid_to_idx.get(p) is not None]
+        if not idxs:
+            profiles[int(uid)] = csr_matrix((1, X.shape[1]), dtype=np.float32)
+            continue
+        mat = X[idxs]
+        mean_vec = mat.mean(axis=0)
+        if hasattr(mean_vec, "toarray"): mean_vec = mean_vec.toarray()
+        else: mean_vec = np.asarray(mean_vec)
+        prof = sk_normalize(mean_vec)
+        profiles[int(uid)] = csr_matrix(prof, dtype=np.float32)
+    return profiles
 
-    train_data = normalize_engagement(train_data, engagement_column=engagement_column)
-    train_data['NormalizedEngagement'] = normalize_scores(train_data[engagement_column])
-    train_data['WeightedEngagement'] = train_data['NormalizedEngagement'] + train_data['NormalizedCommentCount']
+def _user_content_score(uid: int, profiles: Dict[int, csr_matrix], X: csr_matrix, idx: int) -> float:
+    prof = profiles.get(int(uid))
+    if prof is None or prof.nnz == 0: return 0.0
+    v = X[idx]
+    num = float(v.multiply(prof).sum())
+    den = (np.linalg.norm(v.data) * np.linalg.norm(prof.data)) if prof.nnz>0 and v.nnz>0 else 0.0
+    return float(num/den) if den>0 else 0.0
 
-    test_data = normalize_engagement(test_data, engagement_column=engagement_column)
-    test_data['WeightedEngagement'] = test_data['NormalizedEngagement'] + test_data['NormalizedCommentCount']
+# ====== Collab ======
+def _build_true_labels(events: pd.DataFrame) -> pd.DataFrame:
+    t = events.groupby(['user_id','post_id','action_type']).size().reset_index(name='cnt')
+    if t.empty:
+        return pd.DataFrame(columns=['user_id','post_id','y'])
+    pvt = t.pivot_table(index=['user_id','post_id'], columns='action_type',
+                        values='cnt', fill_value=0, aggfunc='sum').reset_index()
+    pvt.columns = [str(c).lower() for c in pvt.columns]
+    pos = np.zeros(len(pvt), dtype=bool)
+    for a in POS_ACTIONS:
+        if a in pvt.columns: pos |= (pvt[a].to_numpy(dtype=float) > 0)
+    if 'view' in pvt.columns:
+        pos |= (pvt['view'].to_numpy(dtype=float) >= VIEW_POS_MIN)
+    if NEG_ACTIONS:
+        neg = np.zeros(len(pvt), dtype=bool)
+        for a in NEG_ACTIONS:
+            if a in pvt.columns: neg |= (pvt[a].to_numpy(dtype=float) > 0)
+        pos = np.where(neg, False, pos)
+    pvt['y'] = pos.astype(int)
+    return pvt[['user_id','post_id','y']]
 
-    joblib.dump(tfidf, 'TFIDF_Model.pkl', compress=3)
-    joblib.dump(knn, 'KNN_Model.pkl', compress=3)
+def _build_collab_model(events: pd.DataFrame, post_ids: List[int]):
+    e = events[events['post_id'].isin(post_ids)].copy()
+    if e.empty: return None
+    t = e.groupby(['user_id','post_id','action_type']).size().reset_index(name='cnt')
+    pvt = t.pivot_table(index=['user_id','post_id'], columns='action_type',
+                        values='cnt', fill_value=0, aggfunc='sum').reset_index()
 
-    return tfidf, knn, train_data, test_data
+    rating = np.zeros(len(pvt), dtype=np.float32)
+    for act, w in ACTION_WEIGHT.items():
+        if act in pvt.columns:
+            rating += np.float32(w) * pvt[act].to_numpy(dtype=np.float32)
+    if 'view' in pvt.columns:
+        rating += np.where(pvt['view'].to_numpy(dtype=np.float32) >= VIEW_POS_MIN, np.float32(2.0), np.float32(0.0))
+    rating = np.clip(rating, RATING_MIN, RATING_MAX)
 
-# === Collaborative model (SVD): ทำนายคะแนนจากพฤติกรรมผู้ใช้ร่วม ===
-def create_collaborative_model(data, n_factors=150, n_epochs=70, lr_all=0.005, reg_all=0.5):
-    required_columns = ['user_id', 'post_id']
-    if not all(col in data.columns for col in required_columns):
-        missing = set(required_columns) - set(data.columns)
-        raise ValueError(f"ข้อมูลขาดคอลัมน์ที่จำเป็น: {missing}")
+    data = pvt[['user_id','post_id']].copy()
+    data['rating'] = rating
+    data = data[data['rating'] > 0]
+    if data.empty: return None
 
-    melted_data = data.melt(id_vars=['user_id', 'post_id'], var_name='category', value_name='score')
-    melted_data = melted_data[melted_data['score'] > 0]
-
-    if melted_data.empty:
-        # กันพัง: ถ้าไม่มีคะแนนเลย สร้างโมเดลเปล่าๆ ที่คืนค่าเฉลี่ยกลางๆ
-        class DummySVD:
-            def predict(self, uid, iid):
-                class Est: est = 0.5
-                return Est()
-        model = DummySVD()
-        joblib.dump(model, 'Collaborative_Model.pkl', compress=3)
-        return model, melted_data
-
-    train_data, test_data = train_test_split(melted_data, test_size=0.25, random_state=42)
-
-    reader = Reader(rating_scale=(float(melted_data['score'].min()), float(melted_data['score'].max())))
-    trainset = Dataset.load_from_df(train_data[['user_id', 'post_id', 'score']], reader).build_full_trainset()
-
-    model = SVD(n_factors=n_factors, n_epochs=n_epochs, lr_all=lr_all, reg_all=reg_all)
+    reader = Reader(rating_scale=(RATING_MIN, RATING_MAX))
+    dset = Dataset.load_from_df(data[['user_id','post_id','rating']], reader)
+    trainset = dset.build_full_trainset()
+    model = SVD(n_factors=150, n_epochs=60, lr_all=0.005, reg_all=0.5)
     model.fit(trainset)
+    return model
 
-    joblib.dump(model, 'Collaborative_Model.pkl', compress=3)
-    return model, test_data
-
-# === Hybrid recommend: รวม collaborative + content + category ด้วยน้ำหนักปรับได้ ===
-def recommend_hybrid(user_id, all_posts_data, collaborative_model, knn, tfidf, categories, alpha=0.50, beta=0.20):
-    if not (0 <= alpha <= 1):
-        raise ValueError("Alpha ต้องอยู่ในช่วง 0 ถึง 1")
-    if not (0 <= beta <= 1):
-        raise ValueError("Beta ต้องอยู่ในช่วง 0 ถึง 1")
-
-    recommendations = []
-    has_knn = hasattr(knn, "_fit_X") and getattr(knn, "_fit_X") is not None and getattr(knn, "_fit_X").shape[0] > 0
-    has_tfidf = hasattr(tfidf, "vocabulary_") and tfidf.vocabulary_ is not None
-
-    # ใช้ค่า normalized engagement ถ้ามี มิฉะนั้นถอยไป 0
-    norm_eng_col = 'NormalizedEngagement'
-    if norm_eng_col not in all_posts_data.columns:
-        all_posts_data = all_posts_data.copy()
-        all_posts_data[norm_eng_col] = 0.0
-
-    for _, post in all_posts_data.iterrows():
-        post_id = post['post_id']
-
-        # Collaborative
-        collab_score = 0.5
-        try:
-            collab_score = collaborative_model.predict(user_id, post_id).est
-        except Exception:
-            pass
-
-        # Content-based
-        content_score = 0.0
-        if has_tfidf and has_knn:
+# ====== Ranking ======
+def _recommend_scores_for_user(uid: int,
+                               content_df: pd.DataFrame,
+                               tfidf, X, knn,
+                               uc_profiles: Dict[int, csr_matrix],
+                               collab_model,
+                               item_content_scores: np.ndarray,
+                               weights: Tuple[float,float,float]) -> pd.DataFrame:
+    wc, wi, wu = weights
+    rows = []
+    collab_pred_default = 0.5
+    for i in range(len(content_df)):
+        row = content_df.iloc[i]
+        pid = int(row['post_id'])
+        # กันโพสต์ของตัวเองออกจากแคนดิเดต
+        if int(row.get('owner_id', -1)) == int(uid):
+            continue
+        # collab
+        collab = collab_pred_default
+        if collab_model is not None:
             try:
-                post_content = str(post.get('Content', '')) if pd.notna(post.get('Content', '')) else ''
-                tfidf_vector = tfidf.transform([post_content])
-                n_neighbors = min(20, knn._fit_X.shape[0])
-                distances, indices = knn.kneighbors(tfidf_vector, n_neighbors=n_neighbors)
-                if len(indices[0]) > 0:
-                    content_score = float(np.mean([all_posts_data.iloc[i][norm_eng_col] for i in indices[0]]))
-            except Exception as e:
-                print(f"ข้อผิดพลาดในการคํานวณ Content-Based score สําหรับ post_id {post_id}: {e}")
+                collab = float(collab_model.predict(int(uid), pid).est)
+            except Exception:
+                collab = collab_pred_default
+        # item content
+        ic = float(item_content_scores[i]) if i < len(item_content_scores) else 0.0
+        # user-content cosine
+        uc = _user_content_score(uid, uc_profiles, X, i)
+        # popularity prior เสริม
+        pop = float(row.get('PopularityPrior', 0.0))
+        final = wc*collab + wi*ic + wu*uc + 0.05*pop
+        rows.append((pid, collab, ic, uc, pop, final))
+    out = pd.DataFrame(rows, columns=['post_id','collab','item_content','user_content','pop','final'])
+    out['final_norm'] = _normalize(out['final'])
+    return out.sort_values(['final_norm','final'], ascending=[False, False])
 
-        # Category-based
-        category_score = 0.0
-        if categories:
-            cnt = 0
-            for category in categories:
-                if category in post.index and pd.notna(post[category]) and post[category] == 1:
-                    cnt += 1
-            if len(categories) > 0:
-                category_score = cnt / len(categories)
+# ====== Model block cache (ไฟล์) ======
+def _get_cache_paths(cache_key: str, tfidf_params: dict):
+    key = hashlib.md5(json.dumps(tfidf_params, sort_keys=True).encode()).hexdigest()
+    base = os.path.join(CACHE_DIR, cache_key)
+    return {
+        'tfidf_pkl': base + f'.tfidf_{key}.pkl',
+        'X_npz'    : base + f'.X_{key}.npz',
+        'knn_pkl'  : base + '.knn.pkl',
+        'ics_npy'  : base + '.item_scores.npy',
+        'uc_pkl'   : base + '.ucprof.pkl',
+        'svd_pkl'  : base + '.svd.pkl',
+    }
 
-        # Final score
-        final_score = (alpha * float(collab_score)) + ((1 - alpha) * float(content_score)) + (beta * float(category_score))
-        recommendations.append((post_id, final_score))
+def _build_or_load_blocks(content_df: pd.DataFrame, events: pd.DataFrame, use_cache: bool=True):
+    content_hash = _md5_of_df(content_df, ['post_id', TEXT_COL, ENGAGE_COL])
+    sample_ev = events[['user_id','post_id','action_type']].head(5000).copy() if len(events)>5000 else events[['user_id','post_id','action_type']]
+    events_hash  = _md5_of_df(sample_ev, ['user_id','post_id','action_type'])
+    cache_key = f"{content_hash}_{events_hash}"
+    P = _get_cache_paths(cache_key, TFIDF_PARAMS)
 
-    recommendations_df = pd.DataFrame(recommendations, columns=['post_id', 'score'])
-    recommendations_df['random_order'] = np.random.rand(len(recommendations_df))
-
-    if not recommendations_df['score'].empty and recommendations_df['score'].nunique() > 1:
-        recommendations_df['normalized_score'] = normalize_scores(recommendations_df['score'])
+    # TF-IDF
+    if use_cache and os.path.exists(P['tfidf_pkl']) and os.path.exists(P['X_npz']):
+        with open(P['tfidf_pkl'],'rb') as f: tfidf = pickle.load(f)
+        X = load_npz(P['X_npz']).astype(np.float32)
     else:
-        recommendations_df['normalized_score'] = 0.5
+        tfidf, X = _build_tfidf(content_df, TFIDF_PARAMS)
+        with open(P['tfidf_pkl'],'wb') as f: pickle.dump(tfidf,f)
+        save_npz(P['X_npz'], X)
 
-    return recommendations_df.sort_values(by=['normalized_score', 'random_order'], ascending=[False, False])['post_id'].tolist()
+    # KNN + item content
+    if use_cache and os.path.exists(P['knn_pkl']) and os.path.exists(P['ics_npy']):
+        with open(P['knn_pkl'],'rb') as f: knn = pickle.load(f)
+        item_scores = np.load(P['ics_npy'])
+    else:
+        knn = _build_knn(X)
+        item_scores = _precompute_item_content_scores(knn, content_df, X)
+        with open(P['knn_pkl'],'wb') as f: pickle.dump(knn,f)
+        np.save(P['ics_npy'], item_scores)
 
-# === Split & rank: จัดชั้นความสำคัญ สดใหม่ก่อน, เคยเห็นแต่ไม่โต้ตอบ, เคยโต้ตอบ ===
+    # user text profiles (จาก label บวก)
+    labels = _build_true_labels(events)
+    train_pos = labels[labels['y']==1][['user_id','post_id']]
+    if use_cache and os.path.exists(P['uc_pkl']):
+        try:
+            with open(P['uc_pkl'],'rb') as f: uc_prof = pickle.load(f)
+        except Exception:
+            uc_prof = _user_text_profiles(train_pos, content_df, X)
+            with open(P['uc_pkl'],'wb') as f: pickle.dump(uc_prof,f)
+    else:
+        uc_prof = _user_text_profiles(train_pos, content_df, X)
+        with open(P['uc_pkl'],'wb') as f: pickle.dump(uc_prof,f)
+
+    # collab
+    if use_cache and os.path.exists(P['svd_pkl']):
+        try:
+            with open(P['svd_pkl'],'rb') as f: svd = pickle.load(f)
+        except Exception:
+            svd = _build_collab_model(events, content_df['post_id'].tolist())
+            with open(P['svd_pkl'],'wb') as f: pickle.dump(svd,f)
+    else:
+        svd = _build_collab_model(events, content_df['post_id'].tolist())
+        with open(P['svd_pkl'],'wb') as f: pickle.dump(svd,f)
+
+    return tfidf, X, knn, item_scores, uc_prof, svd, cache_key
+
+# ====== Public runtime API (เรียกใช้ภายในแอป) ======
+def recommend_for_user(user_id: int, top_k: int = 20, use_cache: bool=True) -> List[int]:
+    """
+    คืนรายการ post_id ที่จัดอันดับแล้ว พร้อมใช้กับ split_and_rank_recommendations
+    อาศัยแคช in-memory (ของมึง) + แคชไฟล์บล็อกโมเดล เพื่อลด latency
+    """
+    now = datetime.now()
+
+    # in-memory cache hit (ล้างโดยเจ้า background janitor ของมึงอยู่แล้ว)
+    with _cache_lock:
+        cached = recommendation_cache.get(user_id)
+        if cached:
+            # ตัดตาม top_k ฝั่ง client
+            ids = cached['ids'][:top_k]
+            return [int(x) for x in ids]
+
+    # เตรียมดาต้า
+    eng = _connect()
+    content_df = _load_content(eng)
+    ts_col = _guess_ts_column(eng)
+    events = _load_events(eng, ts_col)
+
+    # สร้าง/โหลดบล็อกโมเดล
+    tfidf, X, knn, item_scores, uc_prof, svd, _ = _build_or_load_blocks(content_df, events, use_cache=use_cache)
+
+    # สกอร์พื้นฐานเรียงจากสูงไปต่ำ
+    sc = _recommend_scores_for_user(int(user_id), content_df, tfidf, X, knn, uc_prof, svd, item_scores, WEIGHTS)
+
+    # รายการที่ผู้ใช้เคยมีปฏิสัมพันธ์แล้ว (กันลูปเดิม)
+    user_interacted = events[events['user_id']==int(user_id)]['post_id'].tolist()
+
+    # impression history (TTL/trim จัดการโดย thread ของมึงแล้ว)
+    with _cache_lock:
+        impression_history = impression_history_cache.get(int(user_id), []).copy()
+
+    total_posts = int(content_df['post_id'].nunique())
+
+    # เอา candidate ทั้งหมดไปจัดลำดับใหม่ตาม split & rank
+    ranked_all = split_and_rank_recommendations(
+        recommendations=sc['post_id'].tolist(),
+        user_interactions=user_interacted,
+        impression_history=impression_history,
+        total_posts_in_db=total_posts
+    )
+
+    # หั่นตาม top_k
+    final_ids = [int(p) for p in ranked_all[:max(top_k, 1)]]
+
+    # อัพเดต in-memory cache
+    with _cache_lock:
+        recommendation_cache[user_id] = {'ids': ranked_all, 'timestamp': now}
+
+        # อัพเดต impression history ด้วยโพสต์ที่เพิ่งส่งไป
+        hist = impression_history_cache.get(user_id, [])
+        now_ts = datetime.now()
+        for pid in final_ids:
+            hist.append({'post_id': int(pid), 'timestamp': now_ts})
+        # เก็บล่าสุดไม่เกิน IMPRESSION_HISTORY_MAX_ENTRIES (ตัว clean-up จะ prune ตาม TTL อยู่แล้ว)
+        impression_history_cache[user_id] = hist[-IMPRESSION_HISTORY_MAX_ENTRIES:]
+
+    return final_ids
+
+
+# ==================== Split & Rank (ของเดิม, ตัด log ออก) ====================
 def split_and_rank_recommendations(recommendations, user_interactions, impression_history, total_posts_in_db):
     unique_recommendations_ids = [int(p) if isinstance(p, float) else p for p in list(dict.fromkeys(recommendations))]
     user_interactions_set = set([int(p) if isinstance(p, float) else p for p in user_interactions])
-    impression_history_set = set([int(p) for entry in impression_history for p in [entry['post_id']]])
+    impression_history_set = set([int(e['post_id']) for e in impression_history])
 
     final_recommendations_ordered = []
 
@@ -552,15 +739,8 @@ def split_and_rank_recommendations(recommendations, user_interactions, impressio
         if post_id not in set(final_recommendations_ordered)
     ]
 
-    group_A_not_recently_shown = [
-        post_id for post_id in remaining_posts_to_mix
-        if post_id not in impression_history_set
-    ]
-
-    group_B_recently_shown = [
-        post_id for post_id in remaining_posts_to_mix
-        if post_id in impression_history_set
-    ]
+    group_A_not_recently_shown = [p for p in remaining_posts_to_mix if p not in impression_history_set]
+    group_B_recently_shown = [p for p in remaining_posts_to_mix if p in impression_history_set]
 
     num_to_demote_from_history = min(len(impression_history), int(len(impression_history) * 0.25))
     posts_to_demote = set([entry['post_id'] for entry in impression_history[:num_to_demote_from_history]])
@@ -569,15 +749,8 @@ def split_and_rank_recommendations(recommendations, user_interactions, impressio
     for post_id in unique_recommendations_ids:
         (demoted_posts if post_id in posts_to_demote else non_demoted_posts).append(post_id)
 
-    truly_unviewed_non_demoted = [
-        post_id for post_id in non_demoted_posts
-        if post_id not in user_interactions_set and post_id not in impression_history_set
-    ]
-
-    remaining_non_demoted_and_not_truly_unviewed = [
-        post_id for post_id in non_demoted_posts
-        if post_id not in set(truly_unviewed_non_demoted)
-    ]
+    truly_unviewed_non_demoted = [p for p in non_demoted_posts if p not in user_interactions_set and p not in impression_history_set]
+    remaining_non_demoted_and_not_truly_unviewed = [p for p in non_demoted_posts if p not in set(truly_unviewed_non_demoted)]
 
     num_unviewed_first_current_run = min(30, len(truly_unviewed_non_demoted))
     final_recommendations_ordered.extend(truly_unviewed_non_demoted[:num_unviewed_first_current_run])
@@ -601,12 +774,8 @@ def split_and_rank_recommendations(recommendations, user_interactions, impressio
         shuffled_segment.extend([post_id for post_id, _ in block_with_priority])
 
     final_recommendations_ordered.extend(shuffled_segment)
-
-    print("Top N Unviewed (prioritized):", final_recommendations_ordered[:num_unviewed_first_current_run])
-    print("Remaining Overall Recommendations (block-shuffled, with recently shown and demoted pushed back):", final_recommendations_ordered[num_unviewed_first_current_run:])
-    print("Final Recommendations (ordered, after mix):", final_recommendations_ordered)
-
     return final_recommendations_ordered
+
 
 
 # ==================== SLIP & PROMPTPAY FUNCTIONS (from Slip.py) ====================
@@ -1245,144 +1414,68 @@ def _save_upload(file, allowed_exts: set, folder: str) -> str:
     file.save(path)
     return fname, path
 
-# ==================== Recommendation Route ====================
+# ==================== Recommendation Route (optimized, production) ====================
+
 @app.route('/ai/recommend', methods=['POST'])
 @verify_token
 def recommend():
     try:
-        # === อ่านพารามิเตอร์และเช็ก refresh ===
-        user_id = request.user_id
-        now = datetime.now()
+        user_id = int(request.user_id)
+        if user_id <= 0:
+            return jsonify({"error": "Invalid user"}), 400
+
+        # คุมจำนวนโพสต์ที่ดึงกลับ
+        top_k = int(request.args.get('top_k', 20))
+        top_k = max(1, min(100, top_k))
+
+        # refresh=true จะบังคับไม่ใช้แคชในรอบนี้ และเคลียร์ in-memory ids cache ของ user
         refresh_requested = request.args.get('refresh', 'false').lower() == 'true'
+        if refresh_requested:
+            with _cache_lock:
+                recommendation_cache.pop(user_id, None)  # เคลียร์ ids cache ของระบบใหม่เท่านั้น
 
-        # === จัดการ cache invalidation แบบไม่ทำให้เคสอื่นพัง ===
-        if refresh_requested and user_id in recommendation_cache:
+        # เรียก runtime core ที่จัดการหมดแล้ว (rank + splitrank + impression history)
+        ids = recommend_for_user(user_id=user_id, top_k=top_k, use_cache=(not refresh_requested))
+        if not ids:
+            return jsonify([]), 200
+
+        # ดึงข้อมูลโพสต์ตามลำดับที่ AI จัดมา
+        placeholders = ', '.join([f':id_{i}' for i in range(len(ids))])
+        with db.session.begin():
+            q = text(f"""
+                SELECT p.*, u.username, u.picture,
+                       (SELECT COUNT(*) FROM likes WHERE post_id = p.id AND user_id = :user_id) AS is_liked
+                FROM posts p
+                JOIN users u ON p.user_id = u.id
+                WHERE p.status = 'active' AND p.id IN ({placeholders})
+            """)
+            params = {'user_id': user_id, **{f'id_{i}': pid for i, pid in enumerate(ids)}}
+            rows = db.session.execute(q, params).fetchall()
+
+        # คืนลำดับให้ตรงกับ ids
+        order_map = {pid: i for i, pid in enumerate(ids)}
+        posts = [r._mapping for r in rows]
+        posts_sorted = sorted(posts, key=lambda x: order_map.get(x['id'], 10**9))
+
+        # สร้าง payload
+        out = []
+        for post in posts_sorted:
             try:
-                del recommendation_cache[user_id]
-            except Exception:
-                recommendation_cache.pop(user_id, None)
-            print(f"Cache for user_id: {user_id} invalidated due to client-side refresh request. Impression history RETAINED.")
-
-        # === ใช้ cache ถ้ายังสดมาก ๆ ลดโหลดเครื่อง ===
-        if user_id in recommendation_cache and not refresh_requested:
-            cached_data, cache_timestamp = recommendation_cache[user_id]
-            if (now - cache_timestamp).total_seconds() < (CACHE_EXPIRY_TIME_SECONDS / 2):
-                print(f"Returning VERY FRESH cached recommendations for user_id: {user_id}")
-                return jsonify(cached_data)
-            print(f"Cached recommendations for user_id: {user_id} are still valid but slightly old. Recalculating for freshness.")
-
-        # === โหลดข้อมูลสำหรับแนะนำจาก DB ===
-        content_based_data, collaborative_data = load_data_from_db()
-
-        # === โหลดโมเดล (กันไฟล์หาย/เพี้ยน) ===
-        try:
-            knn = joblib.load('KNN_Model.pkl')
-            collaborative_model = joblib.load('Collaborative_Model.pkl')
-            tfidf = joblib.load('TFIDF_Model.pkl')
-
-            # เตรียมฟีเจอร์ที่ต้องใช้ ถ้ายังไม่มีให้เติมแบบไม่ทับของเดิม
-            if 'NormalizedEngagement' not in content_based_data.columns:
-                content_based_data = normalize_engagement(content_based_data, user_column='owner_id', engagement_column='PostEngagement')
-
-            if 'CommentCount' not in content_based_data.columns:
-                content_based_data['CommentCount'] = analyze_comments(content_based_data['Comments'])
-                m = content_based_data['CommentCount'].max()
-                content_based_data['NormalizedCommentCount'] = (content_based_data['CommentCount'] / m) if m and m > 0 else 0.0
-
-            if 'WeightedEngagement' not in content_based_data.columns:
-                content_based_data['WeightedEngagement'] = content_based_data['NormalizedEngagement'] + content_based_data['NormalizedCommentCount']
-
-        except FileNotFoundError as e:
-            print(f"Error loading models: {e}")
-            return jsonify({"error": "Model files not found"}), 500
-        except Exception as e:
-            print(f"Error initializing models: {e}")
-            return jsonify({"error": "Model initialization failed"}), 500
-
-        # === กำหนดหมวดหมู่ (ใช้ชุดเดิม) ===
-        categories = ['Electronics_Gadgets', 'Furniture', 'Outdoor_Gear', 'Beauty_Products', 'Accessories']
-
-        # === คำนวณคำแนะนำแบบ Hybrid ===
-        recommendations = recommend_hybrid(
-            user_id,
-            content_based_data,
-            collaborative_model,
-            knn,
-            tfidf,
-            categories,
-            alpha=0.8,
-            beta=0.2
-        )
-        if not recommendations:
-            return jsonify({"error": "No recommendations found"}), 404
-
-        # === ดึง interaction ของ user สำหรับกรอง ===
-        user_interactions = collaborative_data[collaborative_data['user_id'] == user_id]['post_id'].tolist()
-
-        # === ใช้ impression history ที่แคชไว้ เพื่อลดการวนซ้ำโพสต์เดิม ===
-        current_impression_history = impression_history_cache.get(user_id, [])
-        print(f"Current Impression History for user {user_id}: {[entry['post_id'] for entry in current_impression_history]}")
-
-        # === จัดอันดับสุดท้าย ===
-        final_recommendations_ids = split_and_rank_recommendations(
-            recommendations,
-            user_interactions,
-            current_impression_history,
-            len(content_based_data)
-        )
-
-        # ถ้าไม่มี id หลังจัดอันดับ ให้ตอบ 404 ชัดเจน
-        if not final_recommendations_ids:
-            return jsonify({"error": "No recommendations after ranking"}), 404
-
-        # ลดขนาด IN ให้พอเหมาะ กัน param ระเบิด (ตัดให้พอ feed หน้าลิสต์แรก)
-        MAX_IDS = 200
-        final_ids_slice = final_recommendations_ids[:MAX_IDS]
-
-        # === ดึงโพสต์ตามลำดับ AI (รักษาโครง SQL เดิม แต่กันกรณีลิสต์ว่าง) ===
-        placeholders = ', '.join([f':id_{i}' for i in range(len(final_ids_slice))])
-        query = text(f"""
-            SELECT posts.*, users.username, users.picture,
-                   (SELECT COUNT(*) FROM likes WHERE post_id = posts.id AND user_id = :user_id) AS is_liked
-            FROM posts 
-            JOIN users ON posts.user_id = users.id
-            WHERE posts.status = 'active' AND posts.id IN ({placeholders})
-        """) if final_ids_slice else text("""
-            SELECT posts.*, users.username, users.picture,
-                   (SELECT 0) AS is_liked
-            FROM posts 
-            JOIN users ON posts.user_id = users.id
-            WHERE 1=0
-        """)
-
-        if final_ids_slice:
-            params = {'user_id': user_id, **{f'id_{i}': pid for i, pid in enumerate(final_ids_slice)}}
-            result = db.session.execute(query, params).fetchall()
-        else:
-            result = []
-
-        # === เรียงโพสต์ตามลำดับที่ AI ให้มา ===
-        id_to_rank = {pid: idx for idx, pid in enumerate(final_recommendations_ids)}
-        posts = [row._mapping for row in result]
-        sorted_posts = sorted(posts, key=lambda x: id_to_rank.get(x['id'], 10**9))
-
-        # === แปลงเป็น payload ฝั่ง client ===
-        output = []
-        for post in sorted_posts:
-            try:
-                updated = post['updated_at']
-                # เผื่อ driver คืน naive datetime
-                if hasattr(updated, 'tzinfo') and updated.tzinfo is None:
-                    updated = updated.replace(tzinfo=timezone.utc)
-                iso_updated = updated.astimezone(timezone.utc).replace(microsecond=0).isoformat() + 'Z'
+                updated = post.get('updated_at')
+                if updated is None:
+                    iso_updated = datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+                else:
+                    if getattr(updated, 'tzinfo', None) is None:
+                        updated = updated.replace(tzinfo=timezone.utc)
+                    iso_updated = updated.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
             except Exception:
                 iso_updated = datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
 
-            output.append({
+            out.append({
                 "id": post['id'],
                 "userId": post['user_id'],
-                "title": post['Title'],
-                "content": post['content'],
+                "title": post.get('Title'),
+                "content": post.get('content'),
                 "updated": iso_updated,
                 "photo_url": json.loads(post.get('photo_url', '[]') or '[]'),
                 "video_url": json.loads(post.get('video_url', '[]') or '[]'),
@@ -1391,30 +1484,10 @@ def recommend():
                 "is_liked": (post['is_liked'] or 0) > 0
             })
 
-        # === เขียน cache แบบปลอดภัย ===
-        recommendation_cache[user_id] = (output, now)
+        return jsonify(out), 200
 
-        # === อัปเดต impression history โดยไม่ให้โตเกินและไม่ซ้ำซ้อน ===
-        if user_id not in impression_history_cache:
-            impression_history_cache[user_id] = []
-
-        existing_set = {entry['post_id'] for entry in impression_history_cache[user_id]}
-        new_impressions = [{'post_id': pid, 'timestamp': now} for pid in final_recommendations_ids if pid not in existing_set]
-        impression_history_cache[user_id].extend(new_impressions)
-        impression_history_cache[user_id] = sorted(
-            impression_history_cache[user_id],
-            key=lambda x: x['timestamp'],
-            reverse=True
-        )[:IMPRESSION_HISTORY_MAX_ENTRIES]
-
-        print(f"Updated Impression History for user {user_id}: {[entry['post_id'] for entry in impression_history_cache[user_id]]}")
-        return jsonify(output)
-
-    except KeyError as e:
-        print(f"KeyError in recommend function: {e}")
-        return jsonify({"error": f"KeyError: {e}"}), 500
     except Exception as e:
-        print("Error in recommend function:", e)
+        # อยาก log ก็ใส่ logger.error(str(e)) เอาเอง
         return jsonify({"error": "Internal Server Error"}), 500
 
 
