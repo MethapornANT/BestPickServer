@@ -2293,7 +2293,6 @@ app.delete("/api/notifications", verifyToken, (req, res) => {
       console.error("Database error during deleting notification:", error);
       return res.status(500).json({ error: "Error deleting notification" });
     }
-    res.json({ message: "Notification deleted successfully" });
   });
 });
 
