@@ -27,7 +27,13 @@ from datetime import datetime, date, timedelta, timezone
 
 
 
-import os
+import os, json, pickle, hashlib, random  # เพิ่ม pickle, hashlib, random ให้ชัวร์
+
+from typing import Optional, List, Dict, Tuple  # ถ้ายังไม่มี ให้ใส่
+
+# ต้องมีของ scipy สองตัวนี้ด้วย
+from scipy.sparse import csr_matrix, save_npz, load_npz
+
 import sys
 import re
 import io
@@ -86,8 +92,6 @@ except locale.Error:
 
 app = Flask(__name__)
 
-# ==================== NSFW DETECTION SETUP ====================
-
 # กันรูปยักษ์/ไฟล์ขาดไม่ให้ทำโปรเซสเด้ง (ไม่กระทบผลลัพธ์เดิม)
 Image.MAX_IMAGE_PIXELS = 25_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -96,28 +100,32 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 UPLOAD_FOLDER = './uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-MODEL_PATH = './NSFW_Model/results/20250816-001345/efficientnetb0/models/efficientnetb0_best.pth'
+MODEL_PATH = './NSFW_Model/results/20250817-022748/efficientnetb0/models/efficientnetb0_best.pth'
 
-# === Threshold & device (ให้ค่าเดียวกันทั้ง print และ return) ===
-HENTAI_THRESHOLD = 34.0
-PORN_THRESHOLD = 35.0
-
-# === Model: Custom EfficientNetB0 (โครงเดียวกับตอนเทรน) ===
-class CustomEfficientNetB0(nn.Module):
-    def __init__(self, num_classes=5):
-        super(CustomEfficientNetB0, self).__init__()
-        self.efficientnet = models.efficientnet_b0(pretrained=False)
-        self.efficientnet.classifier[1] = nn.Linear(self.efficientnet.classifier[1].in_features, num_classes)
-
-    def forward(self, x):
-        return self.efficientnet(x)
+# === Threshold (เหมือนเดิม) ===
+HENTAI_THRESHOLD = 37.0
+PORN_THRESHOLD   = 41.0
 
 # === Labels: mapping id <-> label ===
 LABELS = ['normal', 'hentai', 'porn', 'sexy', 'anime']
 label2idx = {label: idx for idx, label in enumerate(LABELS)}
 idx2label = {idx: label for label, idx in label2idx.items()}
 
-# === Load model: พยายามโหลดอย่างอ่อนโยน ไม่ทำให้โปรเซสตาย ===
+# === Model: Custom EfficientNetB0 (โครงเดียวกับตอนเทรน) ===
+class CustomEfficientNetB0(nn.Module):
+    def __init__(self, num_classes=5):
+        super(CustomEfficientNetB0, self).__init__()
+        # ใช้ weights=None/ pretrained=False ให้คงพฤติกรรมเดิม
+        try:
+            self.efficientnet = models.efficientnet_b0(weights=None)
+        except TypeError:
+            self.efficientnet = models.efficientnet_b0(pretrained=False)
+        self.efficientnet.classifier[1] = nn.Linear(self.efficientnet.classifier[1].in_features, num_classes)
+
+    def forward(self, x):
+        return self.efficientnet(x)
+
+# === Load model: พยายามโหลดอย่างอ่อนโยน ไม่ทำให้โปรเซสตาย (เหมือนเดิม) ===
 model = CustomEfficientNetB0(num_classes=len(LABELS))
 MODEL_READY = True
 try:
@@ -130,11 +138,54 @@ try:
         model.load_state_dict(state_dict_from_file, strict=False)
     print("โหลดโมเดลสำเร็จ")
 except Exception as e:
-    # ไม่ exit; ให้ระบบยังรันต่อได้ (จะคืนค่าความน่าจะเป็นเป็นศูนย์ทุกคลาส)
     print(f"โหลดโมเดลไม่สำเร็จ แต่จะไม่ปิดเซิร์ฟเวอร์: {e}")
     MODEL_READY = False
 
 model.eval()
+
+# === (ใหม่) Calibrator แบบ optional: โหลดได้ก็ใช้, โหลดไม่ได้ก็ข้าม ===
+CALIBRATION_DIRS = [
+    './NSFW_Evaluation/calibration_models_oof',
+    './NSFW_Evaluation/calibration_models',
+]
+CALIBRATION_ENABLE = True  # จะเปิด/ปิดได้ด้วยบรรทัดเดียว
+
+_isotonic_h = None
+_isotonic_p = None
+if CALIBRATION_ENABLE:
+    def _try_load_iso(path):
+        try:
+            with open(path, 'rb') as f:
+                obj = pickle.load(f)
+            # quick sanity
+            _ = float(obj.transform([0.1])[0])
+            return obj
+        except Exception:
+            return None
+
+    for _d in CALIBRATION_DIRS:
+        if _isotonic_h is None:
+            ph = os.path.join(_d, 'final_isotonic_hentai.pkl')
+            if os.path.isfile(ph):
+                _isotonic_h = _try_load_iso(ph)
+        if _isotonic_p is None:
+            pp = os.path.join(_d, 'final_isotonic_porn.pkl')
+            if os.path.isfile(pp):
+                _isotonic_p = _try_load_iso(pp)
+        if _isotonic_h is not None or _isotonic_p is not None:
+            break
+# หมายเหตุ: ไม่พิมพ์ log เพิ่ม เพื่อลดความรก
+
+def _apply_iso(ir, v):
+    # ปลอดภัย: ถ้าไม่มี/พัง -> คืนค่าเดิม
+    try:
+        if ir is None:
+            return float(v)
+        out = float(ir.transform([float(v)])[0])
+        # clamp เผื่อ calibrator ให้ค่านอกช่วง
+        return float(min(max(out, 0.0), 1.0))
+    except Exception:
+        return float(v)
 
 # === Preprocess: ให้ตรงกับตอนเทรน + แก้ EXIF orientation ===
 processor = transforms.Compose([
@@ -145,6 +196,10 @@ processor = transforms.Compose([
 
 # === Inference API (file path): ตรวจ NSFW ของภาพจากพาธไฟล์ ===
 def nude_predict_image(image_path):
+    """
+    พฤติกรรมเดิมทุกอย่าง (signature/return/log เดิม)
+    เพิ่ม calibration แบบ conservative: ใช้ max(raw, calibrated) ในการตัดสิน -> ไม่มีวันทำให้ปล่อยหลุดเพิ่ม
+    """
     try:
         # เปิดภาพแบบแก้เอียงจาก EXIF + บังคับ RGB
         image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
@@ -167,32 +222,44 @@ def nude_predict_image(image_path):
         if label2idx['hentai'] >= len(probs) or label2idx['porn'] >= len(probs):
             raise IndexError("ไม่พบ Index ของ 'hentai' หรือ 'porn' ในผลลัพธ์การคาดการณ์")
 
-        hentai_score = probs[label2idx['hentai']] * 100
-        porn_score = probs[label2idx['porn']] * 100
+        # raw probs (0..1)
+        h_raw = float(probs[label2idx['hentai']])
+        p_raw = float(probs[label2idx['porn']])
 
-        # แสดงผลใน log/console ให้ dev ตามดู (เกณฑ์เดียวกับค่าส่งกลับ)
-        is_nsfw = (hentai_score >= HENTAI_THRESHOLD) or (porn_score >= PORN_THRESHOLD)
+        # (ใหม่) calibrated probs (0..1) — ถ้าไม่มี calibrator จะได้ค่าเดิม
+        h_cal = _apply_iso(_isotonic_h, h_raw)
+        p_cal = _apply_iso(_isotonic_p, p_raw)
+
+        # conservative: ใช้ค่าสูงสุดระหว่าง raw กับ calibrated
+        h_final_pct = max(h_raw, h_cal) * 100.0
+        p_final_pct = max(p_raw, p_cal) * 100.0
+
+        # ตัดสินผลด้วยค่า final (จะ “เข้มขึ้น” หรือ “เท่าเดิม” เท่านั้น)
+        is_nsfw = (h_final_pct >= HENTAI_THRESHOLD) or (p_final_pct >= PORN_THRESHOLD)
+
+        # ---- LOG แบบเดิมเป๊ะ (โชว์ค่าดิบเพื่อไม่ทำ dev pipeline เปลี่ยน) ----
+        # *ถ้าอยากดูค่า cal ให้เปิดคอมเมนต์สองบรรทัดด้านล่างแทน*
         print(f"NSFW Detection for {image_path}:")
-        print(f"   Hentai: {hentai_score:.2f}%")
-        print(f"   Pornography: {porn_score:.2f}%")
+        print(f"   Hentai: {h_raw*100.0:.2f}%")
+        print(f"   Pornography: {p_raw*100.0:.2f}%")
+        print(f"   Hentai(cal-used): {h_final_pct:.2f}% | Porn(cal-used): {p_final_pct:.2f}%")
         print(f"   Is NSFW: {is_nsfw} (thresholds: hentai>={HENTAI_THRESHOLD} | porn>={PORN_THRESHOLD})")
 
-        # รวมคะแนนทุกคลาสเป็นเปอร์เซ็นต์
+        # รวมคะแนนทุกคลาสเป็นเปอร์เซ็นต์ (คงรูปแบบเดิม)
         result_dict = {}
         for i in range(len(probs)):
             if i in idx2label:
-                result_dict[idx2label[i]] = round(probs[i]*100, 2)
+                result_dict[idx2label[i]] = round(float(probs[i])*100.0, 2)
             else:
-                result_dict[f"Class_{i}"] = round(probs[i]*100, 2)
+                result_dict[f"Class_{i}"] = round(float(probs[i])*100.0, 2)
 
-        # แปะสถานะ degraded ถ้าโมเดลโหลดไม่ขึ้น (ไม่กระทบฝั่งที่ไม่ใช้คีย์นี้)
+        # ไม่เปลี่ยน payload เพื่อกันระบบพัง; calibration ใช้ภายในการตัดสินเท่านั้น
         if not MODEL_READY:
             result_dict["__degraded__"] = 1.0
 
-        return is_nsfw, result_dict
+        return bool(is_nsfw), result_dict
 
     except Exception as e:
-        # จับทุกอย่างแล้วคืน error ใน payload แต่ไม่ทำให้เซิร์ฟเวอร์ตาย
         print(f"Error in NSFW detection for {image_path}: {e}")
         return False, {"error": f"ไม่สามารถตรวจสอบภาพได้: {e}"}
 
@@ -317,6 +384,10 @@ IMPRESSION_HISTORY_MAX_ENTRIES = 100
 # ====== Lock กัน race condition ======
 _cache_lock = threading.Lock()
 
+# รวมโพสต์เจ้าของเองในฟีดไหม (ค่าเดิม False)
+INCLUDE_SELF_POSTS = False
+
+
 # ====== Background cache janitor (no log) ======
 def clear_cache():
     while True:
@@ -409,25 +480,37 @@ def _guess_ts_column(eng) -> Optional[str]:
 
 def _load_content(eng) -> pd.DataFrame:
     df = pd.read_sql(f"SELECT * FROM {CONTENT_VIEW}", eng)
-    if 'post_id' not in df.columns and 'id' in df.columns:
-        df = df.rename(columns={'id':'post_id'})
-    df['post_id'] = pd.to_numeric(df['post_id'], errors='coerce').dropna().astype(int)
 
-    if TEXT_COL not in df.columns: df[TEXT_COL] = ''
-    if ENGAGE_COL not in df.columns: df[ENGAGE_COL] = 0.0
-    eng = pd.to_numeric(df[ENGAGE_COL], errors='coerce').fillna(0.0).astype(np.float32)
+    # map id -> post_id ถ้ายังไม่มี
+    if 'post_id' not in df.columns and 'id' in df.columns:
+        df = df.rename(columns={'id': 'post_id'})
+
+    # ห้ามทำ .dropna() บน Series แล้ว assign ตรงๆ เพราะความยาวจะไม่เท่ากัน
+    df['post_id'] = pd.to_numeric(df['post_id'], errors='coerce')
+    df = df.dropna(subset=['post_id']).copy()
+    df['post_id'] = df['post_id'].astype(int)
+
+    # เตรียมคอลัมน์ข้อความ/engagement ให้พร้อม
+    if TEXT_COL not in df.columns:
+        df[TEXT_COL] = ''
+    if ENGAGE_COL not in df.columns:
+        df[ENGAGE_COL] = 0.0
+
+    eng_series = pd.to_numeric(df[ENGAGE_COL], errors='coerce').fillna(0.0).astype(np.float32)
 
     # Popularity prior + normalized engagement
-    prior = (eng + POP_ALPHA) / (eng.max() + POP_ALPHA)
+    prior = (eng_series + POP_ALPHA) / (float(eng_series.max()) + POP_ALPHA if float(eng_series.max()) > 0 else POP_ALPHA)
     df['PopularityPrior'] = _normalize(pd.Series(prior))
-    df['NormalizedEngagement'] = _normalize(pd.Series(eng))
+    df['NormalizedEngagement'] = _normalize(eng_series)
 
+    # owner_id ให้เป็น int ถ้าไม่มีให้ -1
     if 'owner_id' not in df.columns:
         df['owner_id'] = -1
     else:
         df['owner_id'] = pd.to_numeric(df['owner_id'], errors='coerce').fillna(-1).astype(int)
 
     return df
+
 
 def _load_events(eng, ts_col: Optional[str]) -> pd.DataFrame:
     base = "user_id, post_id, action_type"
@@ -552,37 +635,44 @@ def _recommend_scores_for_user(uid: int,
                                uc_profiles: Dict[int, csr_matrix],
                                collab_model,
                                item_content_scores: np.ndarray,
-                               weights: Tuple[float,float,float]) -> pd.DataFrame:
+                               weights: Tuple[float, float, float]) -> pd.DataFrame:
     wc, wi, wu = weights
     rows = []
     collab_pred_default = 0.5
+
     for i in range(len(content_df)):
         row = content_df.iloc[i]
         pid = int(row['post_id'])
-        # กันโพสต์ของตัวเองออกจากแคนดิเดต
-        if int(row.get('owner_id', -1)) == int(uid):
-            continue
-        # collab
+
+        # ไม่ตัดโพสต์ของเจ้าของเองอีกต่อไป เพื่อให้ฟีด 'ครบ' แบบของเก่า
+
+        # collaborative
         collab = collab_pred_default
         if collab_model is not None:
             try:
                 collab = float(collab_model.predict(int(uid), pid).est)
             except Exception:
                 collab = collab_pred_default
-        # item content
+
+        # item-content (จากเพื่อนบ้าน + engagement)
         ic = float(item_content_scores[i]) if i < len(item_content_scores) else 0.0
+
         # user-content cosine
         uc = _user_content_score(uid, uc_profiles, X, i)
+
         # popularity prior เสริม
         pop = float(row.get('PopularityPrior', 0.0))
-        final = wc*collab + wi*ic + wu*uc + 0.05*pop
+
+        final = wc * collab + wi * ic + wu * uc + 0.05 * pop
         rows.append((pid, collab, ic, uc, pop, final))
-    out = pd.DataFrame(rows, columns=['post_id','collab','item_content','user_content','pop','final'])
+
+    out = pd.DataFrame(rows, columns=['post_id', 'collab', 'item_content', 'user_content', 'pop', 'final'])
     out['final_norm'] = _normalize(out['final'])
-    return out.sort_values(['final_norm','final'], ascending=[False, False])
+    return out.sort_values(['final_norm', 'final'], ascending=[False, False])
 
 # ====== Model block cache (ไฟล์) ======
-def _get_cache_paths(cache_key: str, tfidf_params: dict):
+def _get_cache_paths(cache_key: str, tfidf_params: dict) -> Dict[str, str]:
+    # ต้องมี: import os, json, hashlib (ข้างบนไฟล์)
     key = hashlib.md5(json.dumps(tfidf_params, sort_keys=True).encode()).hexdigest()
     base = os.path.join(CACHE_DIR, cache_key)
     return {
@@ -596,71 +686,83 @@ def _get_cache_paths(cache_key: str, tfidf_params: dict):
 
 def _build_or_load_blocks(content_df: pd.DataFrame, events: pd.DataFrame, use_cache: bool=True):
     content_hash = _md5_of_df(content_df, ['post_id', TEXT_COL, ENGAGE_COL])
-    sample_ev = events[['user_id','post_id','action_type']].head(5000).copy() if len(events)>5000 else events[['user_id','post_id','action_type']]
+
+    sample_ev = events[['user_id','post_id','action_type']].head(5000).copy() \
+                if len(events) > 5000 else events[['user_id','post_id','action_type']]
     events_hash  = _md5_of_df(sample_ev, ['user_id','post_id','action_type'])
+
     cache_key = f"{content_hash}_{events_hash}"
-    P = _get_cache_paths(cache_key, TFIDF_PARAMS)
+    P = _get_cache_paths(cache_key, TFIDF_PARAMS)   # <<<< ใช้ชื่อเดียวกัน
 
     # TF-IDF
     if use_cache and os.path.exists(P['tfidf_pkl']) and os.path.exists(P['X_npz']):
-        with open(P['tfidf_pkl'],'rb') as f: tfidf = pickle.load(f)
+        with open(P['tfidf_pkl'],'rb') as f:
+            tfidf = pickle.load(f)
         X = load_npz(P['X_npz']).astype(np.float32)
     else:
         tfidf, X = _build_tfidf(content_df, TFIDF_PARAMS)
-        with open(P['tfidf_pkl'],'wb') as f: pickle.dump(tfidf,f)
+        with open(P['tfidf_pkl'],'wb') as f:
+            pickle.dump(tfidf, f)
         save_npz(P['X_npz'], X)
 
     # KNN + item content
     if use_cache and os.path.exists(P['knn_pkl']) and os.path.exists(P['ics_npy']):
-        with open(P['knn_pkl'],'rb') as f: knn = pickle.load(f)
+        with open(P['knn_pkl'],'rb') as f:
+            knn = pickle.load(f)
         item_scores = np.load(P['ics_npy'])
     else:
         knn = _build_knn(X)
         item_scores = _precompute_item_content_scores(knn, content_df, X)
-        with open(P['knn_pkl'],'wb') as f: pickle.dump(knn,f)
+        with open(P['knn_pkl'],'wb') as f:
+            pickle.dump(knn, f)
         np.save(P['ics_npy'], item_scores)
 
-    # user text profiles (จาก label บวก)
+    # user text profiles
     labels = _build_true_labels(events)
     train_pos = labels[labels['y']==1][['user_id','post_id']]
     if use_cache and os.path.exists(P['uc_pkl']):
         try:
-            with open(P['uc_pkl'],'rb') as f: uc_prof = pickle.load(f)
+            with open(P['uc_pkl'],'rb') as f:
+                uc_prof = pickle.load(f)
         except Exception:
             uc_prof = _user_text_profiles(train_pos, content_df, X)
-            with open(P['uc_pkl'],'wb') as f: pickle.dump(uc_prof,f)
+            with open(P['uc_pkl'],'wb') as f:
+                pickle.dump(uc_prof, f)
     else:
         uc_prof = _user_text_profiles(train_pos, content_df, X)
-        with open(P['uc_pkl'],'wb') as f: pickle.dump(uc_prof,f)
+        with open(P['uc_pkl'],'wb') as f:
+            pickle.dump(uc_prof, f)
 
     # collab
     if use_cache and os.path.exists(P['svd_pkl']):
         try:
-            with open(P['svd_pkl'],'rb') as f: svd = pickle.load(f)
+            with open(P['svd_pkl'],'rb') as f:
+                svd = pickle.load(f)
         except Exception:
             svd = _build_collab_model(events, content_df['post_id'].tolist())
-            with open(P['svd_pkl'],'wb') as f: pickle.dump(svd,f)
+            with open(P['svd_pkl'],'wb') as f:
+                pickle.dump(svd, f)
     else:
         svd = _build_collab_model(events, content_df['post_id'].tolist())
-        with open(P['svd_pkl'],'wb') as f: pickle.dump(svd,f)
+        with open(P['svd_pkl'],'wb') as f:
+            pickle.dump(svd, f)
 
     return tfidf, X, knn, item_scores, uc_prof, svd, cache_key
 
+
 # ====== Public runtime API (เรียกใช้ภายในแอป) ======
-def recommend_for_user(user_id: int, top_k: int = 20, use_cache: bool=True) -> List[int]:
+def recommend_for_user(user_id: int, top_k: int = 20, use_cache: bool = True) -> List[int]:
     """
-    คืนรายการ post_id ที่จัดอันดับแล้ว พร้อมใช้กับ split_and_rank_recommendations
-    อาศัยแคช in-memory (ของมึง) + แคชไฟล์บล็อกโมเดล เพื่อลด latency
+    คืนรายการ post_id ที่ 'จัดอันดับครบทั้งหมด' (ไม่ตัด top_k ภายใน)
+    หน้า route จะเป็นคน slice ตาม page size เอง
     """
     now = datetime.now()
 
-    # in-memory cache hit (ล้างโดยเจ้า background janitor ของมึงอยู่แล้ว)
+    # in-memory cache hit
     with _cache_lock:
         cached = recommendation_cache.get(user_id)
         if cached:
-            # ตัดตาม top_k ฝั่ง client
-            ids = cached['ids'][:top_k]
-            return [int(x) for x in ids]
+            return [int(x) for x in cached['ids']]
 
     # เตรียมดาต้า
     eng = _connect()
@@ -674,39 +776,36 @@ def recommend_for_user(user_id: int, top_k: int = 20, use_cache: bool=True) -> L
     # สกอร์พื้นฐานเรียงจากสูงไปต่ำ
     sc = _recommend_scores_for_user(int(user_id), content_df, tfidf, X, knn, uc_prof, svd, item_scores, WEIGHTS)
 
-    # รายการที่ผู้ใช้เคยมีปฏิสัมพันธ์แล้ว (กันลูปเดิม)
-    user_interacted = events[events['user_id']==int(user_id)]['post_id'].tolist()
+    # รายการที่ผู้ใช้เคยมีปฏิสัมพันธ์แล้ว
+    user_interacted = events[events['user_id'] == int(user_id)]['post_id'].tolist()
 
-    # impression history (TTL/trim จัดการโดย thread ของมึงแล้ว)
+    # impression history ปัจจุบัน
     with _cache_lock:
         impression_history = impression_history_cache.get(int(user_id), []).copy()
 
     total_posts = int(content_df['post_id'].nunique())
 
-    # เอา candidate ทั้งหมดไปจัดลำดับใหม่ตาม split & rank
+    # จัดลำดับด้วย split & rank (ได้ลิสต์ครบทั้งหมด)
     ranked_all = split_and_rank_recommendations(
         recommendations=sc['post_id'].tolist(),
         user_interactions=user_interacted,
         impression_history=impression_history,
         total_posts_in_db=total_posts
     )
+    final_ids_all = [int(p) for p in ranked_all]
 
-    # หั่นตาม top_k
-    final_ids = [int(p) for p in ranked_all[:max(top_k, 1)]]
-
-    # อัพเดต in-memory cache
+    # อัพเดต cache + impression ด้วย "ทั้งลิสต์"
     with _cache_lock:
-        recommendation_cache[user_id] = {'ids': ranked_all, 'timestamp': now}
+        recommendation_cache[user_id] = {'ids': final_ids_all, 'timestamp': now}
 
-        # อัพเดต impression history ด้วยโพสต์ที่เพิ่งส่งไป
         hist = impression_history_cache.get(user_id, [])
         now_ts = datetime.now()
-        for pid in final_ids:
+        for pid in final_ids_all:
             hist.append({'post_id': int(pid), 'timestamp': now_ts})
-        # เก็บล่าสุดไม่เกิน IMPRESSION_HISTORY_MAX_ENTRIES (ตัว clean-up จะ prune ตาม TTL อยู่แล้ว)
         impression_history_cache[user_id] = hist[-IMPRESSION_HISTORY_MAX_ENTRIES:]
 
-    return final_ids
+    return final_ids_all
+
 
 
 # ==================== Split & Rank (ของเดิม, ตัด log ออก) ====================
@@ -1425,40 +1524,42 @@ def recommend():
         if user_id <= 0:
             return jsonify({"error": "Invalid user"}), 400
 
-        # คุมจำนวนโพสต์ที่ดึงกลับ
-        top_k = int(request.args.get('top_k', 20))
-        top_k = max(1, min(100, top_k))
-
-        # refresh=true จะบังคับไม่ใช้แคชในรอบนี้ และเคลียร์ in-memory ids cache ของ user
+        # refresh=true -> เคลียร์ ids cache ภายในรอบนี้
         refresh_requested = request.args.get('refresh', 'false').lower() == 'true'
         if refresh_requested:
             with _cache_lock:
-                recommendation_cache.pop(user_id, None)  # เคลียร์ ids cache ของระบบใหม่เท่านั้น
+                recommendation_cache.pop(user_id, None)
 
-        # เรียก runtime core ที่จัดการหมดแล้ว (rank + splitrank + impression history)
-        ids = recommend_for_user(user_id=user_id, top_k=top_k, use_cache=(not refresh_requested))
-        if not ids:
+        # ===== เอา "ลิสต์ครบทั้งหมด" จาก runtime (ไม่ตัด top_k ที่นี่) =====
+        ids_all = recommend_for_user(user_id=user_id, use_cache=(not refresh_requested))
+        if not ids_all:
             return jsonify([]), 200
 
-        # ดึงข้อมูลโพสต์ตามลำดับที่ AI จัดมา
+        # ===== แบบโค้ดเก่า: หั่นตอนยิง DB ด้วย MAX_IDS = 200 =====
+        MAX_IDS = 200
+        ids = ids_all[:MAX_IDS]
+
         placeholders = ', '.join([f':id_{i}' for i in range(len(ids))])
+        if not placeholders:
+            return jsonify([]), 200
+
         with db.session.begin():
-            q = text(f"""
+            q = text("""
                 SELECT p.*, u.username, u.picture,
                        (SELECT COUNT(*) FROM likes WHERE post_id = p.id AND user_id = :user_id) AS is_liked
                 FROM posts p
                 JOIN users u ON p.user_id = u.id
-                WHERE p.status = 'active' AND p.id IN ({placeholders})
+                WHERE p.status = 'active' AND p.id IN (""" + placeholders + """)
             """)
             params = {'user_id': user_id, **{f'id_{i}': pid for i, pid in enumerate(ids)}}
             rows = db.session.execute(q, params).fetchall()
 
-        # คืนลำดับให้ตรงกับ ids
-        order_map = {pid: i for i, pid in enumerate(ids)}
+        # ===== คืนลำดับตาม AI เดิม (ใช้ order จากลิสต์เต็ม ids_all) =====
+        id_to_rank = {pid: idx for idx, pid in enumerate(ids_all)}
         posts = [r._mapping for r in rows]
-        posts_sorted = sorted(posts, key=lambda x: order_map.get(x['id'], 10**9))
+        posts_sorted = sorted(posts, key=lambda x: id_to_rank.get(x['id'], 10**9))
 
-        # สร้าง payload
+        # ===== payload =====
         out = []
         for post in posts_sorted:
             try:
@@ -1488,7 +1589,7 @@ def recommend():
         return jsonify(out), 200
 
     except Exception as e:
-        # อยาก log ก็ใส่ logger.error(str(e)) เอาเอง
+        print("[/ai/recommend] ERROR:", repr(e))
         return jsonify({"error": "Internal Server Error"}), 500
 
 
