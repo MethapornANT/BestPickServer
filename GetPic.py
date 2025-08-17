@@ -17,7 +17,7 @@ CATEGORY_SEARCHES = {
     "hentai": ["hentai", "hentai girl", "hentai boy", "hentai nude", "cartoon porn", "hentai fuck", "hentai cute", "hentai beautiful"],
     "normal": ["boy", "girl", "women", "man", "cat" , "nature", "athlete", "footballer", "dog", "animal"],
     "porn": ["porn xxx", "nude porn", "pussy xxx", "cock xxx", "gay porn", "sex porn", "hardcore porn", "adult porn", "lesbian porn"],
-    "sexy": ["bikini girl", "sexy girl", "bikini women", "sexy", "sexy man", "cartoon sexy", "underwear sexy", "hot girl", "lingeries"]
+    "sexy": ["bikini girl", "sexy girl", "bikini women", "sexy", "sexy man", "cartoon sexy", "underwear sexy", "hot girl", "lingeries", "no bra sexy"]
 }
 MAX_IMAGES_PER_CATEGORY = 3000          # จำนวนรูปต่อหมวดหมู่
 MAX_RELATED_DEPTH = 3                   # เพิ่มความลึกของ related search
