@@ -25,14 +25,10 @@ from pythainlp.tokenize import word_tokenize
 from PIL import Image, ImageOps, ImageFile
 from datetime import datetime, date, timedelta, timezone
 
-
-
-import os, json, pickle, hashlib, random  # เพิ่ม pickle, hashlib, random ให้ชัวร์
-
-from typing import Optional, List, Dict, Tuple  # ถ้ายังไม่มี ให้ใส่
-
-# ต้องมีของ scipy สองตัวนี้ด้วย
+from sqlalchemy import create_engine, text
 from scipy.sparse import csr_matrix, save_npz, load_npz
+import os, json, pickle, hashlib, random
+from typing import Optional, List, Dict, Tuple
 
 import sys
 import re
@@ -59,36 +55,13 @@ import seaborn as sns
 import threading
 import qrcode
 
-
 import os, time, math, json, pickle, random, hashlib, threading
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
-import numpy as np
-import pandas as pd
 from sqlalchemy import create_engine
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import normalize as sk_normalize
 from scipy.sparse import csr_matrix
 from scipy.sparse import load_npz, save_npz
-from surprise import SVD, Dataset, Reader
-
-
-# optional deps / locale
-try:
-    from promptpay import qrcode as promptpay_qrcode
-except ImportError:
-    promptpay_qrcode = None
-
-try:
-    locale.setlocale(locale.LC_ALL, 'th_TH.UTF-8')
-except locale.Error:
-    try:
-        locale.setlocale(locale.LC_ALL, 'thai')
-    except locale.Error:
-        print("⚠️ [WARN] Could not set Thai locale. Date formatting might not show full Thai month names.")
 
 app = Flask(__name__)
 
@@ -371,13 +344,6 @@ if not JWT_SECRET:
 
 # ==================== RECOMMENDATION SYSTEM FUNCTIONS ====================
 
-from sqlalchemy import create_engine, text
-from scipy.sparse import csr_matrix, save_npz, load_npz
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import normalize as sk_normalize
-from surprise import Dataset, Reader, SVD
-
 # ============================ CONFIG (ปรับง่ายที่เดียว) =========================
 DB_URI = os.getenv("BESTPICK_DB_URI", "mysql+mysqlconnector://root:1234@localhost/bestpick")
 
@@ -517,10 +483,59 @@ def _normalize_vec(v) -> np.ndarray:
         return np.zeros_like(v, dtype=np.float32)
     return (v - mn) / (rng + 1e-12)
 
-
 def _md5_of_df(df: pd.DataFrame, cols: List[str]) -> str:
+    """
+    Robust MD5 snapshot of selected columns.
+    Uses pandas.hash_pandas_object and converts to bytes safely.
+    """
     snap = df[cols].copy().fillna(0)
-    return hashlib.md5(pd.util.hash_pandas_object(snap, index=False).values).hexdigest()
+    try:
+        arr = pd.util.hash_pandas_object(snap, index=False).values
+        # ensure bytes (works for numpy dtypes)
+        b = arr.tobytes()
+    except Exception:
+        # fallback to deterministic JSON bytes (slower but safe)
+        try:
+            b = json.dumps(snap.to_dict(), sort_keys=True, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            # ultimate fallback
+            b = str(snap.values.tolist()).encode("utf-8")
+    return hashlib.md5(b).hexdigest()
+
+def _atomic_write_file(path: str, data_bytes: bytes):
+    """Write bytes atomically (write tmp -> replace)."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data_bytes)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, path)
+    except Exception:
+        # best-effort; if atomic replace fails, try simple write
+        try:
+            with open(path, "wb") as f:
+                f.write(data_bytes)
+        except Exception:
+            pass
+
+
+def _safe_pickle_load(path: str):
+    """Return loaded object or None. If file corrupt, remove it and return None."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return None
 
 def _safe_get_body():
     body = request.get_json(silent=True)
@@ -690,16 +705,284 @@ def _record_impressions(user_id: int, post_ids: List[int]):
     impression_history_cache[user_id] = hist[-IMPRESSION_HISTORY_MAX_ENTRIES:]
 
 def _cache_janitor():
+    """
+    Periodically:
+      - prune stale entries in recommendation_cache (by timestamp)
+      - prune impression_history_cache entries older than TTL and cap per-user history
+    """
     while True:
         try:
+            now = datetime.utcnow()
             with _cache_lock:
-                recommendation_cache.clear()
-                # prune impressions by TTL is already in _get_impressions
+                # prune recommendation_cache entries older than expiry
+                stale_keys = []
+                for k, v in list(recommendation_cache.items()):
+                    ts = v.get("timestamp")
+                    try:
+                        if ts is None or (now - ts).total_seconds() >= CACHE_EXPIRY_TIME_SECONDS:
+                            stale_keys.append(k)
+                    except Exception:
+                        stale_keys.append(k)
+                for k in stale_keys:
+                    recommendation_cache.pop(k, None)
+
+                # prune impression_history_cache by TTL and cap entries per user
+                for uid, hist in list(impression_history_cache.items()):
+                    try:
+                        newhist = [h for h in hist if (now - h["ts"]).total_seconds() < IMPRESSION_HISTORY_TTL_SECONDS]
+                        if newhist:
+                            impression_history_cache[uid] = newhist[-IMPRESSION_HISTORY_MAX_ENTRIES:]
+                        else:
+                            impression_history_cache.pop(uid, None)
+                    except Exception:
+                        # if structure unexpected, remove it to avoid uncontrolled growth
+                        impression_history_cache.pop(uid, None)
         except Exception:
+            # swallow errors to avoid terminating the janitor thread
             pass
         time.sleep(CACHE_EXPIRY_TIME_SECONDS)
 
-threading.Thread(target=_cache_janitor, daemon=True).start()
+# ------------------ ADD: simple file lock helpers (UTILITIES) ------------------
+def _acquire_simple_lock(lock_path: str, wait_seconds: float = 30.0, poll: float = 0.5) -> bool:
+    """
+    Try to create a lock file atomically. If exists, wait up to wait_seconds.
+    Returns True if lock acquired, False otherwise.
+    Lock file content: pid + iso timestamp
+    """
+    start = time.time()
+    pid = os.getpid()
+    while True:
+        try:
+            # O_CREAT | O_EXCL ensures atomic create
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(f"{pid}\n{datetime.utcnow().isoformat()}Z\n")
+                return True
+            except Exception:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                # fallthrough to wait
+        except FileExistsError:
+            # lock exists -> check age; if stale, remove it
+            try:
+                stat = os.stat(lock_path)
+                age = time.time() - stat.st_mtime
+                # if lock older than 10 * wait_seconds, consider stale and remove
+                if age > max(60.0, wait_seconds * 10):
+                    try:
+                        os.remove(lock_path)
+                        # retry immediately
+                        continue
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if (time.time() - start) >= wait_seconds:
+                return False
+            time.sleep(poll)
+        except Exception:
+            # unknown problem creating lock -> fail safe
+            return False
+
+def _release_simple_lock(lock_path: str):
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception:
+        pass
+
+
+# ------------------ ADD: background model builder wrapper ------------------
+def _ensure_models_worker(content_df: pd.DataFrame, events_all: pd.DataFrame, cache_key: str, cache_dir: str):
+    """
+    Worker that actually builds models and writes cache files atomically.
+    This runs in a daemon thread if non-blocking mode is used.
+    """
+    fp_tfidf = os.path.join(cache_dir, cache_key + ".tfidf.pkl")
+    fp_X     = os.path.join(cache_dir, cache_key + ".X.npz")
+    fp_knn   = os.path.join(cache_dir, cache_key + ".knn.pkl")
+    fp_item  = os.path.join(cache_dir, cache_key + ".item.npy")
+    fp_ut    = os.path.join(cache_dir, cache_key + ".ut.pkl")
+    fp_svd   = os.path.join(cache_dir, cache_key + ".svd.pkl")
+    lock_path = os.path.join(cache_dir, cache_key + ".lock")
+
+    acquired = _acquire_simple_lock(lock_path, wait_seconds=10.0)
+    if not acquired:
+        # someone else building or cannot get lock — give up quietly
+        return
+    try:
+        # build TF-IDF/X if missing
+        tfidf = _safe_pickle_load(fp_tfidf)
+        X = None
+        if tfidf is None or not os.path.exists(fp_X):
+            try:
+                tfidf, X, postidx, _ = build_contentbased_models(content_df)
+                # atomic write
+                try:
+                    _atomic_write_file(fp_tfidf, pickle.dumps(tfidf))
+                except Exception:
+                    pass
+                try:
+                    save_npz(fp_X, X)
+                except Exception:
+                    pass
+            except Exception:
+                # cannot build tfidf -> abort worker
+                return
+        else:
+            try:
+                X = load_npz(fp_X).astype(np.float32)
+            except Exception:
+                # fallback: rebuild
+                try:
+                    tfidf, X, postidx, _ = build_contentbased_models(content_df)
+                    _atomic_write_file(fp_tfidf, pickle.dumps(tfidf))
+                    save_npz(fp_X, X)
+                except Exception:
+                    return
+
+        # build knn + item_scores if missing
+        knn = _safe_pickle_load(fp_knn)
+        item_scores = None
+        if knn is None or not os.path.exists(fp_item):
+            try:
+                knn = _build_knn(X)
+                item_scores = _precompute_item_content_scores(knn, content_df, X)
+                try:
+                    _atomic_write_file(fp_knn, pickle.dumps(knn))
+                except Exception:
+                    pass
+                try:
+                    np.save(fp_item, item_scores)
+                except Exception:
+                    pass
+            except Exception:
+                # skip but don't fatal
+                knn = None
+
+        # build user text profiles (ut_profiles)
+        ut = _safe_pickle_load(fp_ut)
+        if ut is None:
+            try:
+                # create train_pos like in main flow (positive actions)
+                t = events_all.groupby(["user_id","post_id","action_type"]).size().reset_index(name="cnt")
+                if t.empty:
+                    train_pos = pd.DataFrame(columns=["user_id","post_id"])
+                else:
+                    pvt = t.pivot_table(index=["user_id","post_id"], columns="action_type",
+                                        values="cnt", fill_value=0, aggfunc="sum").reset_index()
+                    pvt.columns = [str(c).lower() for c in pvt.columns]
+                    pos = np.zeros(len(pvt), dtype=bool)
+                    for a in POS_ACTIONS:
+                        if a in pvt.columns: pos |= (pvt[a].to_numpy(dtype=float) > 0)
+                    if "view" in pvt.columns: pos |= (pvt["view"].to_numpy(dtype=float) >= VIEW_POS_MIN)
+                    if NEG_ACTIONS:
+                        neg = np.zeros(len(pvt), dtype=bool)
+                        for a in NEG_ACTIONS:
+                            if a in pvt.columns: neg |= (pvt[a].to_numpy(dtype=float) > 0)
+                        pos = np.where(neg, False, pos)
+                    labels = pvt[["user_id","post_id"]].copy(); labels["y"] = pos.astype(int)
+                    train_pos = labels[labels["y"]==1][["user_id","post_id"]]
+                ut_profiles = _user_text_profiles(train_pos, content_df, X)
+                try:
+                    _atomic_write_file(fp_ut, pickle.dumps(ut_profiles))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # build collaborative SVD (with resource-safe fallback)
+        svd = _safe_pickle_load(fp_svd)
+        if svd is None:
+            try:
+                svd = build_collaborative_model(events_all, content_df["post_id"].astype(int).tolist())
+                # if build_collaborative_model is heavy/failed, try a lighter attempt
+            except Exception:
+                svd = None
+
+            # fallback lighter SVD attempt if failed
+            if svd is None:
+                try:
+                    # lightweight SVD: fewer factors/epochs to avoid OOM
+                    e = events_all[events_all["post_id"].isin(content_df["post_id"].astype(int).tolist())].copy()
+                    if not e.empty:
+                        t = e.groupby(["user_id","post_id","action_type"]).size().reset_index(name="cnt")
+                        pvt = t.pivot_table(index=["user_id","post_id"], columns="action_type",
+                                            values="cnt", fill_value=0, aggfunc="sum").reset_index()
+                        rating = np.zeros(len(pvt), dtype=np.float32)
+                        for act, w in ACTION_WEIGHT.items():
+                            if act in pvt.columns:
+                                rating += np.float32(w) * pvt[act].to_numpy(dtype=np.float32)
+                        if "view" in pvt.columns:
+                            rating += np.where(pvt["view"].to_numpy(dtype=np.float32) >= VIEW_POS_MIN, np.float32(2.0), np.float32(0.0))
+                        rating = np.clip(rating, RATING_MIN, RATING_MAX)
+                        data = pvt[["user_id","post_id"]].copy()
+                        data["rating"] = rating
+                        data = data[data["rating"] > 0]
+                        if not data.empty:
+                            reader = Reader(rating_scale=(RATING_MIN, RATING_MAX))
+                            dset = Dataset.load_from_df(data[["user_id","post_id","rating"]], reader)
+                            trainset = dset.build_full_trainset()
+                            model = SVD(n_factors=64, n_epochs=10, lr_all=0.01, reg_all=0.5)
+                            model.fit(trainset)
+                            svd = model
+                except Exception:
+                    svd = None
+
+            if svd is not None:
+                try:
+                    _atomic_write_file(fp_svd, pickle.dumps(svd))
+                except Exception:
+                    pass
+    finally:
+        _release_simple_lock(lock_path)
+
+
+# ------------------ ADD: ensure_models_built (call this from get_hybridrecommendation_order) ------------------
+def ensure_models_built(content_df: pd.DataFrame, events_all: pd.DataFrame, cache_key: str, cache_dir: str = CACHE_DIR,
+                        force: bool = False, non_blocking: bool = True) -> None:
+    """
+    Ensure tfidf/X, knn/item_scores, ut_profiles, and svd are built (cached).
+    - If non_blocking=True and models missing, spawn a daemon thread to build them and return immediately.
+    - If non_blocking=False, will block trying to acquire lock and build (up to lock timeout).
+    """
+    fp_tfidf = os.path.join(cache_dir, cache_key + ".tfidf.pkl")
+    fp_X     = os.path.join(cache_dir, cache_key + ".X.npz")
+    fp_knn   = os.path.join(cache_dir, cache_key + ".knn.pkl")
+    fp_item  = os.path.join(cache_dir, cache_key + ".item.npy")
+    fp_ut    = os.path.join(cache_dir, cache_key + ".ut.pkl")
+    fp_svd   = os.path.join(cache_dir, cache_key + ".svd.pkl")
+
+    need_build = force or not (os.path.exists(fp_tfidf) and os.path.exists(fp_X) and os.path.exists(fp_knn) and os.path.exists(fp_item) and os.path.exists(fp_ut) and os.path.exists(fp_svd))
+
+    if not need_build:
+        return
+
+    lock_path = os.path.join(cache_dir, cache_key + ".lock")
+    if non_blocking:
+        # spawn background thread to do the heavy lifting
+        try:
+            th = threading.Thread(target=_ensure_models_worker, args=(content_df, events_all, cache_key, cache_dir), daemon=True)
+            th.start()
+            return
+        except Exception:
+            # if cannot spawn, fallback to blocking attempt
+            non_blocking = False
+
+    # blocking path: try to acquire lock and build inline (use small timeout)
+    acquired = _acquire_simple_lock(lock_path, wait_seconds=30.0)
+    if not acquired:
+        # cannot obtain lock => another process is building; return
+        return
+    try:
+        # call worker inline (reuse same function)
+        _ensure_models_worker(content_df, events_all, cache_key, cache_dir)
+    finally:
+        _release_simple_lock(lock_path)
+
 
 # =========================== CONTENT-BASED (Models) =============================
 def build_contentbased_models(content_df: pd.DataFrame):
@@ -721,15 +1004,36 @@ def _build_knn(X: csr_matrix):
     return knn
 
 def _precompute_item_content_scores(knn, content_df: pd.DataFrame, X: csr_matrix) -> np.ndarray:
+    """
+    Vectorized version:
+      - use knn.kneighbors to get neighbor indices for every item
+      - compute mean of NormalizedEngagement for neighbors using numpy indexing
+    """
     n = X.shape[0]
-    scores = np.zeros(n, dtype=np.float32)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
     k = min(20, n)
-    if n == 0: return scores
-    dists, idxs = knn.kneighbors(X, n_neighbors=k)
-    eng = content_df["NormalizedEngagement"].to_numpy(dtype=np.float32)
-    for i in range(n):
-        scores[i] = float(np.mean(eng[idxs[i]])) if idxs[i].size else 0.0
-    return scores
+    try:
+        dists, idxs = knn.kneighbors(X, n_neighbors=k)
+        # idxs shape: (n, k)
+        eng = content_df["NormalizedEngagement"].to_numpy(dtype=np.float32)
+        # handle possible edge cases
+        if idxs.size == 0:
+            return np.zeros(n, dtype=np.float32)
+        scores = np.mean(eng[idxs], axis=1).astype(np.float32)
+        return scores
+    except Exception:
+        # fallback to safe (loop) version if knn.kneighbors fails unexpectedly
+        scores = np.zeros(n, dtype=np.float32)
+        try:
+            dists, idxs = knn.kneighbors(X, n_neighbors=min(5, n))
+            for i in range(n):
+                jidx = idxs[i]
+                if jidx.size:
+                    scores[i] = float(np.mean(content_df["NormalizedEngagement"].to_numpy(dtype=np.float32)[jidx]))
+        except Exception:
+            pass
+        return scores
 
 def _user_text_profile(user_id: int, user_events: pd.DataFrame, content_df: pd.DataFrame, X: csr_matrix) -> csr_matrix:
     """
@@ -989,28 +1293,80 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
     fp_item  = os.path.join(CACHE_DIR, cache_key + ".item.npy")
     fp_ut    = os.path.join(CACHE_DIR, cache_key + ".ut.pkl")
     fp_svd   = os.path.join(CACHE_DIR, cache_key + ".svd.pkl")
+    ensure_models_built(content_df, events_all, cache_key, CACHE_DIR, force=False, non_blocking=True)
 
-    # tfidf/X/postidx
-    if os.path.exists(fp_tfidf) and os.path.exists(fp_X):
-        with open(fp_tfidf,"rb") as f: tfidf = pickle.load(f)
-        X = load_npz(fp_X).astype(np.float32)
-        postidx = {pid:i for i, pid in enumerate(content_df["post_id"].astype(int).tolist())}
-    else:
+
+    # tfidf/X/postidx (safe load / atomic save)
+    tfidf = _safe_pickle_load(fp_tfidf)
+    X = None
+    postidx = {pid:i for i, pid in enumerate(content_df["post_id"].astype(int).tolist())}
+
+    if tfidf is not None and os.path.exists(fp_X):
+        try:
+            X = load_npz(fp_X).astype(np.float32)
+        except Exception:
+            try: os.remove(fp_X)
+            except Exception: pass
+            tfidf = None
+            X = None
+
+    if tfidf is None or X is None:
         tfidf, X, postidx, _ = build_contentbased_models(content_df)
-        with open(fp_tfidf,"wb") as f: pickle.dump(tfidf,f)
-        save_npz(fp_X, X)
+        try:
+            _atomic_write_file(fp_tfidf, pickle.dumps(tfidf))
+        except Exception:
+            try:
+                with open(fp_tfidf + ".tmp", "wb") as f:
+                    pickle.dump(tfidf, f)
+                    f.flush()
+                    try: os.fsync(f.fileno())
+                    except Exception: pass
+                os.replace(fp_tfidf + ".tmp", fp_tfidf)
+            except Exception:
+                pass
+        try:
+            save_npz(fp_X, X)
+        except Exception:
+            try:
+                if os.path.exists(fp_X): os.remove(fp_X)
+                save_npz(fp_X, X)
+            except Exception:
+                pass
 
-    # KNN + item-content scores
-    if os.path.exists(fp_knn) and os.path.exists(fp_item):
-        with open(fp_knn,"rb") as f: knn = pickle.load(f)
-        item_scores = np.load(fp_item)
-    else:
+    # KNN + item-content scores (safe load / atomic save)
+    knn = _safe_pickle_load(fp_knn)
+    item_scores = None
+    if knn is not None and os.path.exists(fp_item):
+        try:
+            item_scores = np.load(fp_item, allow_pickle=False)
+        except Exception:
+            try: os.remove(fp_item)
+            except Exception: pass
+            knn = None
+            item_scores = None
+
+    if knn is None or item_scores is None:
         knn = _build_knn(X)
         item_scores = _precompute_item_content_scores(knn, content_df, X)
-        with open(fp_knn,"wb") as f: pickle.dump(knn,f)
-        np.save(fp_item, item_scores)
+        try:
+            _atomic_write_file(fp_knn, pickle.dumps(knn))
+        except Exception:
+            try:
+                with open(fp_knn + ".tmp", "wb") as f:
+                    pickle.dump(knn, f)
+                os.replace(fp_knn + ".tmp", fp_knn)
+            except Exception:
+                pass
+        try:
+            np.save(fp_item, item_scores)
+        except Exception:
+            try:
+                if os.path.exists(fp_item): os.remove(fp_item)
+                np.save(fp_item, item_scores)
+            except Exception:
+                pass
 
-    # user-text profiles (label y=1 จาก POS_ACTIONS/view)
+    # user-text profiles (label y=1 จาก POS_ACTIONS/view) - safe load/write
     t = events_all.groupby(["user_id","post_id","action_type"]).size().reset_index(name="cnt")
     if t.empty:
         train_pos = pd.DataFrame(columns=["user_id","post_id"])
@@ -1030,26 +1386,32 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
         labels = pvt[["user_id","post_id"]].copy(); labels["y"] = pos.astype(int)
         train_pos = labels[labels["y"]==1][["user_id","post_id"]]
 
-    if os.path.exists(fp_ut):
-        try:
-            with open(fp_ut,"rb") as f: ut_profiles = pickle.load(f)
-        except Exception:
-            ut_profiles = _user_text_profiles(train_pos, content_df, X)
-            with open(fp_ut,"wb") as f: pickle.dump(ut_profiles,f)
-    else:
+    ut_profiles = _safe_pickle_load(fp_ut)
+    if ut_profiles is None:
         ut_profiles = _user_text_profiles(train_pos, content_df, X)
-        with open(fp_ut,"wb") as f: pickle.dump(ut_profiles,f)
-
-    # collaborative SVD
-    if os.path.exists(fp_svd):
         try:
-            with open(fp_svd,"rb") as f: svd = pickle.load(f)
+            _atomic_write_file(fp_ut, pickle.dumps(ut_profiles))
         except Exception:
-            svd = build_collaborative_model(events_all, content_df["post_id"].astype(int).tolist())
-            with open(fp_svd,"wb") as f: pickle.dump(svd,f)
-    else:
+            try:
+                with open(fp_ut + ".tmp", "wb") as f:
+                    pickle.dump(ut_profiles, f)
+                os.replace(fp_ut + ".tmp", fp_ut)
+            except Exception:
+                pass
+
+    # collaborative SVD (safe load/write)
+    svd = _safe_pickle_load(fp_svd)
+    if svd is None:
         svd = build_collaborative_model(events_all, content_df["post_id"].astype(int).tolist())
-        with open(fp_svd,"wb") as f: pickle.dump(svd,f)
+        try:
+            _atomic_write_file(fp_svd, pickle.dumps(svd))
+        except Exception:
+            try:
+                with open(fp_svd + ".tmp", "wb") as f:
+                    pickle.dump(svd, f)
+                os.replace(fp_svd + ".tmp", fp_svd)
+            except Exception:
+                pass
 
     # -------- user-specific --------
     user_events   = events_all[events_all["user_id"] == int(uid)]
@@ -1793,7 +2155,7 @@ def _interleave_balanced_with_cap(ids: List[int],
                                   gamma_avail: float = 0.15) -> List[int]:
     """
     จัดเรียง ids ใหม่ให้:
-      - ไม่ให้หมวดเดียวติดเกิน cap (ถ้ายังมีหมวดอื่นให้แทรก)
+      - ไม่ให้หมวดเดียวติดเกิน cap (ถ้ายังมีหมวดอื่นให้สแทรก)
       - เลือกหมวดถัดไปจาก utility = alpha*pref + beta*headScore + gamma*availShare
       - รักษา order ภายในหมวด (ใช้คิวต่อหมวด)
       - ถ้าเหลือหมวดเดียวจริง ๆ -> อนุญาตให้ทะลุ cap (เลี่ยงไม่ได้)
@@ -2152,6 +2514,7 @@ def create_advertisement_db(order_data):
         db.session.rollback()
         print(f"❌ Error creating advertisement for Order ID {order_data.get('id')}: {e}")
         return None
+
 
 # ==================== SLIP & PROMPTPAY FUNCTIONS (from Slip.py) ====================
 
