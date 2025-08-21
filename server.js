@@ -1069,27 +1069,87 @@ app.post("/api/interactions", verifyToken, async (req, res) => {
 // SECURITY: requires verifyToken
 // NOTE: returns all users' interactions (admin-like view)
 // ======================================================
-app.get("/api/interactions", verifyToken, async (req, res) => {
-  const fetchSql = `
-    SELECT 
-        ui.id, 
-        u.username, 
-        p.content AS post_content, 
-        ui.action_type, 
-        ui.content AS interaction_content, 
-        ui.created_at 
-    FROM user_interactions ui
-    JOIN users u ON ui.user_id = u.id
-    JOIN posts p ON ui.post_id = p.id
-    ORDER BY ui.created_at DESC;
-  `;
+app.post("/api/interactions", verifyToken, async (req, res) => {
+  const { post_id, action_type, content } = req.body;
+  const user_id = req.userId; // from token
 
-  pool.query(fetchSql, (error, results) => {
+  // VALIDATION
+  const postIdValue = post_id ? post_id : null;
+  if (!user_id || !action_type) {
+    return res
+      .status(400)
+      .json({ error: "Missing required fields: user_id or action_type" });
+  }
+
+  // DB: insert interaction
+  const insertSql = `
+    INSERT INTO user_interactions (user_id, post_id, action_type, content)
+    VALUES (?, ?, ?, ?);
+  `;
+  const values = [user_id, postIdValue, action_type, content || null];
+
+  pool.query(insertSql, values, (error, results) => {
     if (error) {
       console.error("Database error:", error);
-      return res.status(500).json({ error: "Error fetching interactions" });
+      return res.status(500).json({ error: "Error saving interaction" });
     }
-    res.json(results);
+
+    // -------------------- NOTIFICATIONS (fire-and-forget) --------------------
+    // กรณีที่เป็น action บางประเภท เราจะ "เพิ่ม" การแจ้งเตือน
+    const NOTI_INSERT_ACTIONS = new Set(["share", "like", "bookmark"]);
+    // กรณีที่เป็น action บางประเภท เราจะ "ลบ" การแจ้งเตือนที่เคยสร้าง
+    const NOTI_DELETE_ACTIONS = new Set(["unlike", "unbookmark"]);
+
+    if (postIdValue) {
+      // สร้างข้อความ default ถ้าไม่ได้ส่ง content มา
+      const defaultMsg = `User ${user_id} performed action: ${action_type} on post ${postIdValue}`;
+      const notiContent = content || defaultMsg;
+
+      if (NOTI_INSERT_ACTIONS.has(action_type)) {
+        // กันซ้ำ: เช็กว่ามี noti เดิมของ action นี้อยู่แล้วหรือยัง
+        const checkSql = `
+          SELECT id FROM notifications
+          WHERE user_id = ? AND post_id = ? AND action_type = ?
+          LIMIT 1
+        `;
+        pool.query(checkSql, [user_id, postIdValue, action_type], (cErr, rows) => {
+          if (cErr) {
+            console.error("Check noti error:", cErr);
+          } else if (rows.length === 0) {
+            const notiInsert = `
+              INSERT INTO notifications (user_id, post_id, ads_id, action_type, content, read_status)
+              VALUES (?, ?, NULL, ?, ?, '0')
+            `;
+            pool.query(
+              notiInsert,
+              [user_id, postIdValue, action_type, notiContent],
+              (nErr) => {
+                if (nErr) console.error("Insert noti error:", nErr);
+              }
+            );
+          }
+        });
+      } else if (NOTI_DELETE_ACTIONS.has(action_type)) {
+        // map action un* ให้ไปลบ noti ของ action หลัก
+        const baseAction =
+          action_type === "unbookmark" ? "bookmark" :
+          action_type === "unlike" ? "like" : action_type;
+
+        const notiDelete = `
+          DELETE FROM notifications
+          WHERE user_id = ? AND post_id = ? AND action_type = ?
+        `;
+        pool.query(notiDelete, [user_id, postIdValue, baseAction], (dErr) => {
+          if (dErr) console.error("Delete noti error:", dErr);
+        });
+      }
+    }
+    // ------------------------------------------------------------------------
+
+    res.status(201).json({
+      message: "Interaction saved successfully",
+      interaction_id: results.insertId,
+    });
   });
 });
 
@@ -2036,35 +2096,77 @@ app.get("/api/users/:userId/follow/:followingId/status", verifyToken, (req, res)
   });
 });
 
-// Add comment
+// Add comment -> write to user_interactions + keep legacy response shape
+// Add comment -> write BOTH: comments + user_interactions (transaction)
 app.post("/api/posts/:postId/comment", verifyToken, (req, res) => {
-  try {
-    const { postId } = req.params;
-    const { content } = req.body;
-    const userId = req.userId;
+  const { postId } = req.params;
+  const { content } = req.body;
+  const userId = req.userId;
 
-    if (!content || content.trim() === "") {
-      return res.status(400).json({ error: "Content cannot be empty" });
+  if (!content || content.trim() === "") {
+    return res.status(400).json({ error: "Content cannot be empty" });
+  }
+
+  pool.getConnection((err, conn) => {
+    if (err) {
+      console.error("DB conn error:", err);
+      return res.status(500).json({ error: "DB error" });
     }
 
-    pool.query(
-      "INSERT INTO comments (post_id, user_id, comment_text) VALUES (?, ?, ?)",
-      [postId, userId, content],
-      (error, results) => {
-        if (error) return res.status(500).json({ error: "DB error" });
-        res.status(201).json({
-          message: "Comment added",
-          comment_id: results.insertId,
-          post_id: postId,
-          user_id: userId,
-          content,
-        });
+    conn.beginTransaction(txErr => {
+      if (txErr) {
+        conn.release();
+        console.error("TX begin error:", txErr);
+        return res.status(500).json({ error: "DB error" });
       }
-    );
-  } catch {
-    res.status(500).json({ error: "Internal server error" });
-  }
+
+      const clean = content.trim();
+
+      // 1) เขียนตาราง comments (ให้ UI เดิมใช้)
+      const sqlComment = `
+        INSERT INTO comments (post_id, user_id, comment_text, created_at)
+        VALUES (?, ?, ?, NOW())
+      `;
+      conn.query(sqlComment, [postId, userId, clean], (e1, r1) => {
+        if (e1) return rollback(e1);
+
+        const commentId = r1.insertId;
+
+        // 2) เขียนตาราง user_interactions (เพื่อ logging/analytics)
+        const sqlInteract = `
+          INSERT INTO user_interactions (user_id, post_id, action_type, content, created_at)
+          VALUES (?, ?, 'comment', ?, NOW())
+        `;
+        conn.query(sqlInteract, [userId, postId, clean], (e2) => {
+          if (e2) return rollback(e2);
+
+          conn.commit(cErr => {
+            if (cErr) return rollback(cErr);
+            conn.release();
+
+            // คง shape เดิมให้ Android ไม่พัง + ใส่ created_at แบบ ISO เผื่อใช้ทันที
+            return res.status(201).json({
+              message: "Comment added",
+              comment_id: commentId,
+              post_id: Number(postId),
+              user_id: userId,
+              content: clean,
+              created_at: new Date().toISOString()
+            });
+          });
+        });
+      });
+
+      function rollback(e) {
+        console.error("TX error:", e);
+        conn.rollback(() => conn.release());
+        res.status(500).json({ error: "DB error" });
+      }
+    });
+  });
 });
+
+
 
 // Delete comment
 app.delete("/api/posts/:postId/comment/:commentId", verifyToken, (req, res) => {
