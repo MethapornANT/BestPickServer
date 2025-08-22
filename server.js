@@ -1568,7 +1568,7 @@ app.post("/api/posts/like/:id", verifyToken, (req, res) => {
         }
 
         if (likeResults.length > 0) {
-          // UNLIKE: remove like then return updated count
+          // UNLIKE: remove like then remove any related notifications, then return updated count
           const unlikeSql =
             "DELETE FROM likes WHERE post_id = ? AND user_id = ?";
           pool.query(unlikeSql, [id, user_id], (err) => {
@@ -1579,24 +1579,47 @@ app.post("/api/posts/like/:id", verifyToken, (req, res) => {
                 .json({ error: "Database error during unlike" });
             }
 
-            const likeCountQuery =
-              "SELECT COUNT(*) AS likeCount FROM likes WHERE post_id = ?";
-            pool.query(likeCountQuery, [id], (err, countResults) => {
+            // ---- ลบ notification ที่เกี่ยวข้องกับการไลค์ของ user นี้บนโพสต์นี้ ----
+            // NOTE: ปรับ pattern ของ content ถ้า format ใน DB ของคุณต่างไป
+            const notifPattern = `%User ${user_id} performed action: like on post ${id}%`;
+            const deleteNotifSql =
+              "DELETE FROM notifications WHERE post_id = ? AND action_type = 'like' AND content LIKE ?";
+
+            pool.query(deleteNotifSql, [id, notifPattern], (err, delRes) => {
               if (err) {
-                console.error("Database error during like count:", err);
-                return res
-                  .status(500)
-                  .json({ error: "Database error during like count" });
+                // ไม่ให้ fail ทั้งหมดถ้าลบ notification ไม่สำเร็จ — แต่ log ไว้ให้ดู
+                console.error("Database error deleting like-notifications:", err);
+                // continue to compute likeCount and respond anyway
+              } else {
+                // optional: log how many notifications deleted (MySQL returns affectedRows)
+                try {
+                  const affected = (delRes && delRes.affectedRows) || 0;
+                  console.log(`Deleted ${affected} notification(s) for unlike by user ${user_id} on post ${id}`);
+                } catch (e) {
+                  // ignore
+                }
               }
-              const likeCount = countResults[0].likeCount;
-              res
-                .status(200)
-                .json({
-                  message: "Post unliked successfully",
-                  status: "unliked",
-                  liked: false,
-                  likeCount,
-                });
+
+              // Now get like count and return response
+              const likeCountQuery =
+                "SELECT COUNT(*) AS likeCount FROM likes WHERE post_id = ?";
+              pool.query(likeCountQuery, [id], (err, countResults) => {
+                if (err) {
+                  console.error("Database error during like count:", err);
+                  return res
+                    .status(500)
+                    .json({ error: "Database error during like count" });
+                }
+                const likeCount = countResults[0].likeCount;
+                res
+                  .status(200)
+                  .json({
+                    message: "Post unliked successfully",
+                    status: "unliked",
+                    liked: false,
+                    likeCount,
+                  });
+              });
             });
           });
         } else {
@@ -1620,6 +1643,18 @@ app.post("/api/posts/like/:id", verifyToken, (req, res) => {
                   .json({ error: "Database error during like count" });
               }
               const likeCount = countResults[0].likeCount;
+
+              // (Optional) create notification(s) here for the like if your app expects that to happen in this route.
+              // If you already handle notification elsewhere, skip this.
+              // Example (simple fallback insertion for post owner):
+              /*
+              const insertNotifSql = "INSERT INTO notifications (user_id, post_id, action_type, content, created_at, read_status) VALUES (?, ?, 'like', ?, NOW(), 0)";
+              const content = `User ${user_id} performed action: like on post ${id}`;
+              pool.query(insertNotifSql, [postOwnerId, id, content], (nErr) => {
+                if (nErr) console.error("Failed to insert like notification:", nErr);
+              });
+              */
+
               res
                 .status(201)
                 .json({
@@ -1639,6 +1674,7 @@ app.post("/api/posts/like/:id", verifyToken, (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 
 // ======================================================
@@ -2031,7 +2067,7 @@ function formatDateForSQL(dateString) {
   return `${year}-${month}-${day}`;
 }
 
-// Follow / Unfollow user
+// Follow / Unfollow user  (เพิ่มเขียน/ลบ notifications ให้ด้วย)
 app.post("/api/users/:userId/follow/:followingId", verifyToken, (req, res) => {
   const { userId, followingId } = req.params;
 
@@ -2039,39 +2075,72 @@ app.post("/api/users/:userId/follow/:followingId", verifyToken, (req, res) => {
     return res.status(403).json({ error: "Unauthorized" });
   }
 
+  // เช็ก target user มีจริง
   pool.query("SELECT 1 FROM users WHERE id = ?", [followingId], (error, userCheck) => {
     if (error) return res.status(500).json({ error: "DB error" });
     if (userCheck.length === 0) return res.status(404).json({ error: "User not found" });
 
+    // เช็กว่าตามอยู่แล้วไหม
     pool.query(
       "SELECT 1 FROM follower_following WHERE follower_id = ? AND following_id = ?",
       [userId, followingId],
       (error, followCheck) => {
         if (error) return res.status(500).json({ error: "DB error" });
 
+        // ===== UNFOLLOW =====
         if (followCheck.length > 0) {
           pool.query(
             "DELETE FROM follower_following WHERE follower_id = ? AND following_id = ?",
             [userId, followingId],
             (error) => {
               if (error) return res.status(500).json({ error: "DB error" });
-              return res.status(200).json({ message: "Unfollowed" });
+
+              // ลบ notification ที่เคยแจ้ง user2 ว่า user1 ตาม
+              const delNotifSql = `
+                DELETE FROM notifications
+                WHERE user_id = ?              -- receiver: user2
+                  AND action_type = 'follow'
+                  AND post_id IS NULL
+                  AND content = ?
+              `;
+              const content = `User ${userId} started following you`;
+              pool.query(delNotifSql, [followingId, content], (e2) => {
+                if (e2) return res.status(500).json({ error: "DB error" });
+                return res.status(200).json({ message: "Unfollowed" });
+              });
             }
           );
-        } else {
-          pool.query(
-            "INSERT INTO follower_following (follower_id, following_id) VALUES (?, ?)",
-            [userId, followingId],
-            (error) => {
-              if (error) return res.status(500).json({ error: "DB error" });
+        }
+
+        // ===== FOLLOW =====
+        else {
+          // follower_following: ตามรูป schema มี follow_date default CURRENT_TIMESTAMP
+          const insertRelSql = `
+            INSERT INTO follower_following (follower_id, following_id, follow_date)
+            VALUES (?, ?, NOW())
+          `;
+          pool.query(insertRelSql, [userId, followingId], (error) => {
+            if (error) return res.status(500).json({ error: "DB error" });
+
+            // เขียน notifications ให้ user2 (ผู้รับ)
+            const insNotifSql = `
+              INSERT INTO notifications
+                (user_id, post_id, ads_id, action_type, content, created_at, read_status, comment_id)
+              VALUES
+                (?,       NULL,   NULL,   'follow',   ?,       NOW(),     0,          NULL)
+            `;
+            const content = `User ${userId} started following you`;
+            pool.query(insNotifSql, [followingId, content], (e2) => {
+              if (e2) return res.status(500).json({ error: "DB error" });
               return res.status(201).json({ message: "Followed" });
-            }
-          );
+            });
+          });
         }
       }
     );
   });
 });
+
 
 // Check follow status
 app.get("/api/users/:userId/follow/:followingId/status", verifyToken, (req, res) => {
@@ -2211,48 +2280,201 @@ app.delete("/api/posts/:postId/comment/:commentId", verifyToken, (req, res) => {
 
 
 // ======================================================
-// Notifications: list for current user (post actions + ads status)
-// SECURITY: verifyToken; filters by receiver (post owner) or ad owner
+// Notifications: list for current user (post actions + ads status + post + follow)
+// SECURITY: verifyToken; filters by receiver (post owner) or ad owner or follower (for 'post'/'follow')
 // ======================================================
-app.get("/api/notifications", verifyToken, (req, res) => {
+// replace the existing /api/notifications route with this
+app.get("/api/notifications", verifyToken, async (req, res) => {
   const userId = req.userId;
 
-  const fetchActionNotificationsSql = `
-  SELECT 
-    n.id, 
-    n.user_id AS receiver_id, 
-    n.post_id, 
-    n.comment_id,   
-    n.action_type, 
-    n.content, 
-    n.read_status,
-    n.created_at,
-    n.ads_id,
-    s.username AS sender_name,
-    s.picture AS sender_picture, 
-    p_owner.username AS receiver_name,
-    c.comment_text AS comment_content  
-  FROM notifications n
-  LEFT JOIN users s ON n.user_id = s.id
-  LEFT JOIN posts p ON n.post_id = p.id
-  LEFT JOIN users p_owner ON p.user_id = p_owner.id
-  LEFT JOIN comments c ON c.id = n.comment_id
-  WHERE n.action_type IN ('comment', 'like', 'follow', 'bookmark', 'ads_status_change')
-    AND (
-      (n.action_type = 'ads_status_change' AND n.user_id = ?)
-      OR
-      (n.action_type IN ('comment', 'like', 'follow', 'bookmark') AND p_owner.id = ?)
-    )
-  ORDER BY n.created_at DESC;
+  // basic fetch: notifications + posts + comments (we will enrich per-row below)
+  const fetchSql = `
+    SELECT
+      n.id, n.user_id AS receiver_id, n.post_id, n.comment_id,
+      n.action_type, n.content AS notif_content, n.read_status, n.created_at, n.ads_id,
+      p.user_id AS post_owner_id, p.content AS post_content
+    FROM notifications n
+    LEFT JOIN posts p ON n.post_id = p.id
+    LEFT JOIN comments c ON n.comment_id = c.id
+    WHERE n.action_type IN ('comment','like','follow','bookmark','ads_status_change','post')
+      AND (
+        (n.action_type = 'ads_status_change' AND n.user_id = ?)
+        OR
+        (n.action_type IN ('comment','like','bookmark') AND p.user_id = ?)
+        OR
+        (n.action_type = 'post' AND n.user_id = ?)
+        OR
+        (n.action_type = 'follow' AND n.user_id = ?)
+      )
+    ORDER BY n.created_at DESC
+    LIMIT 200
   `;
 
-  pool.query(fetchActionNotificationsSql, [userId, userId], (error, results) => {
-    if (error) {
-      console.error("Database error during fetching notifications:", error);
-      return res.status(500).json({ error: "Error fetching notifications" });
+  try {
+    // use promise API
+    const [rows] = await pool.promise().execute(fetchSql, [userId, userId, userId, userId]);
+
+    // helper: get user (id) -> { id, username, picture } or null
+    const getUserById = async (uid) => {
+      if (!uid) return null;
+      try {
+        const [r] = await pool.promise().execute('SELECT id, username, picture FROM users WHERE id = ? LIMIT 1', [uid]);
+        if (r && r.length) return r[0];
+      } catch (e) {
+        console.error('getUserById error', e);
+      }
+      return null;
+    };
+
+    // helper: get comment owner
+    const getCommentOwner = async (commentId) => {
+      if (!commentId) return null;
+      try {
+        const [r] = await pool.promise().execute('SELECT id, user_id, content FROM comments WHERE id = ? LIMIT 1', [commentId]);
+        if (r && r.length) return r[0];
+      } catch (e) {
+        console.error('getCommentOwner error', e);
+      }
+      return null;
+    };
+
+    // helper: get latest like actor for a post (best-effort)
+    const getLatestLikeActor = async (postId, notifCreatedAt) => {
+      if (!postId) return null;
+      try {
+        // try to find the like closest to the notification time (best-effort)
+        // If likes has created_at column this will pick the most recent like (may be the actor)
+        const [r] = await pool.promise().execute(
+          `SELECT user_id, created_at FROM likes WHERE post_id = ? ORDER BY created_at DESC LIMIT 1`,
+          [postId]
+        );
+        if (r && r.length) return r[0]; // { user_id, created_at }
+      } catch (e) {
+        console.error('getLatestLikeActor error', e);
+      }
+      return null;
+    };
+
+    // helper: parse numeric user id from content (for follow messages that include "User 12345")
+    const parseUserIdFromContent = (s) => {
+      if (!s) return null;
+      const m = s.match(/(\d{5,})/); // assume user ids are >=5 digits (adjust if needed)
+      if (m) return parseInt(m[1], 10);
+      return null;
+    };
+
+    // process each notification row and enrich it
+    const enriched = [];
+    for (const r of rows) {
+      const n = {
+        id: r.id,
+        receiver_id: r.receiver_id,
+        post_id: r.post_id,
+        comment_id: r.comment_id,
+        action_type: r.action_type,
+        content: r.notif_content,
+        read_status: r.read_status,
+        created_at: r.created_at,
+        ads_id: r.ads_id,
+        // placeholders:
+        actor_id: null,
+        sender_name: null,
+        sender_picture: null,
+        post_content_snippet: null
+      };
+
+      try {
+        // 1) If action_type = 'comment' => actor is comment.user_id
+        if (n.action_type === 'comment' && n.comment_id) {
+          const commentRow = await getCommentOwner(n.comment_id);
+          if (commentRow) {
+            n.actor_id = commentRow.user_id;
+            n.post_content_snippet = (commentRow.content || '').slice(0, 200);
+          }
+        }
+
+        // 2) If action_type = 'post' => actor is post owner (we already selected p.user_id)
+        else if (n.action_type === 'post' && r.post_owner_id) {
+          n.actor_id = r.post_owner_id;
+          n.post_content_snippet = (r.post_content || '').slice(0, 200);
+        }
+
+        // 3) If action_type = 'follow' => try parse actor id from content
+        else if (n.action_type === 'follow') {
+          const parsed = parseUserIdFromContent(n.content);
+          if (parsed) n.actor_id = parsed;
+        }
+
+        // 4) If action_type = 'like' or 'bookmark' => best-effort: try user_interactions or likes table
+        else if ((n.action_type === 'like' || n.action_type === 'bookmark') && n.post_id) {
+          // try user_interactions first (if exists)
+          try {
+            const [uiRows] = await pool.promise().execute(
+              `SELECT user_id FROM user_interactions WHERE post_id = ? AND action_type = ? ORDER BY created_at DESC LIMIT 1`,
+              [n.post_id, n.action_type]
+            );
+            if (uiRows && uiRows.length) {
+              n.actor_id = uiRows[0].user_id;
+            } else {
+              // fallback to likes table (if exists)
+              const likeRow = await getLatestLikeActor(n.post_id, n.created_at);
+              if (likeRow) n.actor_id = likeRow.user_id;
+            }
+          } catch (e) {
+            // ignore and fallback
+            const likeRow = await getLatestLikeActor(n.post_id, n.created_at);
+            if (likeRow) n.actor_id = likeRow.user_id;
+          }
+        }
+
+        // 5) ads_status_change or other => try n.user_id (some implementations used user_id as actor)
+        if (!n.actor_id && (n.action_type === 'ads_status_change' || n.action_type === 'other')) {
+          // it's safe to try the field, but if it is receiver, it may be wrong
+          n.actor_id = null;
+        }
+
+        // After we have actor_id, fetch sender info
+        if (n.actor_id) {
+          const sender = await getUserById(n.actor_id);
+          if (sender) {
+            n.sender_name = sender.username;
+            n.sender_picture = sender.picture;
+          } else {
+            // if no user found, leave sender_name null (client can show fallback)
+            n.sender_name = null;
+            n.sender_picture = null;
+          }
+        } else {
+          // fallback: sometimes notifications were created with the actor embedded
+          // attempt to replace "User 12345" with the number found and fetch that user
+          const parsed2 = parseUserIdFromContent(n.content);
+          if (parsed2) {
+            const s2 = await getUserById(parsed2);
+            if (s2) {
+              n.actor_id = s2.id;
+              n.sender_name = s2.username;
+              n.sender_picture = s2.picture;
+            }
+          }
+        }
+
+        // ensure post_content_snippet for 'post' action is present (already set), but for others we can also include post content if available
+        if (!n.post_content_snippet && r.post_content) {
+          n.post_content_snippet = (r.post_content || '').slice(0, 200);
+        }
+
+      } catch (e) {
+        console.error('notification enrich error for id', r.id, e);
+      }
+
+      enriched.push(n);
     }
-    res.json(results);
-  });
+
+    return res.json(enriched);
+  } catch (err) {
+    console.error("Database error during fetching notifications:", err);
+    return res.status(500).json({ error: "Error fetching notifications" });
+  }
 });
 
 
@@ -2339,64 +2561,109 @@ app.post("/api/notifications", verifyToken, (req, res) => {
 
 
 // ======================================================
-// Notifications: mark one as read (only post owner)
-// SECURITY: verifyToken; join to confirm ownership
+// Notifications: mark one as read (post owner หรือ follower แล้วแต่ action_type)
+// SECURITY: verifyToken
 // ======================================================
 app.put("/api/notifications/:id/read", verifyToken, (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
 
-  console.log("Notification ID:", id);
-  console.log("User ID from Token (Post Owner):", userId);
-
   const updateReadStatusSql = `
     UPDATE notifications n
-    JOIN posts p ON n.post_id = p.id
+    LEFT JOIN posts p ON n.post_id = p.id
     SET n.read_status = 1
-    WHERE n.id = ? AND p.user_id = ?;
+    WHERE n.id = ?
+      AND (
+        -- like/comment/bookmark: เจ้าของโพสต์เป็นคนอนุญาตให้มาร์ก
+        (n.action_type IN ('comment','like','bookmark') AND p.user_id = ?)
+        -- follow: ผู้รับ (n.user_id) เป็นคนกดอ่านได้
+        OR (n.action_type = 'follow' AND n.user_id = ?)
+        -- post / ads_status_change: ผู้รับเก็บใน n.user_id (เหมือน follow)
+        OR (n.action_type IN ('post','ads_status_change') AND n.user_id = ?)
+      );
   `;
 
-  pool.query(updateReadStatusSql, [id, userId], (error, results) => {
+  // ส่ง userId ลงไป 3 ครั้งสำหรับ 3 เงื่อนไขข้างบน
+  pool.query(updateReadStatusSql, [id, userId, userId, userId], (error, results) => {
     if (error) {
       console.error("Database error during updating read status:", error);
       return res.status(500).json({ error: "Error updating read status" });
     }
     if (results.affectedRows === 0) {
-      console.warn(`Notification not found or you are not the owner of the post (User ID: ${userId})`);
-      return res.status(404).json({ message: "Notification not found or you are not the owner of the post" });
+      return res.status(404).json({ message: "Notification not found or not allowed" });
     }
-
-    console.log("Notification marked as read for ID:", id);
     res.json({ message: "Notification marked as read" });
   });
 });
 
+app.get('/api/posts/:postId/likes', verifyToken, async (req, res) => {
+  const postId = parseInt(req.params.postId, 10);
+  let limit = parseInt(req.query.limit || '50', 10);
+  let offset = parseInt(req.query.offset || '0', 10);
+
+  if (Number.isNaN(postId)) return res.status(400).json({ error: 'invalid postId' });
+
+  // sanitize
+  limit = Math.min(Number.isFinite(limit) ? Math.abs(limit) : 50, 200);
+  offset = Math.max(Number.isFinite(offset) ? Math.abs(offset) : 0, 0);
+
+  try {
+    // embed offset/limit directly (safe because validated as integers)
+    const sql = `
+      SELECT 
+        u.id AS userId, 
+        u.username, 
+        u.picture AS profileImageUrl, 
+        ui.created_at
+      FROM user_interactions ui
+      JOIN users u ON ui.user_id = u.id
+      WHERE ui.post_id = ? AND ui.action_type = 'like'
+      ORDER BY ui.created_at DESC
+      LIMIT ${offset}, ${limit}
+    `;
+
+    console.log('DEBUG likes SQL:', sql.trim());
+    const [rows] = await pool.promise().execute(sql, [postId]); // only postId as param
+    return res.json(Array.isArray(rows) ? rows : []);
+  } catch (err) {
+    console.error('Error fetching likes:', err);
+    return res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+
 
 // ======================================================
-// Notifications: delete by (user_id, post_id, action_type)
-// SECURITY: verifyToken; body must specify all keys
+// Notifications: delete by (post_id, action_type) for current user as rightful receiver
+// SECURITY: verifyToken; ไม่เชื่อ body.user_id ให้ยึด token
 // ======================================================
 app.delete("/api/notifications", verifyToken, (req, res) => {
-  const { user_id, post_id, action_type } = req.body;
+  const { post_id, action_type } = req.body;
+  const userId = req.userId;
 
-  if (!user_id || !post_id || !action_type) {
-    return res
-      .status(400)
-      .json({ error: "Missing required fields: user_id, post_id, or action_type" });
+  if (!post_id || !action_type) {
+    return res.status(400).json({ error: "Missing required fields: post_id, action_type" });
   }
 
-  const deleteNotificationSql = `
-    DELETE FROM notifications 
-    WHERE user_id = ? AND post_id = ? AND action_type = ?;
+  const deleteSql = `
+    DELETE n FROM notifications n
+    LEFT JOIN posts p ON n.post_id = p.id
+    WHERE n.post_id = ? AND n.action_type = ?
+      AND (
+        (n.action_type IN ('post','ads_status_change') AND n.user_id = ?) OR
+        (n.action_type IN ('comment','like','follow','bookmark') AND p.user_id = ?)
+      );
   `;
 
-  pool.query(deleteNotificationSql, [user_id, post_id, action_type], (error, results) => {
+  pool.query(deleteSql, [post_id, action_type, userId, userId], (error, results) => {
     if (error) {
       console.error("Database error during deleting notification:", error);
       return res.status(500).json({ error: "Error deleting notification" });
     }
+    return res.status(200).json({ message: "Notification deleted (if owned)" });
   });
 });
+
 
 
 // ======================================================
