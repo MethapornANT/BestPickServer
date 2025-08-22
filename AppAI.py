@@ -2993,14 +2993,17 @@ def ai_recommend():
 def ai_seen():
     return ai_seen_handler()
 
+from datetime import datetime, timedelta
+import threading
+from sqlalchemy import text
+import traceback
+import pytz
 
-
-# === NSFW Detection Route: create post ===
 @app.route('/ai/posts/create', methods=['POST'])
 def create_post():
     try:
         user_id = request.form.get('user_id')
-        content = request.form.get('content')
+        content = request.form.get('content', '')
         category = request.form.get('category')
         title = request.form.get('Title')
         product_name = request.form.get('ProductName')
@@ -3014,7 +3017,7 @@ def create_post():
         print(f"Processing {len(photos)} photos...")
 
         for photo in photos:
-            if not photo or not photo.filename:
+            if not photo or not getattr(photo, 'filename', None):
                 continue
             photo_path = None
             try:
@@ -3034,14 +3037,18 @@ def create_post():
                 else:
                     print(f"Photo {fname} is safe")
                     photo_urls.append(f'/uploads/{fname}')
-            except Exception as e:
-                print(f"Error processing photo {getattr(photo, 'filename', '?')}: {e}")
+            except Exception:
+                print(f"Error processing photo {getattr(photo, 'filename', '?')}:")
+                traceback.print_exc()
                 if photo_path and os.path.exists(photo_path):
-                    os.remove(photo_path)
+                    try:
+                        os.remove(photo_path)
+                    except Exception:
+                        pass
                 invalid_photos.append({
                     "filename": getattr(photo, 'filename', '?'),
                     "reason": "Unable to process the image.",
-                    "details": {"error": str(e)}
+                    "details": {"error": "processing error (see log)"}
                 })
 
         print(f"Invalid photos found: {len(invalid_photos)}")
@@ -3058,22 +3065,34 @@ def create_post():
 
         video_urls = []
         for video in videos:
-            if not video or not video.filename:
+            if not video or not getattr(video, 'filename', None):
                 continue
             try:
                 vname, vpath = _save_upload(video, ALLOWED_VIDEO_EXTS, UPLOAD_FOLDER)
                 video_urls.append(f'/uploads/{vname}')
-            except Exception as e:
-                print(f"Skip invalid video {getattr(video, 'filename', '?')}: {e}")
+            except Exception:
+                print(f"Skip invalid video {getattr(video, 'filename', '?')}:")
+                traceback.print_exc()
                 # ไม่ fail ทั้งโพสต์เพราะวิดีโอพัง
 
         photo_urls_json = json.dumps(photo_urls)
         video_urls_json = json.dumps(video_urls)
 
+        # --- ใช้เวลาเป็น Asia/Bangkok แล้วส่งเข้า DB ใน INSERT แบบเป็นค่าสตริง (ไม่แก้ schema) ---
         try:
+            bkk_tz = pytz.timezone('Asia/Bangkok')
+            now_bkk = datetime.now(bkk_tz)
+            created_at_str = now_bkk.strftime('%Y-%m-%d %H:%M:%S')
+
             insert_query = text("""
-                INSERT INTO posts (user_id, Title, content, ProductName, CategoryID, photo_url, video_url, status, updated_at)
-                VALUES (:user_id, :title, :content, :product_name, :category_id, :photo_urls, :video_urls, 'active', NOW())
+                INSERT INTO posts (
+                    user_id, Title, content, ProductName, CategoryID,
+                    photo_url, video_url, status, created_at, updated_at
+                )
+                VALUES (
+                    :user_id, :title, :content, :product_name, :category_id,
+                    :photo_urls, :video_urls, 'active', :created_at, :updated_at
+                )
             """)
             result = db.session.execute(insert_query, {
                 'user_id': user_id,
@@ -3082,32 +3101,25 @@ def create_post():
                 'product_name': product_name,
                 'category_id': category,
                 'photo_urls': photo_urls_json,
-                'video_urls': video_urls_json
+                'video_urls': video_urls_json,
+                'created_at': created_at_str,
+                'updated_at': created_at_str
             })
             db.session.commit()
 
             post_id = getattr(result, "lastrowid", None)
             if not post_id:
-                # fallback สำหรับบาง dialect
-                post_id = db.session.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+                try:
+                    post_id = db.session.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+                except Exception:
+                    post_id = None
 
             print(f"Post created successfully with ID: {post_id}, {len(photo_urls)} photos and {len(video_urls)} videos")
 
-            return jsonify({
-                "post_id": post_id,
-                "user_id": user_id,
-                "content": content,
-                "category": category,
-                "Title": title,
-                "ProductName": product_name,
-                "video_urls": video_urls,
-                "photo_urls": photo_urls
-            }), 201
-
-        except Exception as db_error:
-            print(f"Database error: {db_error}")
+        except Exception:
+            print("Database error during insert:")
+            traceback.print_exc()
             db.session.rollback()
-            # ลบไฟล์ที่เพิ่งเซฟเพื่อลดขยะในกรณี DB fail
             for url in photo_urls:
                 try:
                     path = os.path.join(UPLOAD_FOLDER, os.path.basename(url))
@@ -3124,9 +3136,148 @@ def create_post():
                     pass
             return jsonify({"error": "ไม่สามารถบันทึกโพสต์ลงฐานข้อมูลได้"}), 500
 
-    except Exception as error:
-        print("Internal server error:", str(error))
+        # ---- notification: พยายามเรียกฟังก์ชันเดิม ถ้าไม่มี หรือโยน error ให้ insert notification
+        # ---- สำหรับทุกคนที่ follow ผู้โพสต์ (จากตาราง follower_following)
+        try:
+            def _notify_in_app_context(_post_id, _poster_user_id, _content_snippet):
+                try:
+                    with app.app_context():
+                        # ถ้ามีฟังก์ชัน create_notifications_for_post ให้เรียกมันก่อน (ถ้ามี)
+                        notif_func = globals().get('create_notifications_for_post')
+                        external_called = False
+                        if callable(notif_func):
+                            try:
+                                notif_func(_post_id, _poster_user_id, content_snippet=_content_snippet, run_async=False)
+                                print(f"[create_post] Called external create_notifications_for_post for post {_post_id}")
+                                external_called = True
+                            except Exception:
+                                print(f"[create_post] external create_notifications_for_post threw (ignored):")
+                                traceback.print_exc()
+
+                        # ----- regardless of external_called, ensure notifications exist for each follower -----
+                        try:
+                            # ดึง follower_id ทั้งหมดที่ follow poster
+                            q_followers = text("""
+                                SELECT follower_id
+                                FROM follower_following
+                                WHERE following_id = :poster_id
+                            """)
+                            res = db.session.execute(q_followers, {'poster_id': _poster_user_id})
+                            # Try mappings() -> list of dicts; fallback to tuples
+                            try:
+                                followers = [r.get('follower_id') for r in res.mappings().all()]
+                            except Exception:
+                                keys = res.keys()
+                                fetched = res.fetchall()
+                                followers = [row[0] for row in fetched]  # follower_id should be first column
+
+                            if not followers:
+                                print(f"[create_post] No followers found for poster {_poster_user_id} (no notifications inserted).")
+                            else:
+                                print(f"[create_post] Found {len(followers)} follower(s) for poster {_poster_user_id}. Inserting notifications...")
+
+                                # Prepare content text (english format requested)
+                                notif_content = f"User {_poster_user_id} performed action: post on post {_post_id}"
+
+                                # Insert one notification row per follower (single transaction)
+                                inserted_count = 0
+                                for fid in followers:
+                                    try:
+                                        created_at_inner = datetime.now(pytz.timezone('Asia/Bangkok')).strftime('%Y-%m-%d %H:%M:%S')
+                                        insert_notif = text("""
+                                            INSERT INTO notifications (user_id, post_id, action_type, content, created_at, read_status)
+                                            VALUES (:notify_user_id, :post_id, 'post', :content, :created_at, 0)
+                                        """)
+                                        db.session.execute(insert_notif, {
+                                            'notify_user_id': fid,
+                                            'post_id': _post_id,
+                                            'content': (notif_content or '')[:1000],
+                                            'created_at': created_at_inner
+                                        })
+                                        inserted_count += 1
+                                    except Exception:
+                                        print(f"[create_post] failed to insert notification for follower {fid}:")
+                                        traceback.print_exc()
+                                try:
+                                    db.session.commit()
+                                    print(f"[create_post] Inserted {inserted_count} notification(s) for post {_post_id}")
+                                except Exception:
+                                    print("[create_post] commit failed after inserting notifications:")
+                                    traceback.print_exc()
+                                    db.session.rollback()
+                        except Exception:
+                            print(f"[create_post] failed while preparing/inserting follower notifications:")
+                            traceback.print_exc()
+
+                        # --- query back up to 10 notifications for this post to print a confirmation ---
+                        try:
+                            q = text("""
+                                SELECT id, user_id, post_id, action_type, content, created_at
+                                FROM notifications
+                                WHERE post_id = :pid
+                                ORDER BY created_at DESC
+                                LIMIT 10
+                            """)
+                            result_proxy = db.session.execute(q, {'pid': _post_id})
+                            try:
+                                rows = result_proxy.mappings().all()
+                            except Exception:
+                                keys = result_proxy.keys()
+                                fetched = result_proxy.fetchall()
+                                rows = [dict(zip(keys, row)) for row in fetched]
+
+                            if rows:
+                                print(f"[create_post] Notifications for post_id={_post_id} (latest up to {len(rows)}):")
+                                for r in rows:
+                                    print(" - id={id}, user_id={user_id}, post_id={post_id}, action_type={action_type}, created_at={created_at}, content={content}"
+                                          .format(
+                                              id=r.get('id'),
+                                              user_id=r.get('user_id'),
+                                              post_id=r.get('post_id'),
+                                              action_type=r.get('action_type'),
+                                              created_at=r.get('created_at'),
+                                              content=(r.get('content') or '')[:200]
+                                          ))
+                            else:
+                                print(f"[create_post] No notifications found for post_id={_post_id} after notify attempt.")
+                        except Exception:
+                            print(f"[create_post] Failed to query notifications for post_id={_post_id}:")
+                            traceback.print_exc()
+
+                except Exception:
+                    print(f"[create_post] notification wrapper unexpected error:")
+                    traceback.print_exc()
+
+            t = threading.Thread(target=_notify_in_app_context, args=(post_id, user_id, content), daemon=True)
+            t.start()
+            print(f"[create_post] Spawned notify thread for post_id={post_id}")
+        except Exception:
+            print("[create_post] failed to spawn notify thread:")
+            traceback.print_exc()
+
+        # ส่ง response (รวม created_at ที่เป็นเวลา Asia/Bangkok เพื่อให้ client เห็น)
+        try:
+            return jsonify({
+                "post_id": post_id,
+                "user_id": user_id,
+                "content": content,
+                "category": category,
+                "Title": title,
+                "ProductName": product_name,
+                "video_urls": video_urls,
+                "photo_urls": photo_urls,
+                "created_at": created_at_str
+            }), 201
+        except Exception:
+            print("Failed building response:")
+            traceback.print_exc()
+            return jsonify({"error": "Internal server error"}), 500
+
+    except Exception:
+        print("Internal server error in create_post:")
+        traceback.print_exc()
         return jsonify({"error": "Internal server error"}), 500
+
 
 
 # === Update post: ผสานไฟล์เดิม + ใหม่ ตรวจ NSFW เฉพาะรูปใหม่ ===
