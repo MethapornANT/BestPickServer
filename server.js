@@ -1777,6 +1777,70 @@ ORDER BY p.updated_at DESC;
   );
 });
 
+const metricsStore = {}
+
+// helper
+function ensurePost(postId) {
+  if (!metricsStore[postId]) {
+    metricsStore[postId] = { likes: 0, comments: 0, bookmarks: 0, shares: 0 }
+  }
+  return metricsStore[postId]
+}
+
+// GET metrics for a post
+app.get('/api/posts/:postId/metrics', (req, res) => {
+  const postId = req.params.postId
+  const metrics = ensurePost(postId)
+  return res.json({ postId, metrics })
+})
+
+// POST increment metric
+// body: { action: "like" | "comment" | "bookmark" | "share", delta?: 1 | -1 }
+// returns: { postId, metrics }
+app.post('/api/posts/:postId/metrics', (req, res) => {
+  const postId = req.params.postId
+  const { action, delta } = req.body
+  const d = typeof delta === 'number' ? delta : 1
+  const metrics = ensurePost(postId)
+
+  switch (action) {
+    case 'like':
+      metrics.likes = Math.max(0, metrics.likes + d)
+      break
+    case 'comment':
+      metrics.comments = Math.max(0, metrics.comments + d)
+      break
+    case 'bookmark':
+      metrics.bookmarks = Math.max(0, metrics.bookmarks + d)
+      break
+    case 'share':
+      metrics.shares = Math.max(0, metrics.shares + d)
+      break
+    default:
+      return res.status(400).json({ error: 'unknown action' })
+  }
+
+  return res.json({ postId, metrics })
+})
+
+// OPTIONAL: set metrics (admin)
+app.put('/api/posts/:postId/metrics', (req, res) => {
+  const postId = req.params.postId
+  const { likes, comments, bookmarks, shares } = req.body
+  metricsStore[postId] = {
+    likes: Math.max(0, parseInt(likes) || 0),
+    comments: Math.max(0, parseInt(comments) || 0),
+    bookmarks: Math.max(0, parseInt(bookmarks) || 0),
+    shares: Math.max(0, parseInt(shares) || 0),
+  }
+  return res.json({ postId, metrics: metricsStore[postId] })
+})
+
+// small helper to list all (for debugging)
+app.get('/api/metrics', (req, res) => {
+  return res.json(metricsStore)
+})
+
 
 // ======================================================
 // Profile: get own profile (auth required) with post counts
