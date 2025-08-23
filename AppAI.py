@@ -341,25 +341,30 @@ if not JWT_SECRET:
     print("[WARN] JWT_SECRET is not set in environment. Please configure it for production.")
 
 
-
 # ==================== RECOMMENDATION SYSTEM FUNCTIONS ====================
 
-# ============================ CONFIG (ปรับง่ายที่เดียว) =========================
+
+# ============================ CONFIG  =========================
+
+# ----------------------- DATABASE / INFRASTRUCTURE ---------------------------
+# เก็บ connection string + ชื่อ table/view ที่ต้องแก้เมื่อติดตั้งบนสภาพแวดล้อมใหม่
 DB_URI = os.getenv("BESTPICK_DB_URI", "mysql+mysqlconnector://root:1234@localhost/bestpick")
+POSTS_TABLE   = "posts"
+USERS_TABLE   = "users"
+LIKES_TABLE   = "likes"
+EVENT_TABLE   = "user_interactions"
+CONTENT_VIEW  = "contentbasedview"   # ต้องมีคอลัมน์ตาม config ด้านล่าง
+FOLLOWS_TABLE = "follower_following"
 
-# ตาราง/วิว
-POSTS_TABLE       = "posts"
-USERS_TABLE       = "users"
-LIKES_TABLE       = "likes"
-EVENT_TABLE       = "user_interactions"
-CONTENT_VIEW      = "contentbasedview"
-FOLLOWS_TABLE     = "follower_following"
-INCLUDE_SELF_POSTS_IN_FEED   = True   
-USE_AUTHORED_AS_SIGNALS      = True   
-AUTHORED_CATEGORY_BONUS      = 0.7   
-AUTHORED_TEXT_BONUS          = 0.7     
+# ------------------------ USER / AUTHOR FLAGS -------------------------------
+# Flag ที่กำหนดพฤติกรรมการแสดงโพสต์เจ้าของเอง และการนับโพสต์ที่เขียนเป็นสัญญาณ
+INCLUDE_SELF_POSTS_IN_FEED = True   # ถ้า False จะซ่อนโพสต์ที่ user เป็นเจ้าของจาก feed
+USE_AUTHORED_AS_SIGNALS     = True
+AUTHORED_CATEGORY_BONUS    = 0.7    # น้ำหนักเสริมสำหรับ profile category จากโพสต์ที่เขียนเอง
+AUTHORED_TEXT_BONUS        = 0.7    # น้ำหนักเสริมสำหรับ text-profile จากโพสต์ที่เขียนเอง
 
-# คอลัมน์ฟีเจอร์จาก content view
+# ------------------------ CONTENT / FEATURE COLUMNS -------------------------
+# ระบุคอลัมน์ใน content-based view / table
 CATEGORY_COLS = [
     "Electronics_Gadgets",
     "Furniture",
@@ -367,10 +372,11 @@ CATEGORY_COLS = [
     "Beauty_Products",
     "Accessories",
 ]
-TEXT_COL   = "Content"
-ENGAGE_COL = "PostEngagement"
+TEXT_COL   = "Content"         # คอลัมน์ข้อความ (ใช้ TF-IDF)
+ENGAGE_COL = "PostEngagement"  # engagement raw score (จะถูก normalize)
 
-# น้ำหนัก action → implicit rating (Collaborative)
+# --------------------- INTERACTION → IMPLICIT RATING -----------------------
+# แมป action เป็นน้ำหนัก implicit rating (ใช้สร้าง SVD หรือสรุปสัญญาณ)
 ACTION_WEIGHT = {
     "view": 1.0,
     "like": 2.0,
@@ -380,74 +386,111 @@ ACTION_WEIGHT = {
     "unbookmark": -2.0,
     "share": 5.0,
 }
-POS_ACTIONS      = {"view","like","comment","bookmark","share"}
-NEG_ACTIONS      = {"unlike","unbookmark"}
-IGNORE_ACTIONS   = {"view_profile","follow","unfollow"}
-VIEW_POS_MIN     = 1
-RATING_MIN, RATING_MAX = 0.5, 5.0
+POS_ACTIONS = {"view", "like", "comment", "bookmark", "share"}  # ถ้านับเป็น positive
+NEG_ACTIONS = {"unlike", "unbookmark"}
+IGNORE_ACTIONS = {"view_profile", "follow", "unfollow"}        # ไม่ใช้ใน events
+VIEW_POS_MIN = 1           # กี่ view นับเป็น positive
+RATING_MIN, RATING_MAX = 0.5, 5.0  # rating scale สำหรับ Surprise SVD
 
-# Hybrid weights (อยาก “ยกหมวดหมู่” ขึ้นก็ปรับ WEIGHT_CATEGORY)
-WEIGHT_COLLAB    = 0.25
-WEIGHT_ITEM      = 0.20
-WEIGHT_USER_TEXT = 0.20
-WEIGHT_CATEGORY  = 0.30   # <<<<<<<<<<<<<< หมวดหมู่สำคัญขึ้น
-WEIGHT_POP       = 0.05
+# -------------------- HYBRID COMPONENT WEIGHTS (single source) -------------
+# (แนะนำให้ tune ที่นี่เป็นหลัก — ถ้าต้องการยกหมวดหมู่ ให้ปรับ 'category')
+HYBRID_WEIGHTS = {
+    "collab": 0.20,     # collaborative SVD weight
+    "item": 0.18,       # item-content / neighbor score weight
+    "user_text": 0.12,  # user text-profile similarity weight
+    "category": 0.40,   # category-match weight (เพิ่มค่านี้เพื่อยกหมวด)
+    "pop": 0.10,        # popularity prior weight
+}
+# Backward-compatible globals (ฟังก์ชันเก่าเรียกชื่อเหล่านี้)
+WEIGHT_COLLAB    = float(HYBRID_WEIGHTS["collab"])
+WEIGHT_ITEM      = float(HYBRID_WEIGHTS["item"])
+WEIGHT_USER_TEXT = float(HYBRID_WEIGHTS["user_text"])
+WEIGHT_CATEGORY  = float(HYBRID_WEIGHTS["category"])
+WEIGHT_POP       = float(HYBRID_WEIGHTS["pop"])
 
-# TF-IDF & item-content
-TFIDF_PARAMS = dict(analyzer="char_wb", ngram_range=(2,5), max_features=60000, min_df=2, max_df=0.95)
-KNN_NEIGHBORS = 10
+# Toggle / mapping สำหรับ integration กับ _rank
+USE_HYBRID = False            # ถ้า True จะพยายามคำนวณ hybrid และใช้เป็น base_score ใน _rank
+MAP_HYBRID_TO_RANK = True     # ถ้า True จะแมป category/text จาก HYBRID -> WEIGHT_C / WEIGHT_T
 
-# Popularity prior
-POP_ALPHA = 5.0  # Bayesian smoothing
+# -------------------- _rank-level WEIGHTS (engage/follow/recency) -----------
+# _rank ใช้สัญญาณระดับโพสต์เพิ่มเติม (แยกจาก HYBRID)
+WEIGHT_E = 0.30   # engagement (quality/viral)
+WEIGHT_C = 0.40   # category match (จะถูก override เมื่อ MAP_HYBRID_TO_RANK=True)
+WEIGHT_F = 0.12   # follow-influence category
+WEIGHT_T = 0.12   # text relevance (จะถูก override เมื่อนำ HYBRID มาแมป)
+WEIGHT_R = 0.06   # recency (ใช้เฉพาะ zone new / 21-30)
 
-# Cache/TTL
-OUT_DIR = "./recsys_eval_final"
+# ---------------- TF-IDF / ITEM-CONTENT / KNN params -----------------------
+TFIDF_PARAMS = dict(
+    analyzer="char_wb",
+    ngram_range=(2, 5),
+    max_features=60000,
+    min_df=2,
+    max_df=0.95,
+)
+KNN_NEIGHBORS = 10  # จำนวน neighbor ที่ใช้ใน KNN
+
+# ---------------------- POPULARITY / SMOOTHING -----------------------------
+POP_ALPHA = 5.0  # Bayesian smoothing สำหรับ PopularityPrior (ช่วยโพสต์ใหม่ไม่โดนลดจนน่าเกลียด)
+
+# ---------------- Cache / impression TTL / directories ---------------------
+OUT_DIR = "./LogRec"
 CACHE_DIR = os.path.join(OUT_DIR, "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-CACHE_EXPIRY_TIME_SECONDS = 120
-IMPRESSION_HISTORY_TTL_SECONDS = 24*3600
-IMPRESSION_HISTORY_MAX_ENTRIES = 500
-INCLUDE_SELF_POSTS = False  # รวมโพสต์เจ้าของเองไหม
+CACHE_EXPIRY_TIME_SECONDS = 120          # อายุแคช per-user
+IMPRESSION_HISTORY_TTL_SECONDS = 24*3600 # TTL ของ impression history (24 ชั่วโมง)
+IMPRESSION_HISTORY_MAX_ENTRIES = 500     # เก็บ impressions สูงสุดต่อ user
 
-# ====================== DIVERSITY / NEWNESS / THRESHOLDS ======================
-RUNLEN_CAP_TOP20 = 4
-RUNLEN_CAP_AFTER = 4
-MMR_LAMBDA       = 0.80
-MMR_MAX_REF      = 30
+# deprecated / compatibility flag (ใช้ INCLUDE_SELF_POSTS_IN_FEED แทน)
+INCLUDE_SELF_POSTS = False
 
-NEW_WINDOWS_HOURS = [1, 3, 24]
-NEW_INSERT_MAX    = 3
+# ---------------- DIVERSITY / NEWNESS / THRESHOLDS -------------------------
+RUNLEN_CAP_TOP20 = 3     # จำกัด run-length หมวดเดียวใน Top20
+RUNLEN_CAP_AFTER = 3     # limit หลัง Top20
+MMR_LAMBDA = 0.80        # MMR lambda (ใกล้ 1 => เน้น relevance)
+MMR_MAX_REF = 30         # จำนวน ref item เพื่อคำนวณ diversity penalty
 
-CAT_MATCH_TOP20 = 0.60
-CAT_MATCH_AFTER = 0.50
-ENG_PCTL_TOP20  = 40
-ENG_PCTL_NEW    = 25
+NEW_WINDOWS_HOURS = [1, 3, 24]  # หน้าต่างเวลา (ชั่วโมง) สำหรับนิยาม "โพสต์ใหม่"
+NEW_INSERT_MAX = 3               # จำนวนโพสต์ใหม่สูงสุดที่จะแทรกใน zone 21–30
 
+CAT_MATCH_TOP20 = 0.60   # threshold ของ category-sim สำหรับ Top20
+CAT_MATCH_AFTER = 0.50   # threshold หลัง Top20
+ENG_PCTL_TOP20 = 40      # percentile ของ engagement สำหรับ Top20 (e.g., 40th)
+ENG_PCTL_NEW = 25        # percentile สำหรับโพสต์ใหม่
+
+# randomization temps (biased shuffle)
 TEMP_UNSEEN = 0.15
 TEMP_SEENNO = 0.12
-TEMP_INTER  = 0.10
+TEMP_INTER = 0.10
 
-# สำหรับ _rank._final_score (โซน Top20/21-30 ใช้สเกลนี้)
-WEIGHT_E = 0.50  # engagement
-WEIGHT_C = 0.25  # category match (self)
-WEIGHT_F = 0.10  # follow-influence category
-WEIGHT_T = 0.10  # text relevance
-WEIGHT_R = 0.05  # recency (ใช้เฉพาะโซน new)
-
-# ---- logging to file ----
-LOGREC_FILE = os.path.join(OUT_DIR, "logrec.txt")
-_log_lock = threading.Lock()
-
-# =============================== GLOBAL STATE ===================================
+# ---------------- global caches / lazy artifacts (internal state) ----------
+# ตัวแปรพวกนี้เป็น state ของ process — เก็บไว้ใน module scope
 recommendation_cache: Dict[int, Dict] = {}
 impression_history_cache: Dict[int, List[Dict]] = {}
 _cache_lock = threading.Lock()
 
-# ContentBased global (lazy-build)
+# lazy-built content-based artifacts (อาจถูกเติมโดย background builder)
 _tfidf = None
 _X = None
 _postidx: Dict[int, int] = {}
+
+# ---------------- TTL MODE DEFAULT ----------------------------------------
+USE_TTL_SEEN = True  # True: ใช้ TTL-based seen (impression cache); False: ใช้ event-based seen
+
+# ---------------- optional monitoring / safe defaults ----------------------
+SEEN_ACCESS_SUMMARY_ON_RECOMMEND = False
+def _seen_pop_count() -> int:
+    # stub: คืนค่า 0 ถ้าไม่มีโค้ดตรวจสรุปแยกไว้
+    return 0
+
+# --------------------------- SHORT GUIDANCE --------------------------------
+# - ถ้าจะ "ยกหมวดหมู่" ให้ปรับ HYBRID_WEIGHTS['category'] (หรือ WEIGHT_CATEGORY ถาจะไม่ใช้ dict)
+# - ถ้าต้องการ tune ให้เป็นเอกภาพ: ปรับ HYBRID_WEIGHTS แล้วตั้ง MAP_HYBRID_TO_RANK=True
+# - ปรับ USE_HYBRID=True เฉพาะเมื่อเตรียม artifacts (tfidf/knn/svd) ไว้แล้วหรืออนุญาตให้สร้าง background
+# ============================================================================ 
+
+
 
 # ================================ UTILITIES =====================================
 def _eng():
@@ -466,22 +509,10 @@ def _get_authored_ids(e, user_id: int) -> List[int]:
     except Exception:
         return []
 
-
 def _normalize_series(s: pd.Series) -> pd.Series:
     s = pd.to_numeric(s, errors='coerce').fillna(0.0).astype(np.float32)
     mn, mx = float(s.min()), float(s.max())
     return (s - mn) / (mx - mn + 1e-12)
-
-def _normalize_vec(v) -> np.ndarray:
-    """min-max normalize สำหรับเวกเตอร์ numpy (ใช้กับโปรไฟล์หมวด)"""
-    v = np.asarray(v, dtype=np.float32)
-    if v.size == 0:
-        return v
-    mn, mx = float(np.min(v)), float(np.max(v))
-    rng = mx - mn
-    if rng <= 1e-12:
-        return np.zeros_like(v, dtype=np.float32)
-    return (v - mn) / (rng + 1e-12)
 
 def _md5_of_df(df: pd.DataFrame, cols: List[str]) -> str:
     """
@@ -640,17 +671,6 @@ def verify_token(f):
     return decorated_function
 
 # ============================ DATA LOADING / PREP ===============================
-def _load_posts_active(e) -> pd.DataFrame:
-    """โหลดโพสต์ (กรอง active ตามคอลัมน์ที่มี) สำหรับตรวจ recency/active coverage"""
-    df = pd.read_sql(f"SELECT * FROM {POSTS_TABLE}", e)
-    cols = {c.lower(): c for c in df.columns}
-    if "status" in cols:
-        df = df[df[cols["status"]].astype(str).str.lower().isin(["active","published","publish","1","true"])]
-    elif "active" in cols:
-        df = df[df[cols["active"]].astype(str).str.lower().isin(["1","true","t","yes","y","active"])]
-    elif "is_active" in cols:
-        df = df[df[cols["is_active"]].astype(str).str.lower().isin(["1","true","t","yes","y"])]
-    return df
 
 def _load_content_view(e) -> pd.DataFrame:
     """โหลดฟีเจอร์จาก content view แล้วเตรียมคอลัมน์ที่จำเป็นทั้งหมด"""
@@ -1117,89 +1137,6 @@ def _user_category_profile(user_id: int, user_events: pd.DataFrame, content_df: 
     w = np.maximum(w, 0.0)
     return _normalize_series(pd.Series(w)).to_numpy(dtype=np.float32)
 
-
-
-def _apply_category_runlen_cap(
-    ids: List[int],
-    content_df: pd.DataFrame,
-    user_cat_prof: np.ndarray,
-    scores_by_pid: Dict[int, float],
-    cap: int = 3
-) -> List[int]:
-    """
-    เรียงใหม่โดย 'ห้าม' มีหมวดเดียวกันติดกันเกิน cap แต่ไม่บังคับให้ต้องเป็น 3 เสมอ
-    เลือกตัวถัดไปแบบ greedy โดยดูคะแนนเดิม (scores_by_pid) + preference หมวดของผู้ใช้เล็กน้อย
-    """
-    if not ids: return []
-
-    # เตรียม mapping pid -> category index/name
-    idx = content_df.set_index("post_id")
-    def _cat_idx(pid: int) -> int:
-        row = idx.loc[pid, CATEGORY_COLS].to_numpy(dtype=np.float32)
-        return int(np.argmax(row)) if row.size else 0
-    def _cat_name(pid: int) -> str:
-        return CATEGORY_COLS[_cat_idx(pid)]
-
-    # เตรียมคิวโดยแยกตามหมวด + เรียงในหมวดตามคะแนน
-    buckets: Dict[int, List[int]] = {}
-    for pid in ids:
-        ci = _cat_idx(pid)
-        buckets.setdefault(ci, []).append(pid)
-    for ci in buckets:
-        buckets[ci].sort(key=lambda p: (scores_by_pid.get(p, 0.0)), reverse=True)
-
-    # ดึงค่า preference ของผู้ใช้ต่อหมวด (ไว้ช่วย break tie ตอนคะแนนใกล้กัน)
-    user_pref = (user_cat_prof if user_cat_prof is not None and user_cat_prof.size==len(CATEGORY_COLS)
-                 else np.zeros(len(CATEGORY_COLS), dtype=np.float32))
-
-    out: List[int] = []
-    last_cat = None
-    run_len = 0
-
-    # สร้างชุด "ผู้สมัคร" = หัวแถวของแต่ละหมวดที่ยังเหลือ
-    def _candidates(exclude_cat: Optional[int]) -> List[Tuple[float,int,int]]:
-        cands = []
-        for ci, lst in buckets.items():
-            if not lst: continue
-            if exclude_cat is not None and ci == exclude_cat and run_len >= cap:
-                # cat เดิมชนเพดาน cap แล้ว → ห้าม
-                continue
-            head = lst[0]
-            base = scores_by_pid.get(head, 0.0)
-            bonus = 0.02 * float(user_pref[ci])  # เล็กน้อยพอช่วย balance แต่ไม่สั่นแรงเกิน
-            cands.append((base + bonus, ci, head))
-        cands.sort(key=lambda x: x[0], reverse=True)
-        return cands
-
-    total_left = sum(len(v) for v in buckets.values())
-    while total_left > 0:
-        # เลือกผู้สมัครที่ดีที่สุดโดยไม่ทำให้ run_len > cap
-        cands = _candidates(exclude_cat=last_cat)
-        if not cands:
-            # ทุกตัวที่เหลือคือหมวดเดียวกับ last_cat และวิ่งชน cap หมดแล้ว
-            # ยอมคลี่ constraint (fallback) เพื่อไม่ติด deadlock
-            # -> เลือกคะแนนสูงสุดที่เหลือ (แม้จะทำให้ run เกิน cap ในทางทฤษฎี แต่กรณีนี้คือไม่มีทางเลือก)
-            cands = _candidates(exclude_cat=None)
-            if not cands:
-                break
-
-        _, ci, pid = cands[0]
-        # เอาออกจาก bucket
-        buckets[ci].pop(0)
-        total_left -= 1
-
-        # อัปเดต run
-        if last_cat is None or ci != last_cat:
-            last_cat = ci
-            run_len = 1
-        else:
-            run_len += 1
-
-        out.append(pid)
-
-    # ในทางปฏิบัติ logic นี้จะไม่ “ยัด 3 เสมอ” แต่จะพยายามรักษาคะแนนรวม + cap constraint
-    return out
-
 # =========================== COLLABORATIVE (Model) ==============================
 def build_collaborative_model(events: pd.DataFrame, post_ids: List[int]):
     """สร้าง SVD จาก implicit ratings (ตัดเฉพาะโพสต์ในปัจจุบัน)"""
@@ -1270,193 +1207,156 @@ def compute_hybridrecommendation_scores(
     return out.sort_values(["final_norm","final"], ascending=[False, False])
 
 def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
+    """
+    เวอร์ชันสุดท้าย (patched):
+      - ใช้ _rank เป็นตัวจัดลำดับหลัก แต่สามารถเลือกที่จะใช้ hybrid precomputed base_score
+        ถ้า USE_HYBRID=True จะพยายาม (best-effort) เตรียม artifacts แล้วคำนวณ scores
+      - cache key ผูกกับ snapshot ของ content/events ด้วย _md5_of_df
+      - นโยบาย seen filter คุมด้วย USE_TTL_SEEN (True=TTL impression, False=event-based)
+      - เพิ่ม robustness กับ content_df ว่าง และป้องกัน exception ที่หนักใน request path
+    """
     now = datetime.utcnow()
 
-    # -------- cache (ต่อ user) --------
-    with _cache_lock:
-        cached = recommendation_cache.get(uid)
-        if use_cache and cached and (now - cached["timestamp"]).total_seconds() < CACHE_EXPIRY_TIME_SECONDS:
-            return [int(x) for x in cached["ids"]]
-
+    # โหลดข้อมูลจำเป็น
     e = _eng()
     content_df = _load_content_view(e)
     events_all = _load_events_all(e)
 
-    # ----- blocks / cache ไฟล์สำหรับ TF-IDF / KNN / SVD / user-text profiles -----
-    content_hash = _md5_of_df(content_df, ["post_id", TEXT_COL, ENGAGE_COL])
-    ev_sample = events_all[["user_id","post_id","action_type"]].head(5000) if len(events_all)>5000 else events_all[["user_id","post_id","action_type"]]
-    events_hash = _md5_of_df(ev_sample, ["user_id","post_id","action_type"])
-    cache_key = f"{content_hash}_{events_hash}"
-    fp_tfidf = os.path.join(CACHE_DIR, cache_key + ".tfidf.pkl")
-    fp_X     = os.path.join(CACHE_DIR, cache_key + ".X.npz")
-    fp_knn   = os.path.join(CACHE_DIR, cache_key + ".knn.pkl")
-    fp_item  = os.path.join(CACHE_DIR, cache_key + ".item.npy")
-    fp_ut    = os.path.join(CACHE_DIR, cache_key + ".ut.pkl")
-    fp_svd   = os.path.join(CACHE_DIR, cache_key + ".svd.pkl")
-    ensure_models_built(content_df, events_all, cache_key, CACHE_DIR, force=False, non_blocking=True)
+    # ถ้าไม่มีโพสต์เลย ให้คืนว่าง
+    if content_df is None or content_df.empty:
+        return []
 
-
-    # tfidf/X/postidx (safe load / atomic save)
-    tfidf = _safe_pickle_load(fp_tfidf)
-    X = None
-    postidx = {pid:i for i, pid in enumerate(content_df["post_id"].astype(int).tolist())}
-
-    if tfidf is not None and os.path.exists(fp_X):
-        try:
-            X = load_npz(fp_X).astype(np.float32)
-        except Exception:
-            try: os.remove(fp_X)
-            except Exception: pass
-            tfidf = None
-            X = None
-
-    if tfidf is None or X is None:
-        tfidf, X, postidx, _ = build_contentbased_models(content_df)
-        try:
-            _atomic_write_file(fp_tfidf, pickle.dumps(tfidf))
-        except Exception:
-            try:
-                with open(fp_tfidf + ".tmp", "wb") as f:
-                    pickle.dump(tfidf, f)
-                    f.flush()
-                    try: os.fsync(f.fileno())
-                    except Exception: pass
-                os.replace(fp_tfidf + ".tmp", fp_tfidf)
-            except Exception:
-                pass
-        try:
-            save_npz(fp_X, X)
-        except Exception:
-            try:
-                if os.path.exists(fp_X): os.remove(fp_X)
-                save_npz(fp_X, X)
-            except Exception:
-                pass
-
-    # KNN + item-content scores (safe load / atomic save)
-    knn = _safe_pickle_load(fp_knn)
-    item_scores = None
-    if knn is not None and os.path.exists(fp_item):
-        try:
-            item_scores = np.load(fp_item, allow_pickle=False)
-        except Exception:
-            try: os.remove(fp_item)
-            except Exception: pass
-            knn = None
-            item_scores = None
-
-    if knn is None or item_scores is None:
-        knn = _build_knn(X)
-        item_scores = _precompute_item_content_scores(knn, content_df, X)
-        try:
-            _atomic_write_file(fp_knn, pickle.dumps(knn))
-        except Exception:
-            try:
-                with open(fp_knn + ".tmp", "wb") as f:
-                    pickle.dump(knn, f)
-                os.replace(fp_knn + ".tmp", fp_knn)
-            except Exception:
-                pass
-        try:
-            np.save(fp_item, item_scores)
-        except Exception:
-            try:
-                if os.path.exists(fp_item): os.remove(fp_item)
-                np.save(fp_item, item_scores)
-            except Exception:
-                pass
-
-    # user-text profiles (label y=1 จาก POS_ACTIONS/view) - safe load/write
-    t = events_all.groupby(["user_id","post_id","action_type"]).size().reset_index(name="cnt")
-    if t.empty:
-        train_pos = pd.DataFrame(columns=["user_id","post_id"])
-    else:
-        pvt = t.pivot_table(index=["user_id","post_id"], columns="action_type",
-                            values="cnt", fill_value=0, aggfunc="sum").reset_index()
-        pvt.columns = [str(c).lower() for c in pvt.columns]
-        pos = np.zeros(len(pvt), dtype=bool)
-        for a in POS_ACTIONS:
-            if a in pvt.columns: pos |= (pvt[a].to_numpy(dtype=float) > 0)
-        if "view" in pvt.columns: pos |= (pvt["view"].to_numpy(dtype=float) >= VIEW_POS_MIN)
-        if NEG_ACTIONS:
-            neg = np.zeros(len(pvt), dtype=bool)
-            for a in NEG_ACTIONS:
-                if a in pvt.columns: neg |= (pvt[a].to_numpy(dtype=float) > 0)
-            pos = np.where(neg, False, pos)
-        labels = pvt[["user_id","post_id"]].copy(); labels["y"] = pos.astype(int)
-        train_pos = labels[labels["y"]==1][["user_id","post_id"]]
-
-    ut_profiles = _safe_pickle_load(fp_ut)
-    if ut_profiles is None:
-        ut_profiles = _user_text_profiles(train_pos, content_df, X)
-        try:
-            _atomic_write_file(fp_ut, pickle.dumps(ut_profiles))
-        except Exception:
-            try:
-                with open(fp_ut + ".tmp", "wb") as f:
-                    pickle.dump(ut_profiles, f)
-                os.replace(fp_ut + ".tmp", fp_ut)
-            except Exception:
-                pass
-
-    # collaborative SVD (safe load/write)
-    svd = _safe_pickle_load(fp_svd)
-    if svd is None:
-        svd = build_collaborative_model(events_all, content_df["post_id"].astype(int).tolist())
-        try:
-            _atomic_write_file(fp_svd, pickle.dumps(svd))
-        except Exception:
-            try:
-                with open(fp_svd + ".tmp", "wb") as f:
-                    pickle.dump(svd, f)
-                os.replace(fp_svd + ".tmp", fp_svd)
-            except Exception:
-                pass
-
-    # -------- user-specific --------
-    user_events   = events_all[events_all["user_id"] == int(uid)]
-    user_cat_prof = _user_category_profile(uid, user_events, content_df)
-
-    # hybrid scores → อันดับฐาน
-    sc = compute_hybridrecommendation_scores(
-        uid, content_df, tfidf, X, postidx, ut_profiles, svd, item_scores, user_cat_prof
-    )
-    ordered_raw = [int(x) for x in sc["post_id"].tolist()]
-
-    # --- สร้าง mapping สำหรับความสำคัญของโพสต์ (ใช้ใน diversity อิง ranking เดิม) ---
-    # ใช้ final_norm ถ้ามี ไม่งั้นใช้ final
-    score_col = "final_norm" if "final_norm" in sc.columns else "final"
-    scores_by_pid = {int(pid): float(s) for pid, s in zip(sc["post_id"].astype(int), sc[score_col].astype(float))}
-
-    # กันโพสต์ที่ตัวเองเป็นคนโพสต์
+    # --- สร้าง cache key จากข้อมูลจริง (เปลี่ยนข้อมูลเมื่อไร key เปลี่ยน) ---
     try:
-        my_posts = set(_get_authored_ids(_eng(), uid))
+        cols_content = ["post_id", ENGAGE_COL] + list(CATEGORY_COLS)
+        content_hash = _md5_of_df(content_df[cols_content], cols=cols_content)
     except Exception:
-        my_posts = set()
-    ordered_raw = [pid for pid in ordered_raw if pid not in my_posts]
+        content_hash = _md5_of_df(content_df[["post_id"]], cols=["post_id"])
 
-    # กันซ้ำ preserve-order
-    seen_once = set(); base_order = []
-    for pid in ordered_raw:
-        if pid not in seen_once:
-            base_order.append(pid); seen_once.add(pid)
+    try:
+        cols_events = ["user_id", "post_id", "action_type"]
+        events_hash = _md5_of_df(events_all[cols_events], cols=cols_events)
+    except Exception:
+        events_hash = _md5_of_df(events_all[["user_id","post_id"]], cols=["user_id","post_id"])
 
-    # ===== ใช้ Impression history แยกเป็น unseen / seen_no_positive / interacted =====
-    unseen, seen_no_pos, interacted = _split_seen_buckets(uid, base_order, events_all)
+    cache_key = f"{uid}:{content_hash}:{events_hash}"
 
-    # ===== diversity (run-length cap = 3) ต่อบล็อก + ผสานแบบเลี่ยงชนขอบ =====
-    block_unseen     = _apply_category_runlen_cap(unseen,       content_df, user_cat_prof, scores_by_pid, cap=3)
-    block_seen_no    = _apply_category_runlen_cap(seen_no_pos,  content_df, user_cat_prof, scores_by_pid, cap=3)
-    block_interacted = _apply_category_runlen_cap(interacted,   content_df, user_cat_prof, scores_by_pid, cap=3)
-
-    merged = _concat_with_boundary_cap(block_unseen, block_seen_no, content_df, cap=3, scores_by_pid=scores_by_pid)
-    merged = _concat_with_boundary_cap(merged,       block_interacted, content_df, cap=3, scores_by_pid=scores_by_pid)
-
-    # -------- update cache (impressions จะไป record ใน handler หลังส่งจริง) --------
+    # --- ตรวจ cache โดยผูกกับ key (ถ้า key ไม่ตรง แคชถือว่า invalid) ---
     with _cache_lock:
-        recommendation_cache[uid] = {"ids": merged, "timestamp": now}
+        cached = recommendation_cache.get(uid)
+        if use_cache and cached and cached.get("key") == cache_key and \
+           (now - cached.get("timestamp", now)).total_seconds() < CACHE_EXPIRY_TIME_SECONDS:
+            return [int(x) for x in cached["ids"]]
 
-    return merged
+    # events ของ user
+    user_events = events_all[events_all["user_id"] == int(uid)] if "user_id" in events_all.columns else events_all.iloc[:0]
+
+    # --- แยกกลุ่มสำหรับ _rank ตามนโยบายที่เลือก ---
+    if USE_TTL_SEEN:
+        all_ids = [int(x) for x in pd.to_numeric(content_df["post_id"], errors="coerce").dropna().astype(int).tolist()]
+        unseen, seen_no, interacted = _split_seen_buckets(int(uid), all_ids, events_all)
+    else:
+        unseen, seen_no, interacted = _split_to_unseen_seenno_interacted(int(uid), content_df, events_all)
+
+    # --- (ใหม่) ถ้าเปิด HYBRID -> เตรียม precomputed_base_score (best-effort) ---
+    precomputed_scores = None
+    if USE_HYBRID:
+        # spawn background build (best-effort) so artifacts can be created outside request
+        try:
+            ensure_models_built(content_df, events_all, cache_key, cache_dir=CACHE_DIR, non_blocking=True)
+        except Exception:
+            pass
+
+        # best-effort: try to obtain TF-IDF/X/postidx (may use global lazy-build)
+        try:
+            tfidf, X, postidx, _ = build_contentbased_models(content_df)
+        except Exception:
+            # fallback to globals if available
+            tfidf, X, postidx = (_tfidf, _X, _postidx)
+
+        # best-effort: precompute item_scores (if X available)
+        try:
+            if X is not None and getattr(X, "shape", (0,))[0] > 0:
+                try:
+                    knn = _build_knn(X)
+                    item_scores = _precompute_item_content_scores(knn, content_df, X)
+                except Exception:
+                    # graceful fallback: zeros
+                    item_scores = np.zeros(X.shape[0], dtype=np.float32)
+            else:
+                item_scores = np.zeros(len(content_df), dtype=np.float32)
+        except Exception:
+            item_scores = np.zeros(len(content_df), dtype=np.float32)
+
+        # build train_pos -> user_text_profiles (best-effort)
+        try:
+            t = events_all.groupby(["user_id","post_id","action_type"]).size().reset_index(name="cnt")
+            if t.empty:
+                train_pos = pd.DataFrame(columns=["user_id","post_id"])
+            else:
+                pvt = t.pivot_table(index=["user_id","post_id"], columns="action_type",
+                                    values="cnt", fill_value=0, aggfunc="sum").reset_index()
+                pvt.columns = [str(c).lower() for c in pvt.columns]
+                pos = np.zeros(len(pvt), dtype=bool)
+                for a in POS_ACTIONS:
+                    if a in pvt.columns: pos |= (pvt[a].to_numpy(dtype=float) > 0)
+                if "view" in pvt.columns: pos |= (pvt["view"].to_numpy(dtype=float) >= VIEW_POS_MIN)
+                if NEG_ACTIONS:
+                    neg = np.zeros(len(pvt), dtype=bool)
+                    for a in NEG_ACTIONS:
+                        if a in pvt.columns: neg |= (pvt[a].to_numpy(dtype=float) > 0)
+                    pos = np.where(neg, False, pos)
+                labels = pvt[["user_id","post_id"]].copy(); labels["y"] = pos.astype(int)
+                train_pos = labels[labels["y"]==1][["user_id","post_id"]]
+            user_text_profiles = _user_text_profiles(train_pos, content_df, X if X is not None else csr_matrix((0,0)))
+        except Exception:
+            user_text_profiles = {}
+
+        # collab model: best-effort (may be None)
+        try:
+            collab_model = build_collaborative_model(events_all, content_df["post_id"].astype(int).tolist())
+        except Exception:
+            collab_model = None
+
+        # user category profile
+        try:
+            user_cat_prof = _user_category_profile(int(uid), user_events, content_df)
+        except Exception:
+            user_cat_prof = np.zeros(len(CATEGORY_COLS), dtype=np.float32)
+
+        # compute hybrid dataframe (best-effort)
+        try:
+            df_hybrid = compute_hybridrecommendation_scores(
+                int(uid), content_df, tfidf, X, postidx,
+                user_text_profiles, collab_model, item_scores, user_cat_prof
+            )
+            # use 'final' (not final_norm) so absolute ordering preserved for ranking
+            precomputed_scores = dict(zip(df_hybrid["post_id"].astype(int).tolist(),
+                                         df_hybrid["final"].astype(float).tolist()))
+        except Exception:
+            precomputed_scores = None
+
+    # --- จัดลำดับด้วย _rank (logic หลัก) ---
+    try:
+        ranked = _rank(int(uid), content_df, user_events, unseen, seen_no, interacted, precomputed_base_score=precomputed_scores)
+    except Exception:
+        # fallback safe: return simple popularity order if rank fails
+        try:
+            pop_series = content_df.get("PopularityPrior", None)
+            if pop_series is not None:
+                ordered = content_df["post_id"].astype(int).tolist()
+                ordered.sort(key=lambda p: float(content_df.loc[content_df["post_id"]==p, "PopularityPrior"].values[0]) if not content_df.loc[content_df["post_id"]==p].empty else 0.0, reverse=True)
+                ranked = ordered
+            else:
+                ranked = content_df["post_id"].astype(int).tolist()
+        except Exception:
+            ranked = content_df["post_id"].astype(int).tolist()
+
+    # --- อัปเดตแคชให้ผูกกับ key ปัจจุบัน ---
+    with _cache_lock:
+        recommendation_cache[uid] = {"ids": ranked, "timestamp": now, "key": cache_key}
+
+    return [int(x) for x in ranked]
 
 
 # ======================== DB FETCH (return full post objects) ====================
@@ -1752,11 +1652,18 @@ def _user_text_profiles(train_pos: pd.DataFrame, content_df: pd.DataFrame, X: cs
 
 
 def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
-          unseen: List[int], seen_no: List[int], interacted: List[int]) -> List[int]:
-
+          unseen: List[int], seen_no: List[int], interacted: List[int],
+          precomputed_base_score: Optional[Dict[int, float]] = None) -> List[int]:
+    """
+    Ranking pipeline (patched):
+      - รองรับ precomputed_base_score (จาก hybrid) ถ้ามี -> ใช้เป็น base_score
+      - ถ้า pool (unseen + seen_no) ว่าง -> fallback เอา interacted มาใช้
+      - เพิ่มความปลอดภัยในจุดที่อาจเกิด Index/empty errors
+      - คืน ordered list ของ post_id (unique, preserved order)
+    """
     now = datetime.now()
 
-    # เตรียม TF-IDF / post-index
+    # เตรียม TF-IDF / post-index (lazy)
     _vectorize_texts(content_df)
 
     # ==== โปรไฟล์ ====
@@ -1770,14 +1677,20 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
     )
 
     def _final_score(E, C, F, T, R, zone_is_new: bool) -> float:
-        # ใช้ WEIGHT_* เดิมของคุณได้เลย (หรือ map จากชุด WEIGHT_COLLAB/ITEM/USER_TEXT/CATEGORY/POP ถ้าคุณใช้ชื่อแบบนั้น)
         if zone_is_new:
             return WEIGHT_E*E + WEIGHT_C*C + WEIGHT_F*F + WEIGHT_T*T + WEIGHT_R*R
         return WEIGHT_E*E + WEIGHT_C*C + WEIGHT_F*F + WEIGHT_T*T
 
-    base_score = {int(pid): _final_score(scores_E[int(pid)], scores_C[int(pid)], scores_F[int(pid)],
-                                         scores_T[int(pid)], 0.0, zone_is_new=False)
-                  for pid in content_df["post_id"].astype(int)}
+    # --- base_score: ถ้ามี precomputed_base_score ให้ใช้ (จาก hybrid) มิฉะนั้นคำนวณเดิม ---
+    if precomputed_base_score:
+        base_score = {int(pid): float(precomputed_base_score.get(int(pid), 0.0))
+                      for pid in content_df["post_id"].astype(int)}
+    else:
+        base_score = {
+            int(pid): _final_score(scores_E.get(int(pid), 0.0), scores_C.get(int(pid), 0.0), scores_F.get(int(pid), 0.0),
+                                   scores_T.get(int(pid), 0.0), 0.0, zone_is_new=False)
+            for pid in content_df["post_id"].astype(int)
+        }
 
     # เตรียมข้อมูลช่วยตัดสิน
     ptiles = _category_percentiles_map(content_df)
@@ -1789,22 +1702,36 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
         self_post_ids = set()
 
     # ===================== Top 20 =====================
+    # pool เป็น unseen + seen_no ตาม policy — แต่ถ้าว่าง fallback ให้ใช้ interacted
+    pool = list(unseen) + list(seen_no)
+    if not pool:
+        # fallback: ถ้าผู้ใช้มี interacted แต่ไม่มี unseen/seen_no ให้ใช้ interacted เป็น pool
+        pool = list(interacted)
+
     top20_cands = []
-    pool = unseen + seen_no
     for pid in pool:
         if (not INCLUDE_SELF_POSTS_IN_FEED) and (pid in self_post_ids):
             continue
         cat = category_by_pid(content_df, pid)
         ok_cat = scores_C.get(pid, 0.0) >= CAT_MATCH_TOP20
-        thr_map = ptiles[str(ENG_PCTL_TOP20)]
-        thr = thr_map.get(cat, thr_map["__global__"])
-        ok_eng = content_df.loc[content_df["post_id"] == pid, "PostEngagement"].values[0] >= thr
+        # 안전하게อ่านค่า ENGAGE_COL
+        try:
+            eng_val = float(content_df.loc[content_df["post_id"] == pid, ENGAGE_COL].values[0])
+        except Exception:
+            eng_val = 0.0
+        thr_map = ptiles.get(str(ENG_PCTL_TOP20), {})
+        thr = thr_map.get(cat, thr_map.get("__global__", 0.0))
+        ok_eng = eng_val >= thr
         if ok_cat and ok_eng:
             top20_cands.append(pid)
 
     if len(top20_cands) < 20:
         relax_pool = [pid for pid in pool if pid not in top20_cands]
-        relax = sorted(relax_pool, key=lambda x: (scores_C.get(x,0.0), base_score.get(x,0.0)), reverse=True)
+        relax = sorted(
+            relax_pool,
+            key=lambda x: (scores_C.get(x, 0.0), base_score.get(x, 0.0)),
+            reverse=True
+        )
         for pid in relax:
             if (not INCLUDE_SELF_POSTS_IN_FEED) and (pid in self_post_ids):
                 continue
@@ -1812,17 +1739,18 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
                 break
             top20_cands.append(pid)
 
-    # MMR diversity
-    def simfunc(a:int,b:int):
-        ia, ib = _postidx.get(a,-1), _postidx.get(b,-1)
-        if ia<0 or ib<0: return 0.0
+    # MMR diversity ใน Top20
+    def simfunc(a: int, b: int):
+        ia, ib = _postidx.get(a, -1), _postidx.get(b, -1)
+        if ia < 0 or ib < 0:
+            return 0.0
         va, vb = _X[ia], _X[ib]
         num = float(va.multiply(vb).sum())
-        den = (np.linalg.norm(va.data)*np.linalg.norm(vb.data))
-        return float(num/den) if den>0 else 0.0
+        den = (np.linalg.norm(va.data) * np.linalg.norm(vb.data)) if (hasattr(va, "data") and hasattr(vb, "data")) else 0.0
+        return float(num/den) if den > 0 else 0.0
 
     top20_sorted = _mmr_select(
-        candidates=sorted(set(top20_cands), key=lambda x: base_score.get(x,0.0), reverse=True),
+        candidates=sorted(set(top20_cands), key=lambda x: base_score.get(x, 0.0), reverse=True),
         scores=base_score, simfunc=simfunc, lam=MMR_LAMBDA, k=min(20, len(content_df))
     )
 
@@ -1833,8 +1761,10 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
         cat = category_by_pid(content_df, pid)
         if _runlen_violate(cat_seq, cat, RUNLEN_CAP_TOP20):
             continue
-        top20_out.append(pid); cat_seq.append(cat)
-        if len(top20_out) >= 20: break
+        top20_out.append(pid)
+        cat_seq.append(cat)
+        if len(top20_out) >= 20:
+            break
 
     # ================= Zone 21–30 (ของใหม่) =================
     zone21_30 = []
@@ -1846,40 +1776,75 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
             if (not INCLUDE_SELF_POSTS_IN_FEED) and (pid in self_post_ids):
                 continue
             row = content_df.loc[content_df["post_id"] == pid]
-            if row.empty: continue
-            ts = pd.to_datetime(row["created_ts"].iloc[0]) if "created_ts" in row.columns else pd.NaT
-            if not _is_new(ts, now_ts, h): continue
+            if row.empty:
+                continue
+            ts = pd.NaT
+            for c in ("created_ts", "created_at", "createdAt", "updated_at", "updatedAt", "timestamp"):
+                if c in row.columns:
+                    ts = pd.to_datetime(row[c].iloc[0], errors="coerce")
+                    break
+            if not _is_new(ts, now_ts, h):
+                continue
             cat = category_by_pid(content_df, pid)
-            cond_cat = scores_C.get(pid,0.0) >= CAT_MATCH_AFTER
-            thr_map_new = ptiles[str(ENG_PCTL_NEW)]
-            thr_new = thr_map_new.get(cat, thr_map_new["__global__"])
-            cond_eng = row["PostEngagement"].values[0] >= thr_new
+            cond_cat = scores_C.get(pid, 0.0) >= CAT_MATCH_AFTER
+            thr_map_new = ptiles.get(str(ENG_PCTL_NEW), {})
+            thr_new = thr_map_new.get(cat, thr_map_new.get("__global__", 0.0))
+            try:
+                eng_val = float(row[ENGAGE_COL].values[0])
+            except Exception:
+                eng_val = 0.0
+            cond_eng = eng_val >= thr_new
             if cond_cat and cond_eng:
-                sc = _final_score(scores_E.get(pid,0.0), scores_C.get(pid,0.0), scores_F.get(pid,0.0),
-                                  scores_T.get(pid,0.0), scores_R.get(pid,0.0), zone_is_new=True)
+                sc = _final_score(
+                    scores_E.get(pid, 0.0), scores_C.get(pid, 0.0), scores_F.get(pid, 0.0),
+                    scores_T.get(pid, 0.0), scores_R.get(pid, 0.0), zone_is_new=True
+                )
                 new_cands.append((sc, pid))
         new_cands.sort(reverse=True)
-        picked = [pid for _,pid in new_cands[:need_max]]
+        picked = [pid for _, pid in new_cands[:need_max]]
         if picked:
             zone21_30 = picked[:need_max]
             break
 
-    # เติม 21–30 ด้วย best-of-rest
+    # เติม 21–30 ด้วย best-of-rest (พร้อมเช็ก cap ต่อเนื่องจาก Top20)
     chosen20 = set(top20_out)
     chosen21 = set(zone21_30)
-    remaining_pool = [pid for pid in unseen + seen_no if pid not in chosen20 | chosen21]
+    remaining_pool = [pid for pid in unseen + seen_no if pid not in (chosen20 | chosen21)]
     if not INCLUDE_SELF_POSTS_IN_FEED:
         remaining_pool = [pid for pid in remaining_pool if pid not in self_post_ids]
-    rest_sorted = sorted(remaining_pool, key=lambda x: base_score.get(x,0.0), reverse=True)
+    rest_sorted = sorted(remaining_pool, key=lambda x: base_score.get(x, 0.0), reverse=True)
 
     pos21_30 = []
     insert_positions = [22, 26, 29]
-    i_new = 0
+
+    # ต่อรันหมวดจาก Top20 มาเลย เพื่อให้ cap เป็น global ต่อเนื่อง
+    cat_seq2 = cat_seq[:]  # cat_seq มาจาก Top20
+
+    def _pick_from(lst: List[int]) -> Optional[int]:
+        j = 0
+        while j < len(lst):
+            pid = lst[j]
+            c = category_by_pid(content_df, pid)
+            if not _runlen_violate(cat_seq2, c, RUNLEN_CAP_AFTER):
+                lst.pop(j)
+                cat_seq2.append(c)
+                return pid
+            j += 1
+        return None
+
     for pos in range(21, 31):
-        if i_new < len(zone21_30) and pos in insert_positions:
-            pos21_30.append(zone21_30[i_new]); i_new += 1
-        elif rest_sorted:
-            pos21_30.append(rest_sorted.pop(0))
+        pid_choice = None
+        # พยายามแทรก "ของใหม่" ตามตำแหน่งกำหนด โดยไม่ชน cap
+        if pos in insert_positions and zone21_30:
+            pid_choice = _pick_from(zone21_30)
+
+        # ถ้ายังไม่มี (ชน cap หรือหมด) -> หยิบ best-of-rest แบบไม่ชน cap
+        if pid_choice is None and rest_sorted:
+            pid_choice = _pick_from(rest_sorted)
+
+        if pid_choice is not None:
+            pos21_30.append(pid_choice)
+        # หากไม่มีตัวที่ไม่ชน cap เลย ให้เว้นไว้ก่อน (ช่วง tail จะเติมต่อด้วยกติกา cap เดิม)
 
     # ================= หลัง 30 =================
     chosen = set(top20_out + pos21_30)
@@ -1901,11 +1866,12 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
     U, S = len(unseen), len(seen_no)
     start_inter = _start_interacted_position(U, S)
 
-    tail, cat_seq_all = [], [category_by_pid(content_df, pid) for pid in (top20_out + pos21_30)]
-    pos_idx = len(top20_out) + len(pos21_30)
+    # ต่อเนื่องรันหมวด (รวม Top20 + 21–30) เพื่อรักษา cap แบบ global
+    cat_seq_all = [category_by_pid(content_df, pid) for pid in (top20_out + pos21_30)]
+    tail, pos_idx = [], len(top20_out) + len(pos21_30)
 
     # fill จนถึงจุดเริ่มแทรก interacted
-    mix_pool = sorted(unseen_rest + seenno_rest, key=lambda x: base_score.get(x,0.0), reverse=True)
+    mix_pool = sorted(unseen_rest + seenno_rest, key=lambda x: base_score.get(x, 0.0), reverse=True)
     for pid in mix_pool:
         cat = category_by_pid(content_df, pid)
         if _runlen_violate(cat_seq_all, cat, RUNLEN_CAP_AFTER):
@@ -1915,44 +1881,65 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
         if pos_idx >= start_inter:
             break
 
-    remain_ids = [pid for pid in base_rest if pid not in set(tail)]
-    remain_unseen   = [pid for pid in unseen_rest   if pid in remain_ids]
-    remain_seenno   = [pid for pid in seenno_rest   if pid in remain_ids]
-    remain_inter    = [pid for pid in interact_rest if pid in remain_ids]
+    remain_ids  = [pid for pid in base_rest if pid not in set(tail)]
+    remain_un   = [pid for pid in unseen_rest   if pid in remain_ids]
+    remain_sn   = [pid for pid in seenno_rest   if pid in remain_ids]
+    remain_it   = [pid for pid in interact_rest if pid in remain_ids]
 
-    while remain_unseen or remain_seenno or remain_inter:
+    while remain_un or remain_sn or remain_it:
         block_items = []
         quota_inter = max(0, int(0.10 * 10))  # ~10% ต่อบล็อก 10
         for _ in range(10):
-            best = None; best_score = -1
-            pools = [("unseen", remain_unseen), ("seenno", remain_seenno), ("inter", remain_inter if quota_inter>0 else [])]
+            best = None; best_score = -1.0
+            pools = [
+                ("un", remain_un),
+                ("sn", remain_sn),
+                ("it", remain_it if quota_inter > 0 else [])
+            ]
             for name, pool in pools:
-                if not pool: continue
+                if not pool:
+                    continue
                 cand = pool[0]
                 s = base_score.get(cand, 0.0)
                 if s > best_score:
                     best_score = s; best = (name, cand)
-            if best is None: break
+            if best is None:
+                break
+
             name, cand = best
             cat = category_by_pid(content_df, cand)
             if _runlen_violate(cat_seq_all, cat, RUNLEN_CAP_AFTER):
-                pool = remain_unseen if name=="unseen" else remain_seenno if name=="seenno" else remain_inter
+                # ชน cap → ทิ้งหัวแถวนั้นแล้วพยายามตัวถัดไปในรอบหน้า
+                pool = remain_un if name == "un" else remain_sn if name == "sn" else remain_it
                 pool.pop(0)
                 continue
+
             block_items.append(cand); cat_seq_all.append(cat)
-            pool = remain_unseen if name=="unseen" else remain_seenno if name=="seenno" else remain_inter
+            pool = remain_un if name == "un" else remain_sn if name == "sn" else remain_it
             pool.pop(0)
-            if name == "inter": quota_inter -= 1
-            if len(block_items) >= 10: break
+            if name == "it":
+                quota_inter -= 1
+            if len(block_items) >= 10:
+                break
 
         if not block_items:
-            leftovers = remain_unseen + remain_seenno + remain_inter
+            # fallback: กวาดทั้งหมดอีกรอบแบบเคารพ cap
+            leftovers = remain_un + remain_sn + remain_it
+            moved = False
             for cand in leftovers:
                 cat = category_by_pid(content_df, cand)
-                if _runlen_violate(cat_seq_all, cat, RUNLEN_CAP_AFTER):
-                    continue
-                block_items.append(cand)
-            remain_unseen.clear(); remain_seenno.clear(); remain_inter.clear()
+                if not _runlen_violate(cat_seq_all, cat, RUNLEN_CAP_AFTER):
+                    block_items.append(cand)
+                    cat_seq_all.append(cat)
+                    if cand in remain_un: remain_un.remove(cand)
+                    elif cand in remain_sn: remain_sn.remove(cand)
+                    else:
+                        if cand in remain_it: remain_it.remove(cand)
+                    moved = True
+            if not moved:
+                # ถ้าจริงๆ ไม่มีอะไรวางได้โดยไม่ชน cap (rare) ให้ break ป้องกันลูปค้าง
+                break
+
         tail.extend(block_items)
 
     final_list = top20_out + pos21_30 + tail
@@ -1961,6 +1948,38 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
         if pid not in seen_set:
             ordered.append(pid); seen_set.add(pid)
     return ordered
+
+def _split_to_unseen_seenno_interacted(uid: int, content_df: pd.DataFrame, events_all: pd.DataFrame):
+    """
+    สร้าง 3 กลุ่มสำหรับ _rank:
+      - unseen: ไม่เคยเห็นเลย
+      - seen_no: เคยเห็นแต่ไม่ positive
+      - interacted: มี positive (ตาม POS_ACTIONS)
+    หมายเหตุ: ไม่ยุ่ง created_at ตามที่มึงสั่ง
+    """
+    ev_u = events_all[events_all["user_id"] == int(uid)] if "user_id" in events_all.columns else events_all.iloc[:0]
+
+    # seen = มี event อะไรก็ได้กับโพสต์นั้น
+    if not ev_u.empty:
+        seen_set = set(pd.to_numeric(ev_u["post_id"], errors="coerce").dropna().astype(int).tolist())
+    else:
+        seen_set = set()
+
+    # interacted = positive actions เท่านั้น (ไม่ใช้ view มาเป็น positive)
+    interacted_set = set()
+    if not ev_u.empty and "action_type" in ev_u.columns:
+        am = ev_u["action_type"].astype(str).str.lower()
+        pos = [a.lower() for a in POS_ACTIONS] if POS_ACTIONS else []
+        if pos:
+            interacted_set = set(pd.to_numeric(ev_u.loc[am.isin(pos), "post_id"], errors="coerce").dropna().astype(int).tolist())
+
+    all_posts = [int(x) for x in pd.to_numeric(content_df["post_id"], errors="coerce").dropna().astype(int).tolist()]
+
+    unseen     = [pid for pid in all_posts if pid not in seen_set]
+    seen_no    = [pid for pid in all_posts if (pid in seen_set and pid not in interacted_set)]
+    interacted = [pid for pid in all_posts if pid in interacted_set]
+
+    return unseen, seen_no, interacted
 
 
 # ============================== ROUTE HANDLER ===================================
@@ -2074,6 +2093,16 @@ def ai_recommend_handler():
         _append_rec_log([f"[{ts}][/ai/recommend][ERROR] {ex} {traceback.format_exc()}"])
         return jsonify({"error": "Internal Server Error"}), 500
 
+def _now_th():
+    try:
+        return datetime.now(_TH_TZ)
+    except Exception:
+        # fallback: manual +7
+        return datetime.utcnow() + timedelta(hours=7)
+
+def _fmt_th(dt: datetime) -> str:
+    # 2025-08-21 16:19:57 (ICT)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") + " ICT"
 
 @verify_token
 def ai_seen_handler():
@@ -2143,169 +2172,6 @@ def _split_seen_buckets(uid: int, ordered_ids: List[int], events_all: pd.DataFra
             unseen.append(pid)
 
     return unseen, seen_no_pos, interacted
-
-
-def _interleave_balanced_with_cap(ids: List[int],
-                                  content_df: pd.DataFrame,
-                                  user_cat_prof: np.ndarray,
-                                  scores_by_pid: Dict[int, float],
-                                  cap: int = 3,
-                                  alpha_pref: float = 0.5,
-                                  beta_head: float = 0.35,
-                                  gamma_avail: float = 0.15) -> List[int]:
-    """
-    จัดเรียง ids ใหม่ให้:
-      - ไม่ให้หมวดเดียวติดเกิน cap (ถ้ายังมีหมวดอื่นให้สแทรก)
-      - เลือกหมวดถัดไปจาก utility = alpha*pref + beta*headScore + gamma*availShare
-      - รักษา order ภายในหมวด (ใช้คิวต่อหมวด)
-      - ถ้าเหลือหมวดเดียวจริง ๆ -> อนุญาตให้ทะลุ cap (เลี่ยงไม่ได้)
-    """
-
-    if not ids:
-        return []
-
-    # map pid -> category
-    idx = content_df.set_index("post_id")
-    def _cat_of(pid: int) -> str:
-        try:
-            row = idx.loc[int(pid)]
-            vals = row[CATEGORY_COLS].to_numpy(dtype=np.float32)
-            return CATEGORY_COLS[int(np.argmax(vals))] if vals.size else "Unknown"
-        except Exception:
-            return "Unknown"
-
-    # จัดคิวต่อหมวด (preserve order ภายในหมวด)
-    from collections import defaultdict, deque
-    queues: Dict[str, deque] = defaultdict(deque)
-    for pid in ids:
-        queues[_cat_of(pid)].append(pid)
-
-    # ความชอบหมวด (normalize)
-    pref_vec = np.asarray(user_cat_prof, dtype=np.float32)
-    if pref_vec.size != len(CATEGORY_COLS) or float(pref_vec.sum()) <= 0:
-        pref_vec = np.ones(len(CATEGORY_COLS), dtype=np.float32)
-    pref_vec = pref_vec / (pref_vec.sum() + 1e-12)
-    pref_map = {CATEGORY_COLS[i]: float(pref_vec[i]) for i in range(len(CATEGORY_COLS))}
-
-    # เพิ่ม "Unknown" = ค่าต่ำสุดเล็กน้อย
-    for c in list(queues.keys()):
-        if c not in pref_map:
-            pref_map[c] = 0.0
-
-    # ฟังก์ชัน utility ต่อหมวด
-    def _utility(cat: str, last_cat: Optional[str], run_len: int) -> float:
-        if not queues[cat]:
-            return -1e9
-        head_pid = queues[cat][0]
-        head_score = float(scores_by_pid.get(int(head_pid), 0.0))
-        # สัดส่วนของโพสต์หมวดนี้ที่ยังเหลือ
-        rem_c = float(len(queues[cat]))
-        rem_total = float(sum(len(q) for q in queues.values()))
-        avail_share = rem_c / (rem_total + 1e-12)
-        # base utility
-        u = (alpha_pref * float(pref_map.get(cat, 0.0))
-             + beta_head * head_score
-             + gamma_avail * avail_share)
-        # ลงโทษถ้า cap ใกล้ชน
-        if last_cat == cat and run_len >= (cap - 1):
-            u -= 0.5  # penalty เบา ๆ เพื่อกระตุ้นให้สลับหมวด
-        return u
-
-    out: List[int] = []
-    last_cat: Optional[str] = None
-    run_len = 0
-
-    total = sum(len(q) for q in queues.values())
-    while len(out) < total:
-        # หา candidate ที่ไม่ชน cap ก่อน
-        cand_cats = [c for c in queues.keys() if queues[c]]
-        picked = False
-        best_cat, best_u = None, -1e9
-
-        for c in cand_cats:
-            # ถ้าหมวดเดียวกับก่อนหน้าและ run ชน cap แล้ว → ข้ามรอบแรก
-            if last_cat == c and run_len >= cap:
-                continue
-            u = _utility(c, last_cat, run_len)
-            if u > best_u:
-                best_u = u; best_cat = c
-
-        if best_cat is not None:
-            pid = queues[best_cat].popleft()
-            out.append(pid)
-            if last_cat == best_cat:
-                run_len += 1
-            else:
-                last_cat = best_cat
-                run_len = 1
-            picked = True
-
-        if picked:
-            continue
-
-        # ถ้าไม่มีใครให้เลือก (เช่นเหลือหมวดเดียวจริง ๆ) → หยิบจากหมวดที่เหลือเยอะสุด
-        if not picked:
-            nonempty = [(c, len(queues[c])) for c in queues.keys() if queues[c]]
-            if not nonempty:
-                break
-            nonempty.sort(key=lambda x: x[1], reverse=True)
-            c = nonempty[0][0]
-            pid = queues[c].popleft()
-            out.append(pid)
-            if last_cat == c:
-                run_len += 1
-            else:
-                last_cat = c
-                run_len = 1
-
-    return out
-
-
-def _concat_with_boundary_cap(
-    ids_a: List[int],
-    ids_b: List[int],
-    content_df: pd.DataFrame,
-    cap: int,
-    scores_by_pid: Dict[int, float]
-) -> List[int]:
-    if not ids_a: return ids_b[:]
-    if not ids_b: return ids_a[:]
-
-    idx = content_df.set_index("post_id")
-    def _cat_idx(pid: int) -> int:
-        row = idx.loc[pid, CATEGORY_COLS].to_numpy(dtype=np.float32)
-        return int(np.argmax(row)) if row.size else 0
-
-    # หา run สุดท้ายของ A
-    last_cat = _cat_idx(ids_a[-1])
-    run_len = 1
-    for i in range(len(ids_a)-2, -1, -1):
-        if _cat_idx(ids_a[i]) == last_cat:
-            run_len += 1
-        else:
-            break
-
-    # ถ้ารันท้ายของ A ชน cap แล้ว และหัว B เป็นหมวดเดียวกัน → หาตัวคั่นจาก B
-    if run_len >= cap and _cat_idx(ids_b[0]) == last_cat:
-        # หาโพสต์ตัวแรกใน B ที่หมวด != last_cat ให้เลือก “ที่คะแนนรวมสูงสุด” ขึ้นมาเป็นหัว
-        best_j = -1
-        best_score = -1.0
-        # จำกัดระยะค้นหาเพื่อไม่ทำลายลำดับมากเกินไป (เช่น มองหน้า 20 ตัวแรก)
-        lookahead = min(20, len(ids_b))
-        for j in range(lookahead):
-            if _cat_idx(ids_b[j]) != last_cat:
-                s = scores_by_pid.get(ids_b[j], 0.0)
-                if s > best_score:
-                    best_score = s; best_j = j
-        if best_j >= 0:
-            chosen = ids_b[best_j]
-            rest_b = ids_b[:best_j] + ids_b[best_j+1:]
-            return ids_a + [chosen] + rest_b
-
-        # ถ้าไม่มีหมวดอื่นเลยในช่วง lookahead → ปล่อยต่อไป (เลี่ยงไม่ได้จริง ๆ)
-        # (โดยรวมเรา “เคย” cap ในแต่ละบล็อกมาแล้ว โอกาสชนหนัก ๆ จึงน้อย)
-    return ids_a + ids_b
-
 
 
 # ==================== SLIP & PROMPTPAY FUNCTIONS (from Slip.py) ====================
