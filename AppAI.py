@@ -65,6 +65,8 @@ from scipy.sparse import load_npz, save_npz
 
 app = Flask(__name__)
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 # กันรูปยักษ์/ไฟล์ขาดไม่ให้ทำโปรเซสเด้ง (ไม่กระทบผลลัพธ์เดิม)
 Image.MAX_IMAGE_PIXELS = 25_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = True

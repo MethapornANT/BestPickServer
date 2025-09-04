@@ -3137,7 +3137,7 @@ app.get("/api/bookmarks", verifyToken, (req, res) => {
   const user_id = req.userId;
 
   const sql = `
-    SELECT p.id AS post_id, p.title, p.content, p.photo_url, p.video_url, p.updated_at,
+    SELECT p.id AS post_id, p.title, p.content, p.photo_url, p.video_url, p.created_at,
       (SELECT COUNT(*) FROM likes WHERE post_id = p.id) AS like_count,
       (SELECT COUNT(*) FROM comments WHERE post_id = p.id) AS comment_count,
       u.id AS user_id, u.username AS author_username, u.picture AS author_profile_image,
@@ -3158,7 +3158,7 @@ app.get("/api/bookmarks", verifyToken, (req, res) => {
       post_id: post.post_id,
       title: post.title,
       content: post.content,
-      created_at: post.updated_at,
+      created_at: post.created_at,
       like_count: post.like_count,
       comment_count: post.comment_count,
       photos: parseJsonSafe(post.photo_url),
@@ -3739,48 +3739,156 @@ app.post("/api/admin/login", async (req, res) => {
 /* ================================
    Admin: Dashboard snapshot (รวมหลายกราฟ)
    SECURITY: authenticateToken + authorizeAdmin
+   เพิ่ม: revenue_daily, revenue_monthly, package_usage, ads_daily, ads_monthly
 ================================ */
 app.get("/api/admin/dashboard", authenticateToken, authorizeAdmin, (req, res) => {
-    const newUsersQuery = "SELECT DATE_FORMAT(created_at, '%Y-%m') AS month_year, COUNT(*) AS new_users FROM users WHERE role = 'user' GROUP BY month_year ORDER BY month_year DESC;";
-    const totalPostsQuery = "SELECT DATE_FORMAT(updated_at, '%Y-%m') AS month_year, COUNT(*) AS total_posts FROM posts GROUP BY month_year ORDER BY month_year DESC;";
-    const categoryPopularityQuery = "SELECT CASE WHEN Electronics_Gadgets = 1 THEN 'Electronics & Gadgets' WHEN Furniture = 1 THEN 'Furniture' WHEN Outdoor_Gear = 1 THEN 'Outdoor Gear' WHEN Beauty_Products = 1 THEN 'Beauty Products' WHEN Accessories = 1 THEN 'Accessories' ELSE 'Other' END AS CategoryName, SUM(PostEngagement) AS TotalEngagement, SUM(CASE WHEN Male = 1 THEN PostEngagement ELSE 0 END) AS MaleEngagement, SUM(CASE WHEN Female = 1 THEN PostEngagement ELSE 0 END) AS FemaleEngagement, SUM(CASE WHEN Male = 0 AND Female = 0 THEN PostEngagement ELSE 0 END) AS OtherEngagement FROM contentbasedview GROUP BY CategoryName ORDER BY TotalEngagement DESC;";
-    const ageInterestQuery = "SELECT CASE WHEN Age BETWEEN 18 AND 25 THEN '18-25' WHEN Age BETWEEN 26 AND 35 THEN '26-35' WHEN Age > 35 THEN '36+' ELSE 'Other' END AS AgeGroup, CASE WHEN Electronics_Gadgets = 1 THEN 'Electronics & Gadgets' WHEN Furniture = 1 THEN 'Furniture' WHEN Outdoor_Gear = 1 THEN 'Outdoor Gear' WHEN Beauty_Products = 1 THEN 'Beauty Products' WHEN Accessories = 1 THEN 'Accessories' ELSE 'Other' END AS CategoryName, SUM(PostEngagement) AS TotalEngagement FROM contentbasedview GROUP BY AgeGroup, CategoryName ORDER BY AgeGroup, TotalEngagement DESC;";
+  // optional query param: ?days=30  (default 30)
+  const days = parseInt(req.query.days, 10) || 30;
 
-    pool.query(newUsersQuery, (newUsersError, newUsersResults) => {
-        if (newUsersError) {
-            console.error("Database error fetching new users:", newUsersError);
-            return res.status(500).json({ error: "Error fetching new users data" });
-        }
-  
-        pool.query(totalPostsQuery, (totalPostsError, totalPostsResults) => {
-            if (totalPostsError) {
-                console.error("Database error fetching total posts:", totalPostsError);
-                return res.status(500).json({ error: "Error fetching total posts data" });
-            }
-  
-            pool.query(categoryPopularityQuery, (categoryPopularityError, categoryPopularityResults) => {
-                if (categoryPopularityError) {
-                    console.error("Database error fetching category popularity:", categoryPopularityError);
-                    return res.status(500).json({ error: "Error fetching category popularity data" });
-                }
-  
-                pool.query(ageInterestQuery, (ageInterestError, ageInterestResults) => {
-                    if (ageInterestError) {
-                        console.error("Database error fetching age interest data:", ageInterestError);
-                        return res.status(500).json({ error: "Error fetching age interest data" });
-                    }
-                    
-                    res.json({
-                        new_users_per_month: newUsersResults,
-                        total_posts_per_month: totalPostsResults,
-                        category_popularity: categoryPopularityResults,
-                        age_interest: ageInterestResults,
-                    });
-                });
-            });
-        });
-    });
-  });
+  // existing queries
+  const newUsersQuery = "SELECT DATE_FORMAT(created_at, '%Y-%m') AS month_year, COUNT(*) AS new_users FROM users WHERE role = 'user' GROUP BY month_year ORDER BY month_year DESC;";
+  const totalPostsQuery = "SELECT DATE_FORMAT(updated_at, '%Y-%m') AS month_year, COUNT(*) AS total_posts FROM posts GROUP BY month_year ORDER BY month_year DESC;";
+  const categoryPopularityQuery = "SELECT CASE WHEN Electronics_Gadgets = 1 THEN 'Electronics & Gadgets' WHEN Furniture = 1 THEN 'Furniture' WHEN Outdoor_Gear = 1 THEN 'Outdoor Gear' WHEN Beauty_Products = 1 THEN 'Beauty Products' WHEN Accessories = 1 THEN 'Accessories' ELSE 'Other' END AS CategoryName, SUM(PostEngagement) AS TotalEngagement, SUM(CASE WHEN Male = 1 THEN PostEngagement ELSE 0 END) AS MaleEngagement, SUM(CASE WHEN Female = 1 THEN PostEngagement ELSE 0 END) AS FemaleEngagement, SUM(CASE WHEN Male = 0 AND Female = 0 THEN PostEngagement ELSE 0 END) AS OtherEngagement FROM contentbasedview GROUP BY CategoryName ORDER BY TotalEngagement DESC;";
+  const ageInterestQuery = "SELECT CASE WHEN Age BETWEEN 18 AND 25 THEN '18-25' WHEN Age BETWEEN 26 AND 35 THEN '26-35' WHEN Age > 35 THEN '36+' ELSE 'Other' END AS AgeGroup, CASE WHEN Electronics_Gadgets = 1 THEN 'Electronics & Gadgets' WHEN Furniture = 1 THEN 'Furniture' WHEN Outdoor_Gear = 1 THEN 'Outdoor Gear' WHEN Beauty_Products = 1 THEN 'Beauty Products' WHEN Accessories = 1 THEN 'Accessories' ELSE 'Other' END AS CategoryName, SUM(PostEngagement) AS TotalEngagement FROM contentbasedview GROUP BY AgeGroup, CategoryName ORDER BY AgeGroup, TotalEngagement DESC;";
+
+  // NEW queries for revenue and package usage
+  const revenueDailyQuery = `
+      SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS date,
+             SUM(CAST(amount AS DECIMAL(18,2))) AS total_amount,
+             COUNT(*) AS orders_count
+      FROM orders
+      WHERE slip_image IS NOT NULL
+        AND status IN ('paid','active')
+        AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+      GROUP BY date
+      ORDER BY date DESC;
+  `;
+  const revenueMonthlyQuery = `
+      SELECT DATE_FORMAT(created_at, '%Y-%m') AS month_year,
+             SUM(CAST(amount AS DECIMAL(18,2))) AS total_amount,
+             COUNT(*) AS orders_count
+      FROM orders
+      WHERE slip_image IS NOT NULL
+        AND status IN ('paid','active')
+      GROUP BY month_year
+      ORDER BY month_year DESC;
+  `;
+  const packageUsageQuery = `
+      SELECT o.package_id,
+             ap.name,
+             COUNT(*) AS orders_count,
+             SUM(CAST(o.amount AS DECIMAL(18,2))) AS total_amount
+      FROM orders o
+      LEFT JOIN ad_packages ap ON o.package_id = ap.package_id
+      WHERE o.slip_image IS NOT NULL
+        AND o.status IN ('paid','active')
+      GROUP BY o.package_id, ap.name
+      ORDER BY total_amount DESC;
+  `;
+
+  // NEW queries for ads counts (daily last N days + monthly)
+  const adsDailyQuery = `
+    SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS date,
+           COUNT(*) AS ads_count
+    FROM ads
+    WHERE status IN ('active','expired')
+      AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+    GROUP BY date
+    ORDER BY date DESC;
+  `;
+  const adsMonthlyQuery = `
+    SELECT DATE_FORMAT(created_at, '%Y-%m') AS month_year,
+           COUNT(*) AS ads_count
+    FROM ads
+    WHERE status IN ('active','expired')
+    GROUP BY month_year
+    ORDER BY month_year DESC;
+  `;
+
+  pool.query(newUsersQuery, (newUsersError, newUsersResults) => {
+      if (newUsersError) {
+          console.error("Database error fetching new users:", newUsersError);
+          return res.status(500).json({ error: "Error fetching new users data" });
+      }
+
+      pool.query(totalPostsQuery, (totalPostsError, totalPostsResults) => {
+          if (totalPostsError) {
+              console.error("Database error fetching total posts:", totalPostsError);
+              return res.status(500).json({ error: "Error fetching total posts data" });
+          }
+
+          pool.query(categoryPopularityQuery, (categoryPopularityError, categoryPopularityResults) => {
+              if (categoryPopularityError) {
+                  console.error("Database error fetching category popularity:", categoryPopularityError);
+                  return res.status(500).json({ error: "Error fetching category popularity data" });
+              }
+
+              pool.query(ageInterestQuery, (ageInterestError, ageInterestResults) => {
+                  if (ageInterestError) {
+                      console.error("Database error fetching age interest data:", ageInterestError);
+                      return res.status(500).json({ error: "Error fetching age interest data" });
+                  }
+
+                  // revenue daily (uses ? days param)
+                  pool.query(revenueDailyQuery, [days], (revDailyErr, revDailyRes) => {
+                      if (revDailyErr) {
+                          console.error("Database error fetching revenue daily:", revDailyErr);
+                          return res.status(500).json({ error: "Error fetching revenue daily data" });
+                      }
+
+                      // revenue monthly
+                      pool.query(revenueMonthlyQuery, (revMonthErr, revMonthRes) => {
+                          if (revMonthErr) {
+                              console.error("Database error fetching revenue monthly:", revMonthErr);
+                              return res.status(500).json({ error: "Error fetching revenue monthly data" });
+                          }
+
+                          // package usage
+                          pool.query(packageUsageQuery, (pkgErr, pkgRes) => {
+                              if (pkgErr) {
+                                  console.error("Database error fetching package usage:", pkgErr);
+                                  return res.status(500).json({ error: "Error fetching package usage data" });
+                              }
+
+                              // ads daily (uses ? days param)
+                              pool.query(adsDailyQuery, [days], (adsDailyErr, adsDailyRes) => {
+                                if (adsDailyErr) {
+                                  console.error("Database error fetching ads daily:", adsDailyErr);
+                                  return res.status(500).json({ error: "Error fetching ads daily data" });
+                                }
+
+                                // ads monthly
+                                pool.query(adsMonthlyQuery, (adsMonthErr, adsMonthRes) => {
+                                  if (adsMonthErr) {
+                                    console.error("Database error fetching ads monthly:", adsMonthErr);
+                                    return res.status(500).json({ error: "Error fetching ads monthly data" });
+                                  }
+
+                                  // everything OK -> send combined response
+                                  res.json({
+                                      new_users_per_month: newUsersResults,
+                                      total_posts_per_month: totalPostsResults,
+                                      category_popularity: categoryPopularityResults,
+                                      age_interest: ageInterestResults,
+                                      revenue_daily: revDailyRes,
+                                      revenue_monthly: revMonthRes,
+                                      package_usage: pkgRes,
+                                      ads_daily: adsDailyRes,
+                                      ads_monthly: adsMonthRes
+                                  });
+                                }); // adsMonthlyQuery
+                              }); // adsDailyQuery
+
+                          }); // packageUsageQuery
+                      }); // revenueMonthlyQuery
+                  }); // revenueDailyQuery
+              }); // ageInterestQuery
+          }); // categoryPopularityQuery
+      }); // totalPostsQuery
+  }); // newUsersQuery
+});
+
+
 
 
 /* ================================
