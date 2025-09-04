@@ -629,6 +629,8 @@ def _log_recommendation(uid: int, start: int, page_size: int, return_all: bool, 
         try:
             e = _eng(); content_df = _load_content_view(e)
             idx = content_df.set_index("post_id")
+            # ADD: log ขนาด content base
+            _append_rec_log([f"[{ts}][content_base] total_post_ids={len(idx.index)}"])
             for p in posts:
                 pid = int(p["id"])
                 if pid in idx.index:
@@ -1209,26 +1211,26 @@ def compute_hybridrecommendation_scores(
     return out.sort_values(["final_norm","final"], ascending=[False, False])
 
 def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
-    """
-    เวอร์ชันสุดท้าย (patched):
-      - ใช้ _rank เป็นตัวจัดลำดับหลัก แต่สามารถเลือกที่จะใช้ hybrid precomputed base_score
-        ถ้า USE_HYBRID=True จะพยายาม (best-effort) เตรียม artifacts แล้วคำนวณ scores
-      - cache key ผูกกับ snapshot ของ content/events ด้วย _md5_of_df
-      - นโยบาย seen filter คุมด้วย USE_TTL_SEEN (True=TTL impression, False=event-based)
-      - เพิ่ม robustness กับ content_df ว่าง และป้องกัน exception ที่หนักใน request path
-    """
     now = datetime.utcnow()
 
-    # โหลดข้อมูลจำเป็น
+    # โหลดข้อมูล
     e = _eng()
     content_df = _load_content_view(e)
     events_all = _load_events_all(e)
 
-    # ถ้าไม่มีโพสต์เลย ให้คืนว่าง
+    # LOG: หลังโหลด
+    _log_df_info("content_df_loaded", content_df, ["post_id", TEXT_COL, ENGAGE_COL] + CATEGORY_COLS)
+    _log_df_info("events_all_loaded", events_all, ["user_id", "post_id", "action_type"])
+    try:
+        all_ids0 = pd.to_numeric(content_df["post_id"], errors="coerce").dropna().astype(int).tolist()
+    except Exception:
+        all_ids0 = []
+    _log_stage_counts(f"uid={uid} | all_ids_from_content", all_ids0)
+
     if content_df is None or content_df.empty:
         return []
 
-    # --- สร้าง cache key จากข้อมูลจริง (เปลี่ยนข้อมูลเมื่อไร key เปลี่ยน) ---
+    # cache key
     try:
         cols_content = ["post_id", ENGAGE_COL] + list(CATEGORY_COLS)
         content_hash = _md5_of_df(content_df[cols_content], cols=cols_content)
@@ -1243,7 +1245,7 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
 
     cache_key = f"{uid}:{content_hash}:{events_hash}"
 
-    # --- ตรวจ cache โดยผูกกับ key (ถ้า key ไม่ตรง แคชถือว่า invalid) ---
+    # cache
     with _cache_lock:
         cached = recommendation_cache.get(uid)
         if use_cache and cached and cached.get("key") == cache_key and \
@@ -1253,44 +1255,50 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
     # events ของ user
     user_events = events_all[events_all["user_id"] == int(uid)] if "user_id" in events_all.columns else events_all.iloc[:0]
 
-    # --- แยกกลุ่มสำหรับ _rank ตามนโยบายที่เลือก ---
+    # split buckets
     if USE_TTL_SEEN:
         all_ids = [int(x) for x in pd.to_numeric(content_df["post_id"], errors="coerce").dropna().astype(int).tolist()]
         unseen, seen_no, interacted = _split_seen_buckets(int(uid), all_ids, events_all)
     else:
         unseen, seen_no, interacted = _split_to_unseen_seenno_interacted(int(uid), content_df, events_all)
 
-    # --- (ใหม่) ถ้าเปิด HYBRID -> เตรียม precomputed_base_score (best-effort) ---
+    _log_stage_counts(f"uid={uid} | unseen", unseen, {"mode": "TTL" if USE_TTL_SEEN else "events"})
+    _log_stage_counts(f"uid={uid} | seen_no", seen_no)
+    _log_stage_counts(f"uid={uid} | interacted", interacted)
+
+    # self posts overview
+    try:
+        self_ids = set(_get_authored_ids(e, uid))
+        in_all = [p for p in all_ids0 if p in self_ids]
+        _log_stage_counts(f"uid={uid} | self_post_ids_in_all", in_all, {
+            "INCLUDE_SELF_POSTS_IN_FEED": INCLUDE_SELF_POSTS_IN_FEED,
+            "total_self_anywhere": len(self_ids)
+        })
+    except Exception:
+        pass
+
+    # HYBRID optional (เหมือนเดิม ไม่เปลี่ยน logic) -------------
     precomputed_scores = None
     if USE_HYBRID:
-        # spawn background build (best-effort) so artifacts can be created outside request
         try:
             ensure_models_built(content_df, events_all, cache_key, cache_dir=CACHE_DIR, non_blocking=True)
         except Exception:
             pass
-
-        # best-effort: try to obtain TF-IDF/X/postidx (may use global lazy-build)
         try:
             tfidf, X, postidx, _ = build_contentbased_models(content_df)
         except Exception:
-            # fallback to globals if available
             tfidf, X, postidx = (_tfidf, _X, _postidx)
-
-        # best-effort: precompute item_scores (if X available)
         try:
             if X is not None and getattr(X, "shape", (0,))[0] > 0:
                 try:
                     knn = _build_knn(X)
                     item_scores = _precompute_item_content_scores(knn, content_df, X)
                 except Exception:
-                    # graceful fallback: zeros
                     item_scores = np.zeros(X.shape[0], dtype=np.float32)
             else:
                 item_scores = np.zeros(len(content_df), dtype=np.float32)
         except Exception:
             item_scores = np.zeros(len(content_df), dtype=np.float32)
-
-        # build train_pos -> user_text_profiles (best-effort)
         try:
             t = events_all.groupby(["user_id","post_id","action_type"]).size().reset_index(name="cnt")
             if t.empty:
@@ -1313,36 +1321,29 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
             user_text_profiles = _user_text_profiles(train_pos, content_df, X if X is not None else csr_matrix((0,0)))
         except Exception:
             user_text_profiles = {}
-
-        # collab model: best-effort (may be None)
         try:
             collab_model = build_collaborative_model(events_all, content_df["post_id"].astype(int).tolist())
         except Exception:
             collab_model = None
-
-        # user category profile
         try:
             user_cat_prof = _user_category_profile(int(uid), user_events, content_df)
         except Exception:
             user_cat_prof = np.zeros(len(CATEGORY_COLS), dtype=np.float32)
-
-        # compute hybrid dataframe (best-effort)
         try:
             df_hybrid = compute_hybridrecommendation_scores(
                 int(uid), content_df, tfidf, X, postidx,
                 user_text_profiles, collab_model, item_scores, user_cat_prof
             )
-            # use 'final' (not final_norm) so absolute ordering preserved for ranking
             precomputed_scores = dict(zip(df_hybrid["post_id"].astype(int).tolist(),
                                          df_hybrid["final"].astype(float).tolist()))
         except Exception:
             precomputed_scores = None
+    # --------------------------------------------------
 
-    # --- จัดลำดับด้วย _rank (logic หลัก) ---
+    # rank หลัก
     try:
         ranked = _rank(int(uid), content_df, user_events, unseen, seen_no, interacted, precomputed_base_score=precomputed_scores)
     except Exception:
-        # fallback safe: return simple popularity order if rank fails
         try:
             pop_series = content_df.get("PopularityPrior", None)
             if pop_series is not None:
@@ -1354,7 +1355,6 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
         except Exception:
             ranked = content_df["post_id"].astype(int).tolist()
 
-    # --- อัปเดตแคชให้ผูกกับ key ปัจจุบัน ---
     with _cache_lock:
         recommendation_cache[uid] = {"ids": ranked, "timestamp": now, "key": cache_key}
 
@@ -1363,7 +1363,6 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
 
 # ======================== DB FETCH (return full post objects) ====================
 def fetch_posts_by_ids(ids: List[int], user_id: int) -> List[dict]:
-    """ดึงโพสต์ตามลำดับ ids + user info + is_liked; เรียงตาม ids (ใช้ sqltext)"""
     if not ids:
         return []
     e = _eng()
@@ -1395,6 +1394,18 @@ def fetch_posts_by_ids(ids: List[int], user_id: int) -> List[dict]:
 
     id_to_rank = {int(pid): i for i, pid in enumerate(ids)}
     rows.sort(key=lambda r: id_to_rank.get(int(r["id"]), 10**9))
+
+    # LOG: compare requested vs fetched
+    try:
+        ts = _fmt_th(_now_th())
+        requested_ids = [int(x) for x in ids]
+        fetched_ids = [int(r["id"]) for r in rows]
+        missing = [x for x in requested_ids if x not in set(fetched_ids)]
+        _append_rec_log([
+            f"[{ts}][fetch_posts_by_ids] requested={len(requested_ids)} fetched={len(rows)} dropped_by_sql={len(missing)} missing_sample={missing[:10]}"
+        ])
+    except Exception:
+        pass
 
     out = []
     for r in rows:
@@ -1660,20 +1671,22 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
     Ranking pipeline (patched):
       - รองรับ precomputed_base_score (จาก hybrid) ถ้ามี -> ใช้เป็น base_score
       - ถ้า pool (unseen + seen_no) ว่าง -> fallback เอา interacted มาใช้
-      - เพิ่มความปลอดภัยในจุดที่อาจเกิด Index/empty errors
-      - คืน ordered list ของ post_id (unique, preserved order)
+      - เคารพ run-length cap ระหว่างจัดอันดับหลัก
+      - สุดท้าย 'drain leftovers' เพื่อให้ครบทุกโพสต์ (สำหรับ all=true)
+      - บังคับย้าย 'โพสต์ใหม่ภายใน 24 ชั่วโมงล่าสุด' ที่ไม่มี interaction
+        เข้าโซน 21–30 (ตำแหน่ง 22, 26, 29) โดย *ถอดออกจากลิสต์เดิมก่อน*
     """
     now = datetime.now()
 
-    # เตรียม TF-IDF / post-index (lazy)
+    # ===== TF-IDF / index
     _vectorize_texts(content_df)
 
-    # ==== โปรไฟล์ ====
+    # ===== profiles
     user_prof      = _user_category_profile(user_id, user_events, content_df)
     follow_prof    = _follow_category_profile(_eng(), user_id, content_df)
     user_text_prof = _user_text_profile(user_id, user_events, content_df, _X)
 
-    # ==== สกอร์ฐาน ====
+    # ===== base score
     scores_E, scores_C, scores_F, scores_T, scores_R = _build_scores(
         user_id, content_df, user_prof, follow_prof, user_text_prof, now
     )
@@ -1683,31 +1696,28 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
             return WEIGHT_E*E + WEIGHT_C*C + WEIGHT_F*F + WEIGHT_T*T + WEIGHT_R*R
         return WEIGHT_E*E + WEIGHT_C*C + WEIGHT_F*F + WEIGHT_T*T
 
-    # --- base_score: ถ้ามี precomputed_base_score ให้ใช้ (จาก hybrid) มิฉะนั้นคำนวณเดิม ---
     if precomputed_base_score:
         base_score = {int(pid): float(precomputed_base_score.get(int(pid), 0.0))
                       for pid in content_df["post_id"].astype(int)}
     else:
         base_score = {
-            int(pid): _final_score(scores_E.get(int(pid), 0.0), scores_C.get(int(pid), 0.0), scores_F.get(int(pid), 0.0),
-                                   scores_T.get(int(pid), 0.0), 0.0, zone_is_new=False)
+            int(pid): _final_score(scores_E.get(int(pid), 0.0), scores_C.get(int(pid), 0.0),
+                                   scores_F.get(int(pid), 0.0), scores_T.get(int(pid), 0.0),
+                                   0.0, zone_is_new=False)
             for pid in content_df["post_id"].astype(int)
         }
 
-    # เตรียมข้อมูลช่วยตัดสิน
+    # ===== helpers
     ptiles = _category_percentiles_map(content_df)
 
-    # set ของโพสต์ที่ตัวเองเป็นเจ้าของ (กัน/อนุญาตในฟีดตาม flag)
     try:
         self_post_ids = set(_get_authored_ids(_eng(), user_id))
     except Exception:
         self_post_ids = set()
 
-    # ===================== Top 20 =====================
-    # pool เป็น unseen + seen_no ตาม policy — แต่ถ้าว่าง fallback ให้ใช้ interacted
+    # ===== Top20
     pool = list(unseen) + list(seen_no)
     if not pool:
-        # fallback: ถ้าผู้ใช้มี interacted แต่ไม่มี unseen/seen_no ให้ใช้ interacted เป็น pool
         pool = list(interacted)
 
     top20_cands = []
@@ -1716,7 +1726,6 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
             continue
         cat = category_by_pid(content_df, pid)
         ok_cat = scores_C.get(pid, 0.0) >= CAT_MATCH_TOP20
-        # 안전하게อ่านค่า ENGAGE_COL
         try:
             eng_val = float(content_df.loc[content_df["post_id"] == pid, ENGAGE_COL].values[0])
         except Exception:
@@ -1729,19 +1738,13 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
 
     if len(top20_cands) < 20:
         relax_pool = [pid for pid in pool if pid not in top20_cands]
-        relax = sorted(
-            relax_pool,
-            key=lambda x: (scores_C.get(x, 0.0), base_score.get(x, 0.0)),
-            reverse=True
-        )
-        for pid in relax:
-            if (not INCLUDE_SELF_POSTS_IN_FEED) and (pid in self_post_ids):
-                continue
-            if len(top20_cands) >= 20:
-                break
-            top20_cands.append(pid)
+        # ถ้าขาดเยอะมาก ลองผ่อน cap หมวด (RUNLEN_CAP_TOP20) ชั่วคราว
+        tmp_cap = RUNLEN_CAP_TOP20 if len(top20_cands) >= 10 else max(5, RUNLEN_CAP_TOP20)
+        relax = sorted(relax_pool, key=lambda x: (scores_C.get(x, 0.0), base_score.get(x, 0.0)), reverse=True)
+    else:
+        tmp_cap = RUNLEN_CAP_TOP20
+        relax = []
 
-    # MMR diversity ใน Top20
     def simfunc(a: int, b: int):
         ia, ib = _postidx.get(a, -1), _postidx.get(b, -1)
         if ia < 0 or ib < 0:
@@ -1751,24 +1754,23 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
         den = (np.linalg.norm(va.data) * np.linalg.norm(vb.data)) if (hasattr(va, "data") and hasattr(vb, "data")) else 0.0
         return float(num/den) if den > 0 else 0.0
 
-    top20_sorted = _mmr_select(
-        candidates=sorted(set(top20_cands), key=lambda x: base_score.get(x, 0.0), reverse=True),
-        scores=base_score, simfunc=simfunc, lam=MMR_LAMBDA, k=min(20, len(content_df))
-    )
+    cand_for_top20 = sorted(set(top20_cands) | set(relax), key=lambda x: base_score.get(x, 0.0), reverse=True)
+    top20_sorted = _mmr_select(candidates=cand_for_top20, scores=base_score, simfunc=simfunc,
+                               lam=MMR_LAMBDA, k=min(20, len(content_df)))
 
     top20_out, cat_seq = [], []
     for pid in top20_sorted:
         if (not INCLUDE_SELF_POSTS_IN_FEED) and (pid in self_post_ids):
             continue
         cat = category_by_pid(content_df, pid)
-        if _runlen_violate(cat_seq, cat, RUNLEN_CAP_TOP20):
+        if _runlen_violate(cat_seq, cat, tmp_cap):
             continue
         top20_out.append(pid)
         cat_seq.append(cat)
         if len(top20_out) >= 20:
             break
 
-    # ================= Zone 21–30 (ของใหม่) =================
+    # ===== Zone 21–30 (ของใหม่ตามเงื่อนไข Engagement/Category)
     zone21_30 = []
     need_max = NEW_INSERT_MAX
     now_ts = now
@@ -1797,10 +1799,9 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
                 eng_val = 0.0
             cond_eng = eng_val >= thr_new
             if cond_cat and cond_eng:
-                sc = _final_score(
-                    scores_E.get(pid, 0.0), scores_C.get(pid, 0.0), scores_F.get(pid, 0.0),
-                    scores_T.get(pid, 0.0), scores_R.get(pid, 0.0), zone_is_new=True
-                )
+                sc = _final_score(scores_E.get(pid, 0.0), scores_C.get(pid, 0.0),
+                                  scores_F.get(pid, 0.0), scores_T.get(pid, 0.0),
+                                  scores_R.get(pid, 0.0), zone_is_new=True)
                 new_cands.append((sc, pid))
         new_cands.sort(reverse=True)
         picked = [pid for _, pid in new_cands[:need_max]]
@@ -1808,7 +1809,7 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
             zone21_30 = picked[:need_max]
             break
 
-    # เติม 21–30 ด้วย best-of-rest (พร้อมเช็ก cap ต่อเนื่องจาก Top20)
+    # เติม 21–30
     chosen20 = set(top20_out)
     chosen21 = set(zone21_30)
     remaining_pool = [pid for pid in unseen + seen_no if pid not in (chosen20 | chosen21)]
@@ -1818,9 +1819,7 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
 
     pos21_30 = []
     insert_positions = [22, 26, 29]
-
-    # ต่อรันหมวดจาก Top20 มาเลย เพื่อให้ cap เป็น global ต่อเนื่อง
-    cat_seq2 = cat_seq[:]  # cat_seq มาจาก Top20
+    cat_seq2 = cat_seq[:]
 
     def _pick_from(lst: List[int]) -> Optional[int]:
         j = 0
@@ -1836,19 +1835,14 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
 
     for pos in range(21, 31):
         pid_choice = None
-        # พยายามแทรก "ของใหม่" ตามตำแหน่งกำหนด โดยไม่ชน cap
         if pos in insert_positions and zone21_30:
             pid_choice = _pick_from(zone21_30)
-
-        # ถ้ายังไม่มี (ชน cap หรือหมด) -> หยิบ best-of-rest แบบไม่ชน cap
         if pid_choice is None and rest_sorted:
             pid_choice = _pick_from(rest_sorted)
-
         if pid_choice is not None:
             pos21_30.append(pid_choice)
-        # หากไม่มีตัวที่ไม่ชน cap เลย ให้เว้นไว้ก่อน (ช่วง tail จะเติมต่อด้วยกติกา cap เดิม)
 
-    # ================= หลัง 30 =================
+    # ===== หลัง 30
     chosen = set(top20_out + pos21_30)
     base_rest = [pid for pid in content_df["post_id"].astype(int) if pid not in chosen]
     if not INCLUDE_SELF_POSTS_IN_FEED:
@@ -1858,7 +1852,6 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
     seenno_rest    = [pid for pid in seen_no    if pid in base_rest]
     interact_rest  = [pid for pid in interacted if pid in base_rest]
 
-    # biased shuffle (daily seed)
     seed = _daily_seed(user_id)
     def _bs(ids, t, s): return _biased_shuffle(ids, base_score, t, s)
     unseen_rest   = _bs(unseen_rest,   TEMP_UNSEEN, seed+1)
@@ -1868,11 +1861,9 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
     U, S = len(unseen), len(seen_no)
     start_inter = _start_interacted_position(U, S)
 
-    # ต่อเนื่องรันหมวด (รวม Top20 + 21–30) เพื่อรักษา cap แบบ global
     cat_seq_all = [category_by_pid(content_df, pid) for pid in (top20_out + pos21_30)]
     tail, pos_idx = [], len(top20_out) + len(pos21_30)
 
-    # fill จนถึงจุดเริ่มแทรก interacted
     mix_pool = sorted(unseen_rest + seenno_rest, key=lambda x: base_score.get(x, 0.0), reverse=True)
     for pid in mix_pool:
         cat = category_by_pid(content_df, pid)
@@ -1890,7 +1881,7 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
 
     while remain_un or remain_sn or remain_it:
         block_items = []
-        quota_inter = max(0, int(0.10 * 10))  # ~10% ต่อบล็อก 10
+        quota_inter = max(0, int(0.10 * 10))
         for _ in range(10):
             best = None; best_score = -1.0
             pools = [
@@ -1911,7 +1902,6 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
             name, cand = best
             cat = category_by_pid(content_df, cand)
             if _runlen_violate(cat_seq_all, cat, RUNLEN_CAP_AFTER):
-                # ชน cap → ทิ้งหัวแถวนั้นแล้วพยายามตัวถัดไปในรอบหน้า
                 pool = remain_un if name == "un" else remain_sn if name == "sn" else remain_it
                 pool.pop(0)
                 continue
@@ -1925,7 +1915,6 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
                 break
 
         if not block_items:
-            # fallback: กวาดทั้งหมดอีกรอบแบบเคารพ cap
             leftovers = remain_un + remain_sn + remain_it
             moved = False
             for cand in leftovers:
@@ -1939,17 +1928,128 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
                         if cand in remain_it: remain_it.remove(cand)
                     moved = True
             if not moved:
-                # ถ้าจริงๆ ไม่มีอะไรวางได้โดยไม่ชน cap (rare) ให้ break ป้องกันลูปค้าง
                 break
 
         tail.extend(block_items)
 
+    # ===== รวมเป็น ordered ขั้นแรก
     final_list = top20_out + pos21_30 + tail
     ordered, seen_set = [], set()
     for pid in final_list:
         if pid not in seen_set:
             ordered.append(pid); seen_set.add(pid)
-    return ordered
+
+    # ===== Drain leftovers เพื่อให้ครบทุกโพสต์ (cap = cosmetic only)
+    all_ids_all = [int(x) for x in pd.to_numeric(content_df["post_id"], errors="coerce").dropna().astype(int).tolist()]
+    leftovers = [p for p in all_ids_all if p not in set(ordered)]
+    if leftovers:
+        ordered.extend(leftovers)
+
+    # ===== NEW TODAY INJECTION (24h, no interaction) — relocate to 21–30
+    # build fast ts-map: content_df -> ts ; fallback query posts table if missing
+    def _row_ts_from_df(r: pd.Series) -> Optional[pd.Timestamp]:
+        for c in ("created_ts", "created_at", "createdAt", "updated_at", "updatedAt", "timestamp"):
+            if c in r.index:
+                t = pd.to_datetime(r[c], errors="coerce")
+                if not pd.isna(t):
+                    return t
+        return pd.NaT
+
+    # first pass from content_df
+    ts_map: Dict[int, pd.Timestamp] = {}
+    for _, rr in content_df.iterrows():
+        pid = int(rr["post_id"])
+        t = _row_ts_from_df(rr)
+        if not pd.isna(t):
+            ts_map[pid] = t
+
+    # fallback from posts table (only for missing)
+    missing_pids = [pid for pid in all_ids_all if pid not in ts_map]
+    if missing_pids:
+        try:
+            e = _eng()
+            placeholders = ", ".join([f":p{i}" for i in range(len(missing_pids))])
+            params = {f"p{i}": int(pid) for i, pid in enumerate(missing_pids)}
+            q = sqltext(f"SELECT id, created_at, updated_at FROM {POSTS_TABLE} WHERE id IN ({placeholders})")
+            with e.begin() as conn:
+                rows = conn.execute(q, params).mappings().all()
+            for r in rows:
+                pid = int(r["id"])
+                t = pd.NaT
+                for c in ("created_at","updated_at"):
+                    if r.get(c) is not None:
+                        t = pd.to_datetime(r.get(c), errors="coerce")
+                        if not pd.isna(t):
+                            break
+                if not pd.isna(t):
+                    ts_map[pid] = t
+        except Exception:
+            pass
+
+    # make "now_th" for 24h window in Bangkok
+    try:
+        from zoneinfo import ZoneInfo
+        now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+    except Exception:
+        now_th = datetime.utcnow() + timedelta(hours=7)
+
+    # interaction จริง (ไม่เกี่ยว ai/seen)
+    ev_set = set(pd.to_numeric(user_events["post_id"], errors="coerce")
+                 .dropna().astype(int).tolist()) if not user_events.empty else set()
+
+    # คัด candidates (24 ชั่วโมงล่าสุด & no interaction)
+    new_today = []
+    for pid in all_ids_all:
+        t = ts_map.get(pid)
+        if t is None or pd.isna(t):
+            continue
+        # ทำให้เป็น aware แล้วเทียบเป็นชั่วโมง
+        try:
+            if t.tzinfo is None:
+                t_aware = pd.Timestamp(t).tz_localize("UTC")  # assume UTC from DB
+            else:
+                t_aware = pd.Timestamp(t)
+            t_th = t_aware.tz_convert("Asia/Bangkok")
+        except Exception:
+            # ถ้าพัง ให้เทียบแบบ naive เป็น 24 ชม. เฉยๆ
+            t_th = pd.Timestamp(t)
+        if (now_th - t_th.to_pydatetime()) <= timedelta(hours=24):
+            if int(pid) not in ev_set:
+                new_today.append(pid)
+
+    if not INCLUDE_SELF_POSTS_IN_FEED and new_today:
+        new_today = [p for p in new_today if p not in self_post_ids]
+
+    # จัด priority: ใหม่กว่า/score สูงกว่า มาก่อน
+    new_today.sort(key=lambda p: (ts_map.get(p, pd.Timestamp(0)), base_score.get(p, 0.0)), reverse=True)
+    chosen_new = new_today[:NEW_INSERT_MAX]
+
+    insert_positions = [22, 26, 29]  # 1-based anchor, จะ map เป็น index 21,25,28
+    if chosen_new:
+        # ถอดออกก่อน
+        present = set(ordered)
+        for pid in chosen_new:
+            if pid in present:
+                ordered = [x for x in ordered if x != pid]
+        # ย้ายเข้าโซน
+        for i, pid in enumerate(chosen_new):
+            pos0 = insert_positions[min(i, len(insert_positions)-1)] - 1
+            pos0 = min(pos0, len(ordered))
+            ordered.insert(pos0, pid)
+
+    _log_stage("new_today_injected", {
+        "uid": user_id,
+        "candidates": len(new_today),
+        "inserted": chosen_new
+    })
+
+    # de-dupe อีกรอบ
+    out, _seen = [], set()
+    for pid in ordered:
+        if pid not in _seen:
+            out.append(pid); _seen.add(pid)
+    return out
+
 
 def _split_to_unseen_seenno_interacted(uid: int, content_df: pd.DataFrame, events_all: pd.DataFrame):
     """
@@ -2016,6 +2116,9 @@ def ai_recommend_handler():
 
         ids_all = get_hybridrecommendation_order(uid, use_cache=(not refresh))
         total   = len(ids_all)
+        # === FORCE “NEW TODAY” INTO 21–30 (handler-level) ===
+        ids_all = _inject_new_today(ids_all, uid, positions=(22,26,29), hours=24)
+
 
         # ---- เลือก candidate ids สำหรับ fetch (กันกรณีดรอปเพราะ post ไม่ active) ----
         def _candidate_ids_for_page(ids_all: List[int], start: int, page_size: int) -> List[int]:
@@ -2095,6 +2198,122 @@ def ai_recommend_handler():
         _append_rec_log([f"[{ts}][/ai/recommend][ERROR] {ex} {traceback.format_exc()}"])
         return jsonify({"error": "Internal Server Error"}), 500
 
+def _inject_new_today(
+    ids_all: List[int],
+    user_id: int,
+    positions: Tuple[int, ...] = (22, 26, 29),
+    hours: int = 24,
+    force_top_n_by_id: int = 2,     # การันตีดัน “ไอดีสูงสุดในหน้าต่างเวลา” อย่างน้อย N ตัว
+    insert_cap: Optional[int] = None  # เพดานจำนวนที่จะฉีด (ดีฟอลต์ = จำนวน positions)
+) -> List[int]:
+    """
+    ดันโพสต์ 'ใหม่ภายใน N ชั่วโมง (ดีฟอลต์ 24)' ที่ user ยังไม่เคยมี interaction
+    เข้าโซน 21–30 ตาม positions ที่กำหนด
+    - ไม่สน ai/seen
+    - กันซ้ำ: เอาออกจากลิสต์เดิมก่อนค่อย insert
+    - ปรับลำดับ: บังคับให้ 'ไอดีสูงสุด' อย่างน้อย force_top_n_by_id ตัวได้สิทธิ์ก่อน
+      (เพื่อเคสอย่าง 1380231/1380232)
+    """
+    try:
+        e = _eng()
+        content_df = _load_content_view(e)
+        events_all = _load_events_all(e)
+
+        # interaction จริงของ user
+        ev_user = events_all[events_all.get("user_id") == int(user_id)] if "user_id" in events_all.columns else events_all.iloc[:0]
+        interacted_set = set(pd.to_numeric(ev_user.get("post_id"), errors="coerce").dropna().astype(int).tolist()) if not ev_user.empty else set()
+
+        # โซนเวลาไทย
+        try:
+            from zoneinfo import ZoneInfo
+            now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+        except Exception:
+            now_th = datetime.utcnow() + timedelta(hours=7)
+
+        # map timestamp จาก content_df (และ fallback posts table ถ้าขาด)
+        def _row_ts(r: pd.Series):
+            for c in ("updated_at","updatedAt","created_ts","created_at","createdAt","timestamp"):
+                if c in r and not pd.isna(r[c]):
+                    return pd.to_datetime(r[c], errors="coerce")
+            return pd.NaT
+
+        def _to_th(t: pd.Timestamp) -> Optional[datetime]:
+            try:
+                if pd.isna(t): return None
+                tt = pd.Timestamp(t)
+                if tt.tzinfo is None:
+                    return tt.tz_localize("Asia/Bangkok").to_pydatetime()
+                return tt.tz_convert("Asia/Bangkok").to_pydatetime()
+            except Exception:
+                return None
+
+        ts_map: Dict[int, datetime] = {}
+        for _, rr in content_df.iterrows():
+            pid = int(rr["post_id"])
+            th = _to_th(_row_ts(rr))
+            if th: ts_map[pid] = th
+
+        missing = [pid for pid in ids_all if pid not in ts_map]
+        if missing:
+            try:
+                placeholders = ", ".join([f":p{i}" for i in range(len(missing))])
+                params = {f"p{i}": int(pid) for i, pid in enumerate(missing)}
+                q = sqltext(f"SELECT id, COALESCE(updated_at, created_at) AS t FROM {POSTS_TABLE} WHERE id IN ({placeholders})")
+                with e.begin() as conn:
+                    rows = conn.execute(q, params).mappings().all()
+                for r in rows:
+                    th = _to_th(pd.to_datetime(r["t"], errors="coerce"))
+                    if th: ts_map[int(r["id"])] = th
+            except Exception:
+                pass
+
+        # คัดใหม่ภายใน window และไม่มี interaction จริง
+        cutoff = now_th - timedelta(hours=int(hours))
+        new_today = [pid for pid in ids_all if (pid in ts_map and ts_map[pid] >= cutoff and pid not in interacted_set)]
+
+        if not new_today:
+            _append_rec_log([f"[{_fmt_th(_now_th())}][stage] new_today_injected_handler: uid={user_id} candidates=0 inserted=[] positions={positions} window_h={hours}"])
+            return ids_all
+
+        # การันตี "ไอดีสูงสุด" อย่างน้อย N ตัวมาก่อน
+        by_id_desc = sorted(new_today, reverse=True)  # id มาก → ใหม่ล็อตล่าสุด
+        forced = by_id_desc[:max(0, min(force_top_n_by_id, len(by_id_desc)))]
+
+        # ที่เหลือเรียงตาม timestamp ลดหลั่น
+        forced_set = set(forced)
+        rest = [p for p in new_today if p not in forced_set]
+        rest.sort(key=lambda p: (ts_map.get(p) or datetime.min), reverse=True)
+
+        if insert_cap is None:
+            insert_cap = len(positions)
+        k = min(int(insert_cap), len(positions))
+
+        chosen = []
+        for p in forced + rest:
+            if p not in chosen:
+                chosen.append(p)
+            if len(chosen) >= k:
+                break
+
+        # ถอด chosen ออกจากฐาน แล้วเสียบตามตำแหน่ง
+        base = [p for p in ids_all if p not in set(chosen)]
+        for i, pid in enumerate(chosen):
+            pos = positions[min(i, len(positions)-1)] - 1  # 1-based → 0-based
+            pos = min(max(0, pos), len(base))
+            base.insert(pos, pid)
+
+        _append_rec_log([
+            f"[{_fmt_th(_now_th())}][stage] new_today_injected_handler: uid={user_id} "
+            f"candidates={len(new_today)} forced_by_id={forced} inserted={chosen} "
+            f"positions={positions} window_h={hours}"
+        ])
+        return base
+
+    except Exception as ex:
+        _append_rec_log([f"[{_fmt_th(_now_th())}][stage] new_today_injected_handler_error: {ex}"])
+        return ids_all
+
+
 def _now_th():
     try:
         return datetime.now(_TH_TZ)
@@ -2148,16 +2367,8 @@ def ai_seen_handler():
 
 
 def _split_seen_buckets(uid: int, ordered_ids: List[int], events_all: pd.DataFrame) -> Tuple[List[int], List[int], List[int]]:
-    """
-    แบ่งโพสต์เป็น 3 กลุ่มตาม priority:
-      - unseen: ยังไม่เคยถูก 'ส่งให้ client' ในช่วง TTL (ดูจาก impression_history_cache)
-      - seen_no_positive: เคยส่งให้ client แล้ว แต่ 'ไม่มี' POS_ACTIONS
-      - interacted: มี POS_ACTIONS (like/comment/bookmark/share) กับ user นี้
-    """
-    # impressions ล่าสุดใน TTL
     seen_recent_set = {int(h["post_id"]) for h in _get_impressions(uid)}
 
-    # โพสต์ที่มีปฏิสัมพันธ์เชิงบวก
     pos_ev = events_all[
         (events_all["user_id"] == int(uid)) &
         (events_all["action_type"].isin(POS_ACTIONS))
@@ -2172,6 +2383,13 @@ def _split_seen_buckets(uid: int, ordered_ids: List[int], events_all: pd.DataFra
             seen_no_pos.append(pid)
         else:
             unseen.append(pid)
+
+    # LOG: split summary
+    try:
+        ts = _fmt_th(_now_th())
+        _append_rec_log([f"[{ts}][split] uid={uid} total_input={len(ordered_ids)} unseen={len(unseen)} seen_no_pos={len(seen_no_pos)} interacted={len(interacted)}"])
+    except Exception:
+        pass
 
     return unseen, seen_no_pos, interacted
 
@@ -2848,6 +3066,50 @@ try:
     _append_rec_log([f"===== recsys session started at {_fmt_th(SESSION_LOCAL_START)} ====="])
 except Exception:
     pass
+
+# ========= DEBUG LOG HELPERS (ADD) =========
+from typing import Union, Any
+
+def _log_stage_counts(tag: str, ids: Union[List[int], set, np.ndarray], extra: Optional[Dict[str, Any]] = None):
+    """นับจำนวน/unique และตัวอย่าง 10 ตัวแรก"""
+    try:
+        if ids is None:
+            n = 0; uniq = 0; sample = []
+        else:
+            if not isinstance(ids, list):
+                ids = list(ids)
+            ids = [int(x) for x in ids if x is not None]
+            n = len(ids)
+            uniq = len(set(ids))
+            sample = list(dict.fromkeys(ids))[:10]
+        ts = _fmt_th(_now_th())
+        lines = [f"[{ts}][stage] {tag}: n={n} uniq={uniq} sample={sample}"]
+        if extra is not None:
+            try:
+                lines.append(f"[{ts}][stage] {tag}/extra: {json.dumps(extra, ensure_ascii=False)}")
+            except Exception:
+                lines.append(f"[{ts}][stage] {tag}/extra: {str(extra)}")
+        _append_rec_log(lines)
+    except Exception:
+        pass
+
+def _log_df_info(tag: str, df: pd.DataFrame, cols: Optional[List[str]] = None):
+    """สรุปขนาด df และคอลัมน์ที่หาย"""
+    try:
+        ts = _fmt_th(_now_th())
+        if df is None:
+            _append_rec_log([f"[{ts}][stage] {tag}: df=None"])
+            return
+        n = len(df)
+        u = int(df["post_id"].nunique()) if "post_id" in df.columns else n
+        missing = []
+        if cols:
+            have = set(df.columns.tolist())
+            missing = [c for c in cols if c not in have]
+        _append_rec_log([f"[{ts}][stage] {tag}: rows={n} uniq_post_id={u} missing_cols={missing}"])
+    except Exception:
+        pass
+
 
 # ==================== Recommendation Route (optimized, production) ====================
 

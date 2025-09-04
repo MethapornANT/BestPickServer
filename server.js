@@ -1002,7 +1002,7 @@ app.post("/api/interactions", verifyToken, async (req, res) => {
   const { post_id, action_type, content } = req.body;
   const user_id = req.userId; // from token
 
-  // VALIDATION: required fields
+  // 1) Validation
   const postIdValue = post_id ? post_id : null;
   if (!user_id || !action_type) {
     return res
@@ -1010,10 +1010,10 @@ app.post("/api/interactions", verifyToken, async (req, res) => {
       .json({ error: "Missing required fields: user_id or action_type" });
   }
 
-  // DB: insert interaction
+  // 2) Insert interaction
   const insertSql = `
     INSERT INTO user_interactions (user_id, post_id, action_type, content)
-    VALUES (?, ?, ?, ?);
+    VALUES (?, ?, ?, ?)
   `;
   const values = [user_id, postIdValue, action_type, content || null];
 
@@ -1023,90 +1023,18 @@ app.post("/api/interactions", verifyToken, async (req, res) => {
       return res.status(500).json({ error: "Error saving interaction" });
     }
 
-    // --- เพิ่ม Notification เฉพาะกรณี bookmark/unbookmark (fire-and-forget) ---
-    if (postIdValue) {
-      if (action_type === "bookmark") {
-        const checkSql = `
-          SELECT id FROM notifications
-          WHERE user_id = ? AND post_id = ? AND action_type = 'bookmark'
-          LIMIT 1
-        `;
-        pool.query(checkSql, [user_id, postIdValue], (cErr, cRows) => {
-          if (cErr) {
-            console.error("Check bookmark noti error:", cErr);
-          } else if (cRows.length === 0) {
-            const notiInsert = `
-              INSERT INTO notifications (user_id, post_id, action_type, content)
-              VALUES (?, ?, 'bookmark', NULL)
-            `;
-            pool.query(notiInsert, [user_id, postIdValue], (nErr) => {
-              if (nErr) console.error("Insert bookmark noti error:", nErr);
-            });
-          }
-        });
-      } else if (action_type === "unbookmark") {
-        const notiDelete = `
-          DELETE FROM notifications
-          WHERE user_id = ? AND post_id = ? AND action_type = 'bookmark'
-        `;
-        pool.query(notiDelete, [user_id, postIdValue], (dErr) => {
-          if (dErr) console.error("Delete bookmark noti error:", dErr);
-        });
-      }
-    }
-
-    res.status(201).json({
-      message: "Interaction saved successfully",
-      interaction_id: results.insertId,
-    });
-  });
-});
-
-
-
-// ======================================================
-// Interactions: Fetch all interactions (joined with users, posts)
-// SECURITY: requires verifyToken
-// NOTE: returns all users' interactions (admin-like view)
-// ======================================================
-app.post("/api/interactions", verifyToken, async (req, res) => {
-  const { post_id, action_type, content } = req.body;
-  const user_id = req.userId; // from token
-
-  // VALIDATION
-  const postIdValue = post_id ? post_id : null;
-  if (!user_id || !action_type) {
-    return res
-      .status(400)
-      .json({ error: "Missing required fields: user_id or action_type" });
-  }
-
-  // DB: insert interaction
-  const insertSql = `
-    INSERT INTO user_interactions (user_id, post_id, action_type, content)
-    VALUES (?, ?, ?, ?);
-  `;
-  const values = [user_id, postIdValue, action_type, content || null];
-
-  pool.query(insertSql, values, (error, results) => {
-    if (error) {
-      console.error("Database error:", error);
-      return res.status(500).json({ error: "Error saving interaction" });
-    }
-
-    // -------------------- NOTIFICATIONS (fire-and-forget) --------------------
-    // กรณีที่เป็น action บางประเภท เราจะ "เพิ่ม" การแจ้งเตือน
+    // 3) Notifications (fire-and-forget)
+    // เพิ่ม-ลบแจ้งเตือนตามชนิด action
     const NOTI_INSERT_ACTIONS = new Set(["share", "like", "bookmark"]);
-    // กรณีที่เป็น action บางประเภท เราจะ "ลบ" การแจ้งเตือนที่เคยสร้าง
     const NOTI_DELETE_ACTIONS = new Set(["unlike", "unbookmark"]);
 
     if (postIdValue) {
-      // สร้างข้อความ default ถ้าไม่ได้ส่ง content มา
+      // default message หากไม่ได้ส่ง content
       const defaultMsg = `User ${user_id} performed action: ${action_type} on post ${postIdValue}`;
       const notiContent = content || defaultMsg;
 
       if (NOTI_INSERT_ACTIONS.has(action_type)) {
-        // กันซ้ำ: เช็กว่ามี noti เดิมของ action นี้อยู่แล้วหรือยัง
+        // กันซ้ำด้วยการเช็กก่อน
         const checkSql = `
           SELECT id FROM notifications
           WHERE user_id = ? AND post_id = ? AND action_type = ?
@@ -1130,7 +1058,7 @@ app.post("/api/interactions", verifyToken, async (req, res) => {
           }
         });
       } else if (NOTI_DELETE_ACTIONS.has(action_type)) {
-        // map action un* ให้ไปลบ noti ของ action หลัก
+        // map un* ไปลบ noti ของ action หลัก
         const baseAction =
           action_type === "unbookmark" ? "bookmark" :
           action_type === "unlike" ? "like" : action_type;
@@ -1144,8 +1072,8 @@ app.post("/api/interactions", verifyToken, async (req, res) => {
         });
       }
     }
-    // ------------------------------------------------------------------------
 
+    // 4) Response
     res.status(201).json({
       message: "Interaction saved successfully",
       interaction_id: results.insertId,
@@ -2394,7 +2322,11 @@ app.get("/api/notifications", verifyToken, async (req, res) => {
     const getCommentOwner = async (commentId) => {
       if (!commentId) return null;
       try {
-        const [r] = await pool.promise().execute('SELECT id, user_id, content FROM comments WHERE id = ? LIMIT 1', [commentId]);
+        const [r] = await pool.promise().execute(
+          'SELECT id, user_id, comment_text AS content FROM comments WHERE id = ? LIMIT 1', 
+          [commentId]
+        );
+        
         if (r && r.length) return r[0];
       } catch (e) {
         console.error('getCommentOwner error', e);
