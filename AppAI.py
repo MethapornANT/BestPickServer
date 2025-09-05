@@ -75,7 +75,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 UPLOAD_FOLDER = './uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-MODEL_PATH = './NSFW_Model/results/20250817-022748/efficientnetb0/models/efficientnetb0_best.pth'
+MODEL_PATH = './NSFW_Model/results/20250905-214520/efficientnetb0/models/efficientnetb0_best.pth'
 
 # === Threshold (เหมือนเดิม) ===
 HENTAI_THRESHOLD = 37.0
