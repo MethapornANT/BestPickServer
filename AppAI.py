@@ -362,8 +362,8 @@ FOLLOWS_TABLE = "follower_following"
 # Flag ที่กำหนดพฤติกรรมการแสดงโพสต์เจ้าของเอง และการนับโพสต์ที่เขียนเป็นสัญญาณ
 INCLUDE_SELF_POSTS_IN_FEED = True   # ถ้า False จะซ่อนโพสต์ที่ user เป็นเจ้าของจาก feed
 USE_AUTHORED_AS_SIGNALS     = True
-AUTHORED_CATEGORY_BONUS    = 0.7    # น้ำหนักเสริมสำหรับ profile category จากโพสต์ที่เขียนเอง
-AUTHORED_TEXT_BONUS        = 0.7    # น้ำหนักเสริมสำหรับ text-profile จากโพสต์ที่เขียนเอง
+AUTHORED_CATEGORY_BONUS    = 1.0    # น้ำหนักเสริมสำหรับ profile category จากโพสต์ที่เขียนเอง
+AUTHORED_TEXT_BONUS        = 1.0    # น้ำหนักเสริมสำหรับ text-profile จากโพสต์ที่เขียนเอง
 
 # ------------------------ CONTENT / FEATURE COLUMNS -------------------------
 # ระบุคอลัมน์ใน content-based view / table
@@ -398,8 +398,8 @@ RATING_MIN, RATING_MAX = 0.5, 5.0  # rating scale สำหรับ Surprise SV
 # (แนะนำให้ tune ที่นี่เป็นหลัก — ถ้าต้องการยกหมวดหมู่ ให้ปรับ 'category')
 HYBRID_WEIGHTS = {
     "collab": 0.20,     # collaborative SVD weight
-    "item": 0.18,       # item-content / neighbor score weight
-    "user_text": 0.12,  # user text-profile similarity weight
+    "item": 0.20,       # item-content / neighbor score weight
+    "user_text": 0.20,  # user text-profile similarity weight
     "category": 0.40,   # category-match weight (เพิ่มค่านี้เพื่อยกหมวด)
     "pop": 0.10,        # popularity prior weight
 }
@@ -411,16 +411,16 @@ WEIGHT_CATEGORY  = float(HYBRID_WEIGHTS["category"])
 WEIGHT_POP       = float(HYBRID_WEIGHTS["pop"])
 
 # Toggle / mapping สำหรับ integration กับ _rank
-USE_HYBRID = False            # ถ้า True จะพยายามคำนวณ hybrid และใช้เป็น base_score ใน _rank
+USE_HYBRID = True             # ถ้า True จะพยายามคำนวณ hybrid และใช้เป็น base_score ใน _rank
 MAP_HYBRID_TO_RANK = True     # ถ้า True จะแมป category/text จาก HYBRID -> WEIGHT_C / WEIGHT_T
 
 # -------------------- _rank-level WEIGHTS (engage/follow/recency) -----------
 # _rank ใช้สัญญาณระดับโพสต์เพิ่มเติม (แยกจาก HYBRID)
-WEIGHT_E = 0.30   # engagement (quality/viral)
+WEIGHT_E = 0.20   # engagement (quality/viral)
 WEIGHT_C = 0.40   # category match (จะถูก override เมื่อ MAP_HYBRID_TO_RANK=True)
-WEIGHT_F = 0.12   # follow-influence category
-WEIGHT_T = 0.12   # text relevance (จะถูก override เมื่อนำ HYBRID มาแมป)
-WEIGHT_R = 0.06   # recency (ใช้เฉพาะ zone new / 21-30)
+WEIGHT_F = 0.15   # follow-influence category
+WEIGHT_T = 0.20   # text relevance (จะถูก override เมื่อนำ HYBRID มาแมป)
+WEIGHT_R = 0.05   # recency (ใช้เฉพาะ zone new / 21-30)
 
 # ---------------- TF-IDF / ITEM-CONTENT / KNN params -----------------------
 TFIDF_PARAMS = dict(
@@ -430,7 +430,7 @@ TFIDF_PARAMS = dict(
     min_df=2,
     max_df=0.95,
 )
-KNN_NEIGHBORS = 10  # จำนวน neighbor ที่ใช้ใน KNN
+KNN_NEIGHBORS = 20  # จำนวน neighbor ที่ใช้ใน KNN
 
 # ---------------------- POPULARITY / SMOOTHING -----------------------------
 POP_ALPHA = 5.0  # Bayesian smoothing สำหรับ PopularityPrior (ช่วยโพสต์ใหม่ไม่โดนลดจนน่าเกลียด)
@@ -450,15 +450,15 @@ INCLUDE_SELF_POSTS = False
 # ---------------- DIVERSITY / NEWNESS / THRESHOLDS -------------------------
 RUNLEN_CAP_TOP20 = 3     # จำกัด run-length หมวดเดียวใน Top20
 RUNLEN_CAP_AFTER = 3     # limit หลัง Top20
-MMR_LAMBDA = 0.80        # MMR lambda (ใกล้ 1 => เน้น relevance)
+MMR_LAMBDA = 0.85        # MMR lambda (ใกล้ 1 => เน้น relevance)
 MMR_MAX_REF = 30         # จำนวน ref item เพื่อคำนวณ diversity penalty
 
 NEW_WINDOWS_HOURS = [1, 3, 24]  # หน้าต่างเวลา (ชั่วโมง) สำหรับนิยาม "โพสต์ใหม่"
 NEW_INSERT_MAX = 3               # จำนวนโพสต์ใหม่สูงสุดที่จะแทรกใน zone 21–30
 
-CAT_MATCH_TOP20 = 0.60   # threshold ของ category-sim สำหรับ Top20
+CAT_MATCH_TOP20 = 0.40   # threshold ของ category-sim สำหรับ Top20
 CAT_MATCH_AFTER = 0.50   # threshold หลัง Top20
-ENG_PCTL_TOP20 = 40      # percentile ของ engagement สำหรับ Top20 (e.g., 40th)
+ENG_PCTL_TOP20 = 25      # percentile ของ engagement สำหรับ Top20 (e.g., 40th)
 ENG_PCTL_NEW = 25        # percentile สำหรับโพสต์ใหม่
 
 # randomization temps (biased shuffle)
@@ -486,13 +486,18 @@ def _seen_pop_count() -> int:
     # stub: คืนค่า 0 ถ้าไม่มีโค้ดตรวจสรุปแยกไว้
     return 0
 
+# -------------------- SEEN / REFRESH PENALTY SETTINGS --------------------
+# โพสต์ที่เพิ่งถูกเห็นภายในเวลานี้ จะถูก "cooldown" ไม่ให้โผล่ด้านบน
+NO_SHOW_COOLDOWN_SECONDS = 600    # 10 นาทีแรก ถ้าไม่มี interaction ให้ถอยไปท้ายเลย
+# น้ำหนักลงโทษสกอร์ตามเวลา (ยิ่งเพิ่งเห็น ยิ่งโดนหนัก)
+SEEN_PENALTY_ALPHA = 0.95         # 0.95 = ลดสกอร์ลงสูงสุด ~95% เมื่อเพิ่งเห็นสดๆ
+SEEN_HALF_LIFE_SECONDS = 3600     # ครึ่งชีวิต 1 ชม. (โทษจะค่อยๆ จางตามเวลา)
+
 # --------------------------- SHORT GUIDANCE --------------------------------
 # - ถ้าจะ "ยกหมวดหมู่" ให้ปรับ HYBRID_WEIGHTS['category'] (หรือ WEIGHT_CATEGORY ถาจะไม่ใช้ dict)
 # - ถ้าต้องการ tune ให้เป็นเอกภาพ: ปรับ HYBRID_WEIGHTS แล้วตั้ง MAP_HYBRID_TO_RANK=True
 # - ปรับ USE_HYBRID=True เฉพาะเมื่อเตรียม artifacts (tfidf/knn/svd) ไว้แล้วหรืออนุญาตให้สร้าง background
 # ============================================================================ 
-
-
 
 # ================================ UTILITIES =====================================
 def _eng():
@@ -1443,6 +1448,36 @@ def fetch_posts_by_ids(ids: List[int], user_id: int) -> List[dict]:
 
 
 # ============================ MISSING HELPERS ==================================
+def _seen_penalty_map(uid: int, now: Optional[datetime] = None) -> Dict[int, float]:
+    """
+    คืน dict: post_id -> w (0..1) บอกความ 'สด' ของการเห็นล่าสุด
+    - w ~ 1 เมื่อเพิ่งเห็นสดๆ
+    - ลดลงแบบ exponential ตาม half-life (SEEN_HALF_LIFE_SECONDS)
+    ใช้กับการลดสกอร์และตัดออกจาก pool ด้านบนชั่วคราว
+    """
+    if now is None:
+        now = datetime.utcnow()
+    hist = _get_impressions(uid)  # [{post_id, ts}]
+    if not hist:
+        return {}
+    last_ts: Dict[int, datetime] = {}
+    for h in hist:
+        pid = int(h.get("post_id"))
+        ts  = h.get("ts")
+        if not isinstance(ts, datetime):
+            continue
+        if (pid not in last_ts) or (ts > last_ts[pid]):
+            last_ts[pid] = ts
+
+    hl = max(60.0, float(SEEN_HALF_LIFE_SECONDS))  # กันค่าผิดปกติ
+    out = {}
+    for pid, ts in last_ts.items():
+        dt = max(0.0, (now - ts).total_seconds())
+        # mapping: dt=0 => w=1.0, dt=half-life => w=0.5
+        w = float(np.exp(-np.log(2.0) * dt / hl))
+        out[int(pid)] = max(0.0, min(1.0, w))
+    return out
+
 def _vectorize_texts(content_df: pd.DataFrame):
     """lazy build TF-IDF/X/_postidx ให้ _rank ใช้ (แยกจาก build_contentbased_models เพื่อความเข้ากันได้)"""
     global _tfidf, _X, _postidx
@@ -1668,388 +1703,172 @@ def _rank(user_id: int, content_df: pd.DataFrame, user_events: pd.DataFrame,
           unseen: List[int], seen_no: List[int], interacted: List[int],
           precomputed_base_score: Optional[Dict[int, float]] = None) -> List[int]:
     """
-    Ranking pipeline (patched):
-      - รองรับ precomputed_base_score (จาก hybrid) ถ้ามี -> ใช้เป็น base_score
-      - ถ้า pool (unseen + seen_no) ว่าง -> fallback เอา interacted มาใช้
-      - เคารพ run-length cap ระหว่างจัดอันดับหลัก
-      - สุดท้าย 'drain leftovers' เพื่อให้ครบทุกโพสต์ (สำหรับ all=true)
-      - บังคับย้าย 'โพสต์ใหม่ภายใน 24 ชั่วโมงล่าสุด' ที่ไม่มี interaction
-        เข้าโซน 21–30 (ตำแหน่ง 22, 26, 29) โดย *ถอดออกจากลิสต์เดิมก่อน*
+    Final ranking pipeline (refresh-aware):
+      1) คำนวณ base_score จาก signals (หรือใช้ precomputed_hybrid ถ้ามี)
+      2) ลงโทษโพสต์ที่ 'เพิ่งถูกเห็น' อย่างรุนแรง (refresh แล้วจะเปลี่ยนลิสต์ทันที)
+         - ลดสกอร์ตาม SEEN_PENALTY_ALPHA * w
+         - เอาโพสต์ที่เพิ่งเห็น (ยังไม่มี positive) ออกจาก candidate pool ชั้นบน (cooldown)
+      3) Top20 gate + MMR + run-length cap (ไม่เกิน 3 หมวดติดกัน)
+      4) โซน 21–30 inject โพสต์ใหม่ (คง logic เดิม)
+      5) ต่อท้ายด้วย tail ที่เหลือ และค่อยต่อ cooldown ids ไว้ท้ายสุด
+
+    หมายเหตุ:
+      - เคารพ diversity/run-length ใน top20 ตามเดิม
+      - โพสต์ที่ user มี positive interaction จะไม่ถูกบังคับ cooldown
     """
-    now = datetime.now()
+    now = datetime.utcnow()
+    TEXT_GATE = 0.40  # text similarity gate สำหรับ top20
 
-    # ===== TF-IDF / index
+    # --- เตรียมเวกเตอร์/โปรไฟล์ที่ต้องใช้ ---
     _vectorize_texts(content_df)
-
-    # ===== profiles
     user_prof      = _user_category_profile(user_id, user_events, content_df)
     follow_prof    = _follow_category_profile(_eng(), user_id, content_df)
     user_text_prof = _user_text_profile(user_id, user_events, content_df, _X)
 
-    # ===== base score
     scores_E, scores_C, scores_F, scores_T, scores_R = _build_scores(
         user_id, content_df, user_prof, follow_prof, user_text_prof, now
     )
 
-    def _final_score(E, C, F, T, R, zone_is_new: bool) -> float:
-        if zone_is_new:
-            return WEIGHT_E*E + WEIGHT_C*C + WEIGHT_F*F + WEIGHT_T*T + WEIGHT_R*R
-        return WEIGHT_E*E + WEIGHT_C*C + WEIGHT_F*F + WEIGHT_T*T
+    def _final_score(E, C, F, T, R, is_new=False):
+        return WEIGHT_E*E + WEIGHT_C*C + WEIGHT_F*F + WEIGHT_T*T + (WEIGHT_R*R if is_new else 0.0)
 
+    # base_score: ใช้ precomputed (hybrid) ถ้ามี, ไม่งั้นประกอบจากสัญญาณเดิม
     if precomputed_base_score:
         base_score = {int(pid): float(precomputed_base_score.get(int(pid), 0.0))
                       for pid in content_df["post_id"].astype(int)}
     else:
         base_score = {
-            int(pid): _final_score(scores_E.get(int(pid), 0.0), scores_C.get(int(pid), 0.0),
-                                   scores_F.get(int(pid), 0.0), scores_T.get(int(pid), 0.0),
-                                   0.0, zone_is_new=False)
+            int(pid): _final_score(scores_E.get(pid, 0.0), scores_C.get(pid, 0.0),
+                                   scores_F.get(pid, 0.0), scores_T.get(pid, 0.0),
+                                   0.0, is_new=False)
             for pid in content_df["post_id"].astype(int)
         }
 
-    # ===== helpers
+    # percentile map สำหรับเกท top20 / new-zone
     ptiles = _category_percentiles_map(content_df)
 
+    # self-post กันตาม flag เดิม
     try:
         self_post_ids = set(_get_authored_ids(_eng(), user_id))
     except Exception:
         self_post_ids = set()
 
-    # ===== Top20
-    pool = list(unseen) + list(seen_no)
-    if not pool:
-        pool = list(interacted)
+    # --- candidate pool ชั้นแรก ---
+    pool = list(unseen) + list(seen_no) or list(interacted)
 
+    # ====== จุดสำคัญ: ลงโทษโพสต์ที่ "เพิ่งถูกเห็น" เพื่อให้ refresh แล้วไม่เหมือนเดิม ======
+    # แปลง history -> น้ำหนักความสดของการเห็น
+    seen_w = _seen_penalty_map(user_id, now)
+
+    # set ของโพสต์ที่มี positive interaction จริง (ไม่นำไป cooldown)
+    pos_set = set()
+    if not user_events.empty:
+        am = user_events["action_type"].astype(str).str.lower()
+        pos = [a.lower() for a in POS_ACTIONS] if POS_ACTIONS else []
+        if pos:
+            pos_set = set(pd.to_numeric(
+                user_events.loc[am.isin(pos), "post_id"], errors="coerce"
+            ).dropna().astype(int).tolist())
+
+    # นิยามขอบเวลา "สดมาก ๆ" จาก NO_SHOW_COOLDOWN_SECONDS
+    cooldown_cut = max(30.0, float(NO_SHOW_COOLDOWN_SECONDS))
+
+    # หาโพสต์ที่ควรเข้า cooldown (เพิ่งเห็น + ยังไม่มี positive)
+    cooldown_ids = set()
+    for pid, w in seen_w.items():
+        # ประมาณ dt จาก w ด้วยสมมติฐาน exponential half-life: dt ≈ -ln(w)/ln(2) * hl
+        dt = (0.0 if w <= 0.0 else (-math.log(max(1e-9, w)) / math.log(2.0)) * float(SEEN_HALF_LIFE_SECONDS))
+        if dt < cooldown_cut and int(pid) not in pos_set:
+            cooldown_ids.add(int(pid))
+
+    # ลดสกอร์ของทุกโพสต์ที่เพิ่งเห็น ตามระดับความสด (ยิ่งสดยิ่งโดน)
+    if base_score:
+        for pid in list(base_score.keys()):
+            w = float(seen_w.get(int(pid), 0.0))
+            if w > 0.0:
+                base_score[pid] = float(base_score[pid]) * (1.0 - SEEN_PENALTY_ALPHA * w)
+
+    # เอา cooldown ออกจาก pool ชั้นบน (ให้ไปต่อท้ายในภายหลัง)
+    if cooldown_ids:
+        pool = [p for p in pool if p not in cooldown_ids]
+    # ====== จบส่วนลงโทษ seen ======
+
+    # --- Top20 gate ---
     top20_cands = []
     for pid in pool:
-        if (not INCLUDE_SELF_POSTS_IN_FEED) and (pid in self_post_ids):
+        if not INCLUDE_SELF_POSTS_IN_FEED and pid in self_post_ids:
             continue
-        cat = category_by_pid(content_df, pid)
-        ok_cat = scores_C.get(pid, 0.0) >= CAT_MATCH_TOP20
-        try:
-            eng_val = float(content_df.loc[content_df["post_id"] == pid, ENGAGE_COL].values[0])
-        except Exception:
-            eng_val = 0.0
-        thr_map = ptiles.get(str(ENG_PCTL_TOP20), {})
-        thr = thr_map.get(cat, thr_map.get("__global__", 0.0))
-        ok_eng = eng_val >= thr
-        if ok_cat and ok_eng:
+        c, t = scores_C.get(pid, 0.0), scores_T.get(pid, 0.0)
+        cat  = category_by_pid(content_df, pid)
+        thr_map = ptiles.get(str(ENG_PCTL_TOP20), {}) or {}
+        thr = float(thr_map.get(cat, thr_map.get("__global__", 0.0)))
+        eng_val = float(content_df.loc[content_df["post_id"] == pid, ENGAGE_COL].values[0] or 0.0)
+        if (c >= CAT_MATCH_TOP20 or t >= TEXT_GATE) and eng_val >= thr:
             top20_cands.append(pid)
 
+    # relax fill ให้ครบ 20 ถ้ายังไม่พอ
     if len(top20_cands) < 20:
-        relax_pool = [pid for pid in pool if pid not in top20_cands]
-        # ถ้าขาดเยอะมาก ลองผ่อน cap หมวด (RUNLEN_CAP_TOP20) ชั่วคราว
-        tmp_cap = RUNLEN_CAP_TOP20 if len(top20_cands) >= 10 else max(5, RUNLEN_CAP_TOP20)
-        relax = sorted(relax_pool, key=lambda x: (scores_C.get(x, 0.0), base_score.get(x, 0.0)), reverse=True)
+        relax = sorted([p for p in pool if p not in top20_cands],
+                       key=lambda x: (scores_C.get(x, 0.0), scores_T.get(x, 0.0), base_score.get(x, 0.0)),
+                       reverse=True)
+        cand_for_top20 = list(dict.fromkeys(top20_cands + relax))
     else:
-        tmp_cap = RUNLEN_CAP_TOP20
-        relax = []
+        cand_for_top20 = top20_cands
 
-    def simfunc(a: int, b: int):
+    def sim(a, b):
         ia, ib = _postidx.get(a, -1), _postidx.get(b, -1)
         if ia < 0 or ib < 0:
             return 0.0
         va, vb = _X[ia], _X[ib]
         num = float(va.multiply(vb).sum())
-        den = (np.linalg.norm(va.data) * np.linalg.norm(vb.data)) if (hasattr(va, "data") and hasattr(vb, "data")) else 0.0
-        return float(num/den) if den > 0 else 0.0
+        den = np.linalg.norm(va.data) * np.linalg.norm(vb.data) if va.nnz and vb.nnz else 0.0
+        return num / den if den > 0 else 0.0
 
-    cand_for_top20 = sorted(set(top20_cands) | set(relax), key=lambda x: base_score.get(x, 0.0), reverse=True)
-    top20_sorted = _mmr_select(candidates=cand_for_top20, scores=base_score, simfunc=simfunc,
-                               lam=MMR_LAMBDA, k=min(20, len(content_df)))
+    top20_raw = _mmr_select(cand_for_top20, base_score, sim, MMR_LAMBDA, k=20)
 
+    # run-length cap <= 3 ใน Top20
     top20_out, cat_seq = [], []
-    for pid in top20_sorted:
-        if (not INCLUDE_SELF_POSTS_IN_FEED) and (pid in self_post_ids):
+    for pid in top20_raw:
+        if not INCLUDE_SELF_POSTS_IN_FEED and pid in self_post_ids:
             continue
         cat = category_by_pid(content_df, pid)
-        if _runlen_violate(cat_seq, cat, tmp_cap):
+        if _runlen_violate(cat_seq, cat, RUNLEN_CAP_TOP20):
             continue
         top20_out.append(pid)
         cat_seq.append(cat)
         if len(top20_out) >= 20:
             break
 
-    # ===== Zone 21–30 (ของใหม่ตามเงื่อนไข Engagement/Category)
-    zone21_30 = []
-    need_max = NEW_INSERT_MAX
-    now_ts = now
-    for h in NEW_WINDOWS_HOURS:
-        new_cands = []
-        for pid in unseen:
-            if (not INCLUDE_SELF_POSTS_IN_FEED) and (pid in self_post_ids):
-                continue
-            row = content_df.loc[content_df["post_id"] == pid]
-            if row.empty:
-                continue
-            ts = pd.NaT
-            for c in ("created_ts", "created_at", "createdAt", "updated_at", "updatedAt", "timestamp"):
-                if c in row.columns:
-                    ts = pd.to_datetime(row[c].iloc[0], errors="coerce")
-                    break
-            if not _is_new(ts, now_ts, h):
-                continue
-            cat = category_by_pid(content_df, pid)
-            cond_cat = scores_C.get(pid, 0.0) >= CAT_MATCH_AFTER
-            thr_map_new = ptiles.get(str(ENG_PCTL_NEW), {})
-            thr_new = thr_map_new.get(cat, thr_map_new.get("__global__", 0.0))
-            try:
-                eng_val = float(row[ENGAGE_COL].values[0])
-            except Exception:
-                eng_val = 0.0
-            cond_eng = eng_val >= thr_new
-            if cond_cat and cond_eng:
-                sc = _final_score(scores_E.get(pid, 0.0), scores_C.get(pid, 0.0),
-                                  scores_F.get(pid, 0.0), scores_T.get(pid, 0.0),
-                                  scores_R.get(pid, 0.0), zone_is_new=True)
-                new_cands.append((sc, pid))
-        new_cands.sort(reverse=True)
-        picked = [pid for _, pid in new_cands[:need_max]]
-        if picked:
-            zone21_30 = picked[:need_max]
-            break
-
-    # เติม 21–30
-    chosen20 = set(top20_out)
-    chosen21 = set(zone21_30)
-    remaining_pool = [pid for pid in unseen + seen_no if pid not in (chosen20 | chosen21)]
-    if not INCLUDE_SELF_POSTS_IN_FEED:
-        remaining_pool = [pid for pid in remaining_pool if pid not in self_post_ids]
-    rest_sorted = sorted(remaining_pool, key=lambda x: base_score.get(x, 0.0), reverse=True)
-
-    pos21_30 = []
-    insert_positions = [22, 26, 29]
-    cat_seq2 = cat_seq[:]
-
-    def _pick_from(lst: List[int]) -> Optional[int]:
-        j = 0
-        while j < len(lst):
-            pid = lst[j]
-            c = category_by_pid(content_df, pid)
-            if not _runlen_violate(cat_seq2, c, RUNLEN_CAP_AFTER):
-                lst.pop(j)
-                cat_seq2.append(c)
-                return pid
-            j += 1
-        return None
-
-    for pos in range(21, 31):
-        pid_choice = None
-        if pos in insert_positions and zone21_30:
-            pid_choice = _pick_from(zone21_30)
-        if pid_choice is None and rest_sorted:
-            pid_choice = _pick_from(rest_sorted)
-        if pid_choice is not None:
-            pos21_30.append(pid_choice)
-
-    # ===== หลัง 30
-    chosen = set(top20_out + pos21_30)
-    base_rest = [pid for pid in content_df["post_id"].astype(int) if pid not in chosen]
-    if not INCLUDE_SELF_POSTS_IN_FEED:
-        base_rest = [pid for pid in base_rest if pid not in self_post_ids]
-
-    unseen_rest    = [pid for pid in unseen     if pid in base_rest]
-    seenno_rest    = [pid for pid in seen_no    if pid in base_rest]
-    interact_rest  = [pid for pid in interacted if pid in base_rest]
-
-    seed = _daily_seed(user_id)
-    def _bs(ids, t, s): return _biased_shuffle(ids, base_score, t, s)
-    unseen_rest   = _bs(unseen_rest,   TEMP_UNSEEN, seed+1)
-    seenno_rest   = _bs(seenno_rest,   TEMP_SEENNO, seed+2)
-    interact_rest = _bs(interact_rest, TEMP_INTER,  seed+3)
-
-    U, S = len(unseen), len(seen_no)
-    start_inter = _start_interacted_position(U, S)
-
-    cat_seq_all = [category_by_pid(content_df, pid) for pid in (top20_out + pos21_30)]
-    tail, pos_idx = [], len(top20_out) + len(pos21_30)
-
-    mix_pool = sorted(unseen_rest + seenno_rest, key=lambda x: base_score.get(x, 0.0), reverse=True)
-    for pid in mix_pool:
+    # --- Zone 21–30: inject new ตามเดิม ---
+    zone21 = []
+    thr_map_new = ptiles.get(str(ENG_PCTL_NEW), {}) or {}
+    for pid in unseen:
+        if not INCLUDE_SELF_POSTS_IN_FEED and pid in self_post_ids:
+            continue
         cat = category_by_pid(content_df, pid)
-        if _runlen_violate(cat_seq_all, cat, RUNLEN_CAP_AFTER):
-            continue
-        tail.append(pid); cat_seq_all.append(cat)
-        pos_idx += 1
-        if pos_idx >= start_inter:
-            break
+        thr = thr_map_new.get(cat, thr_map_new.get("__global__", 0.0))
+        eng_val = float(content_df.loc[content_df["post_id"] == pid, ENGAGE_COL].values[0] or 0.0)
+        if scores_C.get(pid, 0.0) >= CAT_MATCH_AFTER and eng_val >= thr:
+            sc = _final_score(scores_E.get(pid, 0.0), scores_C.get(pid, 0.0),
+                              scores_F.get(pid, 0.0), scores_T.get(pid, 0.0),
+                              scores_R.get(pid, 0.0), is_new=True)
+            zone21.append((sc, pid))
+    zone21 = [p for _, p in sorted(zone21, reverse=True)[:NEW_INSERT_MAX]]
 
-    remain_ids  = [pid for pid in base_rest if pid not in set(tail)]
-    remain_un   = [pid for pid in unseen_rest   if pid in remain_ids]
-    remain_sn   = [pid for pid in seenno_rest   if pid in remain_ids]
-    remain_it   = [pid for pid in interact_rest if pid in remain_ids]
+    # --- รวมผลลัพธ์ ---
+    chosen = set(top20_out + zone21)
 
-    while remain_un or remain_sn or remain_it:
-        block_items = []
-        quota_inter = max(0, int(0.10 * 10))
-        for _ in range(10):
-            best = None; best_score = -1.0
-            pools = [
-                ("un", remain_un),
-                ("sn", remain_sn),
-                ("it", remain_it if quota_inter > 0 else [])
-            ]
-            for name, pool in pools:
-                if not pool:
-                    continue
-                cand = pool[0]
-                s = base_score.get(cand, 0.0)
-                if s > best_score:
-                    best_score = s; best = (name, cand)
-            if best is None:
-                break
+    # tail ปกติ (ไม่รวม cooldown)
+    rest = [p for p in content_df["post_id"].astype(int)
+            if p not in chosen and p not in cooldown_ids]
+    tail = sorted(rest, key=lambda x: base_score.get(x, 0.0), reverse=True)
 
-            name, cand = best
-            cat = category_by_pid(content_df, cand)
-            if _runlen_violate(cat_seq_all, cat, RUNLEN_CAP_AFTER):
-                pool = remain_un if name == "un" else remain_sn if name == "sn" else remain_it
-                pool.pop(0)
-                continue
+    # cooldown ต่อท้ายจริงๆ (หลังโดนลดสกอร์แล้ว)
+    cool_tail = sorted(list(cooldown_ids - chosen), key=lambda x: base_score.get(x, 0.0), reverse=True)
 
-            block_items.append(cand); cat_seq_all.append(cat)
-            pool = remain_un if name == "un" else remain_sn if name == "sn" else remain_it
-            pool.pop(0)
-            if name == "it":
-                quota_inter -= 1
-            if len(block_items) >= 10:
-                break
-
-        if not block_items:
-            leftovers = remain_un + remain_sn + remain_it
-            moved = False
-            for cand in leftovers:
-                cat = category_by_pid(content_df, cand)
-                if not _runlen_violate(cat_seq_all, cat, RUNLEN_CAP_AFTER):
-                    block_items.append(cand)
-                    cat_seq_all.append(cat)
-                    if cand in remain_un: remain_un.remove(cand)
-                    elif cand in remain_sn: remain_sn.remove(cand)
-                    else:
-                        if cand in remain_it: remain_it.remove(cand)
-                    moved = True
-            if not moved:
-                break
-
-        tail.extend(block_items)
-
-    # ===== รวมเป็น ordered ขั้นแรก
-    final_list = top20_out + pos21_30 + tail
-    ordered, seen_set = [], set()
-    for pid in final_list:
-        if pid not in seen_set:
-            ordered.append(pid); seen_set.add(pid)
-
-    # ===== Drain leftovers เพื่อให้ครบทุกโพสต์ (cap = cosmetic only)
-    all_ids_all = [int(x) for x in pd.to_numeric(content_df["post_id"], errors="coerce").dropna().astype(int).tolist()]
-    leftovers = [p for p in all_ids_all if p not in set(ordered)]
-    if leftovers:
-        ordered.extend(leftovers)
-
-    # ===== NEW TODAY INJECTION (24h, no interaction) — relocate to 21–30
-    # build fast ts-map: content_df -> ts ; fallback query posts table if missing
-    def _row_ts_from_df(r: pd.Series) -> Optional[pd.Timestamp]:
-        for c in ("created_ts", "created_at", "createdAt", "updated_at", "updatedAt", "timestamp"):
-            if c in r.index:
-                t = pd.to_datetime(r[c], errors="coerce")
-                if not pd.isna(t):
-                    return t
-        return pd.NaT
-
-    # first pass from content_df
-    ts_map: Dict[int, pd.Timestamp] = {}
-    for _, rr in content_df.iterrows():
-        pid = int(rr["post_id"])
-        t = _row_ts_from_df(rr)
-        if not pd.isna(t):
-            ts_map[pid] = t
-
-    # fallback from posts table (only for missing)
-    missing_pids = [pid for pid in all_ids_all if pid not in ts_map]
-    if missing_pids:
-        try:
-            e = _eng()
-            placeholders = ", ".join([f":p{i}" for i in range(len(missing_pids))])
-            params = {f"p{i}": int(pid) for i, pid in enumerate(missing_pids)}
-            q = sqltext(f"SELECT id, created_at, updated_at FROM {POSTS_TABLE} WHERE id IN ({placeholders})")
-            with e.begin() as conn:
-                rows = conn.execute(q, params).mappings().all()
-            for r in rows:
-                pid = int(r["id"])
-                t = pd.NaT
-                for c in ("created_at","updated_at"):
-                    if r.get(c) is not None:
-                        t = pd.to_datetime(r.get(c), errors="coerce")
-                        if not pd.isna(t):
-                            break
-                if not pd.isna(t):
-                    ts_map[pid] = t
-        except Exception:
-            pass
-
-    # make "now_th" for 24h window in Bangkok
-    try:
-        from zoneinfo import ZoneInfo
-        now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
-    except Exception:
-        now_th = datetime.utcnow() + timedelta(hours=7)
-
-    # interaction จริง (ไม่เกี่ยว ai/seen)
-    ev_set = set(pd.to_numeric(user_events["post_id"], errors="coerce")
-                 .dropna().astype(int).tolist()) if not user_events.empty else set()
-
-    # คัด candidates (24 ชั่วโมงล่าสุด & no interaction)
-    new_today = []
-    for pid in all_ids_all:
-        t = ts_map.get(pid)
-        if t is None or pd.isna(t):
-            continue
-        # ทำให้เป็น aware แล้วเทียบเป็นชั่วโมง
-        try:
-            if t.tzinfo is None:
-                t_aware = pd.Timestamp(t).tz_localize("UTC")  # assume UTC from DB
-            else:
-                t_aware = pd.Timestamp(t)
-            t_th = t_aware.tz_convert("Asia/Bangkok")
-        except Exception:
-            # ถ้าพัง ให้เทียบแบบ naive เป็น 24 ชม. เฉยๆ
-            t_th = pd.Timestamp(t)
-        if (now_th - t_th.to_pydatetime()) <= timedelta(hours=24):
-            if int(pid) not in ev_set:
-                new_today.append(pid)
-
-    if not INCLUDE_SELF_POSTS_IN_FEED and new_today:
-        new_today = [p for p in new_today if p not in self_post_ids]
-
-    # จัด priority: ใหม่กว่า/score สูงกว่า มาก่อน
-    new_today.sort(key=lambda p: (ts_map.get(p, pd.Timestamp(0)), base_score.get(p, 0.0)), reverse=True)
-    chosen_new = new_today[:NEW_INSERT_MAX]
-
-    insert_positions = [22, 26, 29]  # 1-based anchor, จะ map เป็น index 21,25,28
-    if chosen_new:
-        # ถอดออกก่อน
-        present = set(ordered)
-        for pid in chosen_new:
-            if pid in present:
-                ordered = [x for x in ordered if x != pid]
-        # ย้ายเข้าโซน
-        for i, pid in enumerate(chosen_new):
-            pos0 = insert_positions[min(i, len(insert_positions)-1)] - 1
-            pos0 = min(pos0, len(ordered))
-            ordered.insert(pos0, pid)
-
-    _log_stage("new_today_injected", {
-        "uid": user_id,
-        "candidates": len(new_today),
-        "inserted": chosen_new
-    })
-
-    # de-dupe อีกรอบ
-    out, _seen = [], set()
-    for pid in ordered:
-        if pid not in _seen:
-            out.append(pid); _seen.add(pid)
-    return out
-
+    order = top20_out + zone21 + tail + cool_tail
+    # de-dupe preserve order
+    return [int(x) for x in dict.fromkeys(order)]
 
 def _split_to_unseen_seenno_interacted(uid: int, content_df: pd.DataFrame, events_all: pd.DataFrame):
     """
