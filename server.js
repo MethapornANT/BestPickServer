@@ -3795,22 +3795,56 @@ app.get("/api/reports", verifyToken, (req, res) => {
 
 
 /* ================================
-   Ads: random 1 ตัว (active) ถ่วงน้ำหนัก display_count ต่ำก่อน
-   NOTE: คืนเป็น array ตามของเดิม
+   Ads: random 1 ตัวแบบ "แฟร์จริง"
+   - คัดเฉพาะ active + ถึงเวลาแสดง + ยังไม่หมดอายุ
+   - cooldown: ตัดตัวที่เพิ่งแสดง <= 3 นาที
+   - weighted random:
+       * นับน้อยได้บูสต์        : 1/(display_count+1)
+       * ห่างการแสดงนานได้บูสต์ : idle_minutes/60 capped to +1x
+       * ตัวใหม่ได้บูสต์          : age_hours/72  capped to +1x
+   - epsilon 5%: สุ่ม RAND ล้วนๆ กันระบบติด pattern
+   - NOTE: คืนเป็น array ตามของเดิม
 ================================ */
 app.get('/api/ads/random', (req, res) => {
-  const sql = `
-    SELECT *
-    FROM ads
-    WHERE status = 'active'
-    ORDER BY display_count ASC, RAND()
-    LIMIT 1
+  const useEpsilon = Math.random() < 0.05; // 5% สุ่มมั่วจริง
+
+  const baseFilter = `
+    FROM ads a
+    WHERE a.status = 'active'
+      AND (a.show_at IS NULL OR a.show_at <= NOW())
+      AND (a.expiration_date IS NULL OR a.expiration_date >= NOW())
+      AND (a.last_shown IS NULL OR a.last_shown <= NOW() - INTERVAL 3 MINUTE)
   `;
+
+  const sql = useEpsilon
+    ? `
+        SELECT a.*
+        ${baseFilter}
+        ORDER BY RAND()
+        LIMIT 1
+      `
+    : `
+        SELECT t.*
+        FROM (
+          SELECT
+            a.*,
+            (1.0 / (COALESCE(a.display_count,0) + 1))                                        AS w_count,
+            LEAST(1.0, GREATEST(TIMESTAMPDIFF(MINUTE, a.last_shown, NOW()), 0) / 60.0)       AS r_recency,
+            LEAST(1.0, GREATEST(TIMESTAMPDIFF(HOUR,   a.show_at,    NOW()), 0) / 72.0)       AS r_newbie
+          ${baseFilter}
+        ) t
+        ORDER BY -LOG(RAND()) / GREATEST(
+                 0.05, LEAST(5.0, t.w_count * (1.0 + t.r_recency) * (1.0 + t.r_newbie))
+               )
+        LIMIT 1
+      `;
+
   pool.query(sql, (err, rows) => {
     if (err) {
       console.error('Database error during fetching random ad:', err);
       return res.status(500).json({ error: 'Error fetching random ad' });
     }
+    // คืนเป็น array ตามเดิม (แม้จะมี 1 แถว)
     res.json(rows);
   });
 });
@@ -3818,26 +3852,32 @@ app.get('/api/ads/random', (req, res) => {
 
 /* ================================
    Ads: track impression (เพิ่มจำนวน + last_shown)
+   - ตรวจ id ให้เป็นตัวเลข
+   - อัปเดตเฉพาะแถวที่ยัง active
+   - กัน NULL: COALESCE(display_count,0) + 1
 ================================ */
 app.post('/api/ads/track', (req, res) => {
-  const adId = req.body.id;
-  if (!adId) return res.status(400).json({ error: 'Ad ID is required' });
+  const adId = Number(req.body.id);
+  if (!Number.isInteger(adId) || adId <= 0) {
+    return res.status(400).json({ error: 'Invalid ad id' });
+  }
 
   const sql = `
     UPDATE ads
-    SET display_count = display_count + 1,
-        last_shown = NOW()
-    WHERE id = ?
+    SET display_count = COALESCE(display_count, 0) + 1,
+        last_shown    = NOW()
+    WHERE id = ? AND status = 'active'
   `;
+
   pool.query(sql, [adId], (err, result) => {
     if (err) {
       console.error('Database error during ad count update:', err);
       return res.status(500).json({ error: 'Error updating ad count' });
     }
     if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Ad not found or not updated' });
+      return res.status(404).json({ error: 'Ad not found or not active' });
     }
-    res.json({ message: 'Ad count updated successfully' });
+    res.json({ ok: true, id: adId });
   });
 });
 
@@ -5819,7 +5859,7 @@ app.post("/api/check-block-status", (req, res) => {
 //########################################################   Order API  ########################################################
 
 
-// POST /api/orders
+
 // POST /api/orders (รองรับทั้งการสร้างใหม่และการต่ออายุ)
 app.post("/api/orders", upload.single('image'), (req, res) => {
     console.log('[INFO] Received POST /api/orders request');
