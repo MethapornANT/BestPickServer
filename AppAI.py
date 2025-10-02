@@ -35,6 +35,8 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize as sk_normalize
 from surprise import SVD, Dataset, Reader
 from collections import defaultdict, deque
+from typing import List, Dict, Any, Tuple, Optional, DefaultDict
+
 
 
 # NLP / Etc.
@@ -468,6 +470,17 @@ FAIRNESS_TOPK       = 20     # พิจารณาความสมดุล�
 FAIRNESS_RATIO_CAP  = 2.0    # สัดส่วนหมวดหลัก : หมวดรอง ไม่ควรเกิน 2:1 ใน Top-K
 FAIRNESS_ALPHA      = 0.22   # ความแรงในการดึงหมวดรองขึ้นมา (0..1) สูงขึ้น = ยอม swap บ่อยขึ้น
 
+# --- USER-SPECIFIC BALANCED PAIR OVERRIDES (Electronics ↔ Beauty 1:1) ---
+# ถ้าผู้ใช้คนไหนต้องการบังคับสลับ 1:1 ใส่ user_id ลง dict นี้
+BALANCED_PAIR_USERS: Dict[int, Tuple[str, str]] = {
+    # ตัวอย่าง: 9999: ("Electronics_Gadgets", "Beauty_Products"),
+}
+# ค่าเริ่มต้นของโหมด balanced pair (เมื่อทริกเกอร์)
+BALANCED_PAIR_CAP_TOP   = 2     # หัวตาราง Top-K ห้ามติดกันเกิน 1 => บังคับสลับ
+BALANCED_PAIR_RATIO_CAP = 1.3   # สัดส่วน 1:1
+BALANCED_PAIR_ALPHA     = 0.28  # บูสต์หมวดรองขึ้นเล็กน้อย
+# ชื่อหมวดที่ถือว่าเป็น “คู่” (โหมดออโต้)
+BALANCED_PAIR_NAMES = {"Electronics_Gadgets", "Beauty_Products"}
 
 # ---------------- Cache / impression TTL / directories ---------------------
 OUT_DIR = "./LogRec"
@@ -524,6 +537,37 @@ def _seen_pop_count() -> int:
     # stub: คืนค่า 0 ถ้าไม่มีโค้ดตรวจสรุปแยกไว้
     return 0
 
+# ---------------------- CODE AUTORELOAD / VERSION HASH ----------------------
+# อย่าเรียก _as_bool ตรงนี้ เพราะยังไม่ได้ประกาศ ฟัดเอาจาก env ตรงๆ เลย
+RECSYS_AUTORELOAD = str(os.getenv("RECSYS_AUTORELOAD", "true")).strip().lower() in (
+    "1", "true", "t", "yes", "y", "on"
+)
+
+# รายชื่อไฟล์โค้ดที่เฝ้าดู (คอมมาแยกไฟล์); ดีฟอลต์คือไฟล์นี้เอง
+RECSYS_CODE_FILES = os.getenv("RECSYS_CODE_FILES", __file__)
+
+def _compute_code_hash() -> str:
+    """
+    คืนค่า MD5 ของไฟล์โค้ดทั้งหมดใน RECSYS_CODE_FILES
+    ใช้ทั้งเนื้อไฟล์และ mtime รวมในแฮช เพื่อให้เปลี่ยนทันทีเมื่อแก้
+    """
+    h = hashlib.md5()
+    for p in [x.strip() for x in str(RECSYS_CODE_FILES).split(",") if x.strip()]:
+        try:
+            with open(p, "rb") as f:
+                h.update(f.read())
+            try:
+                m = os.path.getmtime(p)
+                h.update(str(m).encode())
+            except Exception:
+                pass
+        except Exception:
+            # ไฟล์เปิดไม่ได้ก็ข้ามไป
+            continue
+    return h.hexdigest()
+
+CODE_VERSION_HASH = _compute_code_hash()
+
 # -------------------- SEEN / REFRESH PENALTY SETTINGS --------------------
 # โพสต์ที่เพิ่งถูกเห็นภายในเวลานี้ จะถูก "cooldown" ไม่ให้โผล่ด้านบน
 NO_SHOW_COOLDOWN_SECONDS = 600    # 10 นาทีแรก ถ้าไม่มี interaction ให้ถอยไปท้ายเลย
@@ -538,8 +582,6 @@ SEEN_HALF_LIFE_SECONDS = 3600     # ครึ่งชีวิต 1 ชม. (�
 # ============================================================================ 
 
 # ================================ UTILITIES =====================================
-def _eng():
-    return create_engine(DB_URI, pool_pre_ping=True, pool_recycle=1800)
 
 from sqlalchemy import text as sqltext
 
@@ -598,6 +640,267 @@ def _atomic_write_file(path: str, data_bytes: bytes):
         except Exception:
             pass
 
+# เพิ่มไว้บนหัวไฟล์
+_ENGINE = None
+
+def _eng():
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = create_engine(DB_URI, pool_pre_ping=True, pool_recycle=1800)
+    return _ENGINE
+
+def _flush_caches_and_restart(reason: str = "code-changed"):
+    try:
+        _append_rec_log([f"[{_fmt_th(_now_th())}][autoreload] restarting due to {reason}"])
+    except Exception:
+        pass
+
+    _HEALTH["reloading"] = True
+    try:
+        with _cache_lock:
+            recommendation_cache.clear()
+            impression_history_cache.clear()
+            new_injected_seen_blocklist.clear()
+    except Exception:
+        pass
+
+    # ปิด DB pool ให้เรียบร้อยก่อนรีสตาร์ต
+    try:
+        global _ENGINE
+        if _ENGINE is not None:
+            _ENGINE.dispose()
+            _ENGINE = None
+    except Exception:
+        pass
+
+    try:
+        import sys
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception:
+        os._exit(121)
+
+# เพิ่มบนหัวไฟล์
+import py_compile
+
+_HEALTH = {"reloading": False}
+_WATCHER_STARTED = False  # กันสตาร์ตซ้ำ
+_DEBOUNCE_SEC = 0.8       # รอไฟล์นิ่งก่อนคอมไพล์/รีสตาร์ต
+
+def _list_code_files() -> list:
+    """รวมไฟล์ .py ทั้งโปรเจ็กต์ (ยกเว้น venv/__pycache__/.git) หรือใช้ RECSYS_CODE_FILES ถ้ามี"""
+    roots = [os.getenv("RECSYS_CODE_ROOT", os.path.dirname(__file__))]
+    files = []
+    allow = tuple(".py",)
+    deny_dirs = {"__pycache__", ".git", "venv", ".venv", "env", ".idea", ".mypy_cache", ".pytest_cache"}
+    custom = os.getenv("RECSYS_CODE_FILES")
+    if custom:
+        return [x.strip() for x in custom.split(",") if x.strip()]
+    for root in roots:
+        for d, subdirs, fns in os.walk(root):
+            base = os.path.basename(d)
+            if base in deny_dirs:
+                continue
+            for fn in fns:
+                if fn.endswith(".py"):
+                    files.append(os.path.join(d, fn))
+    # ถ้าไม่มีอะไรจริงๆ ให้ fallback เป็นไฟล์นี้
+    return files or [__file__]
+
+def _code_is_compilable(paths: list) -> (bool, str):
+    """คอมไพล์ไฟล์ทั้งหมดแบบ dry-run; ถ้าพัง ส่งข้อความ error กลับมา"""
+    try:
+        for p in paths:
+            try:
+                py_compile.compile(p, doraise=True)
+            except py_compile.PyCompileError as ex:
+                return False, f"{p}: {ex.msg}"
+        return True, ""
+    except Exception as ex:
+        return False, str(ex)
+
+def _start_code_change_watcher(poll_seconds: float = 1.5):
+    global _WATCHER_STARTED
+    if _WATCHER_STARTED or not RECSYS_AUTORELOAD:
+        return
+    _WATCHER_STARTED = True
+
+    files = _list_code_files()
+    mtimes = {}
+    for p in files:
+        try:
+            mtimes[p] = os.path.getmtime(p)
+        except Exception:
+            mtimes[p] = None
+
+    def _loop():
+        last_change = 0.0
+        while True:
+            try:
+                changed = False
+                # รีสแกนไฟล์เป็นพักๆ (กันไฟล์ใหม่)
+                scan_files = _list_code_files()
+                for p in scan_files:
+                    try:
+                        m = os.path.getmtime(p)
+                    except Exception:
+                        m = None
+                    if mtimes.get(p) != m:
+                        mtimes[p] = m
+                        changed = True
+                        last_change = time.time()
+                if changed:
+                    # debounce: รอให้ไฟล์นิ่ง
+                    while time.time() - last_change < _DEBOUNCE_SEC:
+                        time.sleep(0.1)
+
+                    ok, msg = _code_is_compilable(scan_files)
+                    if not ok:
+                        _append_rec_log([f"[{_fmt_th(_now_th())}][autoreload][SKIP] syntax error: {msg}"])
+                        # อย่าตาย! รอแก้แล้วค่อยลองใหม่
+                    else:
+                        _HEALTH["reloading"] = True
+                        _append_rec_log([f"[{_fmt_th(_now_th())}][autoreload] restart (code clean)"])
+                        _flush_caches_and_restart("code-file-updated")
+                        return
+            except Exception as ex:
+                _append_rec_log([f"[{_fmt_th(_now_th())}][autoreload][WARN] {ex}"])
+            time.sleep(max(0.5, float(poll_seconds)))
+
+    try:
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+    except Exception:
+        pass
+
+# เรียก watcher ตอนโหลดโมดูล
+try:
+    _start_code_change_watcher()
+except Exception:
+    pass
+
+# -------------------------- READ ALL LOG FILES ---------------------------------
+
+# --- ADD: warm impressions from ALL log files (persist across restarts) ---
+_impressions_warmed_from_logs = False
+
+def _warm_impressions_from_logs(force: bool = False):
+    """
+    อ่านทุกไฟล์ logrec_*.txt แล้วเติม impression + blocklist ต่อ user
+    ใช้เฉพาะรายการภายใน TTL ล่าสุด (IMPRESSION_HISTORY_TTL_SECONDS)
+    """
+    global _impressions_warmed_from_logs
+    if _impressions_warmed_from_logs and not force:
+        return
+
+    try:
+        import re
+        from zoneinfo import ZoneInfo
+        from datetime import timezone
+
+        lines = read_all_rec_logs(OUT_DIR)
+        if not lines:
+            _impressions_warmed_from_logs = True
+            return
+
+        # [YYYY-mm-dd HH:MM:SS ICT][seen] uid=123 seen_ids=[1,2,3]
+        rx = re.compile(
+            r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) [A-Z]+\]\[seen\]\s+uid=(?P<uid>\d+)\s+seen_ids=\[(?P<ids>[0-9,\s]+)\]"
+        )
+
+        now_utc = datetime.utcnow()
+        cutoff_utc = now_utc - timedelta(seconds=float(IMPRESSION_HISTORY_TTL_SECONDS))
+
+        # เก็บชั่วคราวก่อน merge เข้า cache จริง
+        tmp_map: Dict[int, List[Dict]] = defaultdict(list)
+
+        for ln in lines:
+            m = rx.match(ln)
+            if not m:
+                continue
+            ts_str = m.group("ts")
+            uid = int(m.group("uid"))
+            ids_raw = m.group("ids")
+
+            # แปลงเวลา ICT -> UTC naive
+            try:
+                ts_local = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Bangkok"))
+                ts_utc = ts_local.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                continue
+
+            if ts_utc < cutoff_utc:
+                continue
+
+            # ดึงตัวเลข post ids ทั้งหมด
+            try:
+                import re as _re
+                pids = [_ for _ in [_re.findall(r"\d+", ids_raw)][0]]
+                pids = [int(x) for x in pids]
+            except Exception:
+                continue
+
+            for pid in pids:
+                tmp_map[uid].append({"post_id": int(pid), "ts": ts_utc})
+
+        if not tmp_map:
+            _impressions_warmed_from_logs = True
+            return
+
+        with _cache_lock:
+            for uid, new_hist in tmp_map.items():
+                old = impression_history_cache.get(uid, [])
+                merged = old + new_hist
+                # เก็บ “ล่าสุดต่อโพสต์” ภายใน TTL
+                latest: Dict[int, datetime] = {}
+                for h in merged:
+                    pid = int(h["post_id"])
+                    t = h["ts"]
+                    if not isinstance(t, datetime):
+                        continue
+                    if t >= cutoff_utc and (pid not in latest or t > latest[pid]):
+                        latest[pid] = t
+                # rebuild list + sort
+                merged_list = [{"post_id": pid, "ts": t} for pid, t in latest.items()]
+                merged_list.sort(key=lambda x: x["ts"])
+                impression_history_cache[uid] = merged_list[-IMPRESSION_HISTORY_MAX_ENTRIES:]
+
+                # อัปเดต blocklist สำหรับการ inject (เพื่อไม่เอามา privileged อีก)
+                s = new_injected_seen_blocklist.get(uid)
+                if s is None:
+                    s = set()
+                    new_injected_seen_blocklist[uid] = s
+                for h in merged_list:
+                    s.add(int(h["post_id"]))
+
+        _impressions_warmed_from_logs = True
+
+    except Exception:
+        # อย่าทำให้ทั้งระบบล้ม ถ้า parse log พัง
+        _impressions_warmed_from_logs = True
+        return
+
+def iter_all_rec_logs(out_dir: str = OUT_DIR):
+    """
+    yield บรรทัดจากไฟล์ logrec_*.txt ทั้งหมด เรียงตามเวลาไฟล์
+    """
+    try:
+        import glob
+        paths = sorted(glob.glob(os.path.join(out_dir, "logrec_*.txt")))
+        for fp in paths:
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    for line in f:
+                        yield line.rstrip("\n")
+            except Exception:
+                continue
+    except Exception:
+        return
+
+def read_all_rec_logs(out_dir: str = OUT_DIR) -> List[str]:
+    """
+    คืน list ของทุกบรรทัดใน log ทั้งหมด
+    """
+    return list(iter_all_rec_logs(out_dir))
 
 def _safe_pickle_load(path: str):
     """Return loaded object or None. If file corrupt, remove it and return None."""
@@ -663,6 +966,95 @@ def _append_rec_log(lines: List[str], fp: Optional[str] = None):
     except Exception:
         pass
 
+# =============== STORY-LOGGING HELPERS (ADD THIS BLOCK) ===============
+LOG_ENABLE_STORY = True
+LOG_TOPN_PER_ITEM = int(os.getenv("LOG_TOPN_PER_ITEM", "30"))
+
+# เข้ารหัสหมวดเป็นตัวเลข เพื่อทำ sequence ง่ายเวลาพรีเซนต์
+CAT_CODE = {c: i + 1 for i, c in enumerate(CATEGORY_COLS)}
+CAT_LEGEND = {i: c for c, i in CAT_CODE.items()}
+
+def _log_human_block(title: str, sections: List[Tuple[str, List[str]]]):
+    """
+    เขียน human-readable summary โดยคั่นหัวข้อด้วย ////////////////
+    sections: [(หัวข้อ, [รายการบรรทัด]), ...]
+    """
+    try:
+        ts = _fmt_th(_now_th())
+        lines = []
+        lines.append(f"[{ts}][human] //////////////////////////////// {title} ////////////////////////////////")
+        for head, items in sections:
+            lines.append(f"[{ts}][human] == {head} ==")
+            for s in items:
+                lines.append(f"[{ts}][human] - {s}")
+            lines.append(f"[{ts}][human] ------------------------------------------------------------")
+        lines.append(f"[{ts}][human] //////////////////////////////////////////////////////////////////////")
+        _append_rec_log(lines)
+    except Exception:
+        pass
+
+
+def _should_force_balanced_pair(user_id: int, user_events: pd.DataFrame, content_df: pd.DataFrame) -> Tuple[bool, Tuple[str, str]]:
+    """
+    เปิดโหมด Balanced Pair เฉพาะเมื่อ 'กำหนดไว้แบบเจาะจง user' เท่านั้น
+    (ปิด auto-detect เพื่อไม่ให้เกิด ABAB 1:1 โดยไม่ได้ตั้งใจ)
+    """
+    pair = BALANCED_PAIR_USERS.get(int(user_id))
+    if pair and len(pair) == 2:
+        # primary, secondary
+        return True, (str(pair[0]), str(pair[1]))
+    return False, ("", "")
+
+def _cat_code(cat: str) -> int:
+    return int(CAT_CODE.get(cat, 0))
+
+def _log_story(tag: str, payload: dict):
+    """เขียน log แบบ JSONL อ่านง่ายไว้เล่าเรื่อง/ดีบักภายหลัง"""
+    if not LOG_ENABLE_STORY:
+        return
+    try:
+        ts = _fmt_th(_now_th())
+        _append_rec_log([f"[{ts}][story][{tag}] {json.dumps(payload, ensure_ascii=False, default=str)}"])
+    except Exception:
+        pass
+
+def _encode_cat_seq(ids: List[int], content_df: pd.DataFrame) -> List[int]:
+    def _cat_of(pid):
+        return category_by_pid(content_df, int(pid))
+    return [_cat_code(_cat_of(pid)) for pid in ids]
+
+def _fairness_stats(order_ids: List[int], content_df: pd.DataFrame, topk: int = 20) -> Dict[str, Any]:
+    """คืนค่าสถิติ fairness แบบสั้น ๆ สำหรับโชว์สไลด์"""
+    seq = _encode_cat_seq(order_ids[:max(1, topk)], content_df)
+    # max run-length
+    max_run = 0; cur = 0; last = None
+    for c in seq:
+        if c == last:
+            cur += 1
+        else:
+            cur = 1; last = c
+        if cur > max_run:
+            max_run = cur
+    # ratio ของ top2 ภายใน window
+    cnt = defaultdict(int)
+    for c in seq:
+        cnt[c] += 1
+    pairs = sorted(cnt.items(), key=lambda x: x[1], reverse=True)
+    if len(pairs) >= 2:
+        a, b = pairs[0][1], pairs[1][1]
+        ratio = float(a) / float(max(1, b))
+        top2_codes = (pairs[0][0], pairs[1][0])
+    elif len(pairs) == 1:
+        ratio = float("inf"); top2_codes = (pairs[0][0], None)
+    else:
+        ratio = 0.0; top2_codes = (None, None)
+    return {
+        "max_run_topk": int(max_run),
+        "ratio_top2_topk": float(ratio),
+        "top2_codes": top2_codes,
+        "legend": CAT_LEGEND
+    }
+# =====================================================================
 
 def _log_recommendation(uid: int, start: int, page_size: int, return_all: bool, posts: List[dict]):
     try:
@@ -758,9 +1150,13 @@ def _load_events_all(e) -> pd.DataFrame:
 
 # =============================== IMPRESSIONS ====================================
 def _get_impressions(user_id: int) -> List[Dict]:
+    # NEW: อุ่นจากทุกไฟล์ log เข้ามาในหน่วยความจำก่อน (ครั้งเดียวต่อโปรเซส)
+    _warm_impressions_from_logs()
+
     now = datetime.utcnow()
     hist = impression_history_cache.get(user_id, [])
-    hist = [h for h in hist if (now - h["ts"]).total_seconds() < IMPRESSION_HISTORY_TTL_SECONDS]
+    # prune ตาม TTL ทุกครั้งที่อ่าน
+    hist = [h for h in hist if isinstance(h.get("ts"), datetime) and (now - h["ts"]).total_seconds() < IMPRESSION_HISTORY_TTL_SECONDS]
     impression_history_cache[user_id] = hist[-IMPRESSION_HISTORY_MAX_ENTRIES:]
     return impression_history_cache[user_id]
 
@@ -1270,7 +1666,7 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
     if content_df is None or content_df.empty:
         return []
 
-    # cache key
+    # cache key: รวม hash ของโค้ดเข้าไปด้วย
     try:
         cols_content = ["post_id", ENGAGE_COL] + list(CATEGORY_COLS)
         content_hash = _md5_of_df(content_df[cols_content], cols=cols_content)
@@ -1281,7 +1677,9 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
         events_hash = _md5_of_df(events_all[cols_events], cols=cols_events)
     except Exception:
         events_hash = _md5_of_df(events_all[["user_id","post_id"]], cols=["user_id","post_id"])
-    cache_key = f"{uid}:{content_hash}:{events_hash}"
+
+    # >>> ใส่เวอร์ชันโค้ดเข้าไป <<<
+    cache_key = f"ver={CODE_VERSION_HASH}|uid={uid}|{content_hash}|{events_hash}"
 
     with _cache_lock:
         cached = recommendation_cache.get(uid)
@@ -1306,12 +1704,13 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
     _log_stage_counts(f"uid={uid} | seen_no", seen_no)
     _log_stage_counts(f"uid={uid} | interacted", interacted)
 
-    # HYBRID คำนวณ (ตัดข้อความเพื่อความชัด)
+    # HYBRID
     precomputed_scores = None
     hybrid_override_C = None
     hybrid_override_T = None
     if USE_HYBRID:
         try:
+            # ใช้ cache_key ที่รวมเวอร์ชันโค้ดแล้ว -> ไฟล์ artifact จะไม่ปนกัน
             ensure_models_built(content_df, events_all, cache_key, cache_dir=CACHE_DIR, non_blocking=True)
         except Exception:
             pass
@@ -1396,7 +1795,7 @@ def get_hybridrecommendation_order(uid: int, use_cache: bool=True) -> List[int]:
         except Exception:
             ranked = content_df["post_id"].astype(int).tolist()
 
-    # >>> Rebalance ก่อน cache <<<
+    # >>> Rebalance ก่อน cache (ตามของเดิม) <<<
     try:
         ranked = _apply_category_rebalance(
             order=ranked,
@@ -1590,99 +1989,258 @@ def _find_swap_candidate(
     return None
 
 def _rebalance_by_category(
-    order: List[int],
-    cat_of,
+    order_ids: List[int],
+    content_df: pd.DataFrame,
+    base_scores: Optional[Dict[int, float]] = None,
+    *,
+    top_k: int = 20,
     cap_top: int = 3,
     cap_after: int = 3,
-    fairness_topk: int = FAIRNESS_TOPK,
-    fairness_pref_two: Optional[Tuple[str, str]] = None,  # (primary, secondary)
-    fairness_ratio_cap: float = FAIRNESS_RATIO_CAP,
-    fairness_alpha: float = FAIRNESS_ALPHA
+    window: int = 20,
+    ratio_cap: float = 2.0,
+    fairness_alpha: float = 0.22,     # ใช้เป็นแรงดึงเข้าหา quota + บูสต์หมวดรอง
+    penalty_big: float = 0.60,        # โทษหนักเมื่อจะเกิน run-length cap
+    penalty_ratio: float = 0.25,      # โทษเมื่อจะทำให้สัดส่วน > ratio_cap ในหน้าต่าง
+    prefer_top2_for_user: Optional[List[str]] = None,
+    log_ctx: Optional[dict] = None,
 ) -> List[int]:
-    if not order:
-        return order[:]
+    """
+    Rebalancer แบบ soft (คุม run-length + สัดส่วน + quota ภายใน Top-K) พร้อมกันแพทเทิร์น ABAB:
+      - hard-avoid: ถ้าเลือกแล้ว run-length เกิน cap ปัจจุบัน จะข้ามก่อน (และยอมเฉพาะเมื่อไม่มีตัวเลือกเลย)
+      - quota: คำนวณเป้าหมายสัดส่วนใน Top-K จากสัดส่วนของ pool ผสม uniform -> ไม่ดันหมวดบางหมวดไปท้ายกอง
+      - urgency: ถ้าช่อง Top-K ที่เหลือน้อยกว่าจำนวนที่ยัง "ขาดโควต้า" จะได้โบนัสเร่งแทรก
+      - anti-ABAB: ลดคะแนนเมื่อกำลังต่อจังหวะสลับ A-B-A-B ที่น่าเบื่อ
+    """
+    if not order_ids:
+        return []
 
-    topk = max(1, min(int(fairness_topk), len(order)))
-    head = order[:topk]
-    tail = order[topk:]
+    # ---------- post_id -> category ----------
+    pid_to_cat: Dict[int, str] = {}
+    for _, r in content_df.iterrows():
+        try:
+            pid = int(r["post_id"])
+        except Exception:
+            continue
+        vals = r[CATEGORY_COLS].to_numpy(dtype=np.float32)
+        pid_to_cat[pid] = CATEGORY_COLS[int(np.argmax(vals))] if vals.size else "Unknown"
 
-    # ---------- Step 1: run-length cap ใน head ----------
-    out_head, run_hist = [], []
-    for pid in head:
-        c = cat_of(pid)
-        if _runlen_violate(run_hist, c, cap_top):
-            swap_idx = None
-            for j in range(len(out_head), len(head)):
-                cj = cat_of(head[j])
-                if not _runlen_violate(run_hist, cj, cap_top):
-                    swap_idx = j; break
-            if swap_idx is not None:
-                pid2 = head[swap_idx]
-                out_head.append(pid2)
-                run_hist.append(cat_of(pid2))
-                head[swap_idx] = pid
-                continue
-        out_head.append(pid); run_hist.append(c)
+    # ---------- base score fallback ----------
+    if base_scores is None:
+        base_scores = {}
+        n = len(order_ids)
+        for rank, pid in enumerate(order_ids):
+            base_scores[int(pid)] = float(n - rank) / max(1.0, n)
 
-    # ---------- Step 2: สัดส่วน 2:1 ระหว่างหมวดโปรดคู่แรกใน Top-K ----------
-    if fairness_pref_two and fairness_ratio_cap > 1.0:
-        primary, secondary = fairness_pref_two
+    remaining = list(order_ids)              # คิวผู้สมัคร
+    out: List[int] = []                      # ผลลัพธ์
+    steps_log: List[Dict[str, Any]] = []     # เก็บเหตุผลรายตำแหน่ง
 
-        def _counts(seq):
-            d = defaultdict(int)
-            for x in seq: d[cat_of(x)] += 1
-            return d
+    # window ในการคุมสัดส่วน/แพทเทิร์น + สถานะ run-length
+    from collections import deque, defaultdict
+    cat_window = deque(maxlen=max(1, int(window)))
+    runlen_now = defaultdict(int)
+    last_cat: Optional[str] = None
 
-        cnts = _counts(out_head)
-        a, b = cnts.get(primary, 0), cnts.get(secondary, 0)
+    # ---------- เตรียม "quota" เป้าหมายสำหรับ Top-K ----------
+    # อิงสัดส่วนของ pool (lookahead) ผสมกับ uniform (alpha_mix) เพื่อหลีกเลี่ยง biased ไปหมวดเดียว
+    look_pool = remaining[:max(60, int(top_k))]
+    pool_cnt = defaultdict(int)
+    pool_cats = set()
+    for pid in look_pool:
+        c = pid_to_cat.get(int(pid), "Unknown")
+        pool_cnt[c] += 1
+        pool_cats.add(c)
 
-        def ratio_violate(A, B) -> bool:
-            return (B == 0 and A > 0) or (A > fairness_ratio_cap * max(1, B))
+    C = max(1, len(pool_cats))
+    N = max(1, len(look_pool))
+    p_emp = {c: float(pool_cnt[c]) / float(N) for c in pool_cats}
+    p_uni = {c: 1.0 / float(C) for c in pool_cats}
+    alpha_mix = float(min(0.6, max(0.15, fairness_alpha)))  # ผสม uniform พอควร
+    p_mix = {c: (1 - alpha_mix) * p_emp.get(c, 0.0) + alpha_mix * p_uni.get(c, 0.0) for c in pool_cats}
 
-        if ratio_violate(a, b):
-            surplus = a - int(fairness_ratio_cap * max(1, b))
-            budget_swaps = max(1, int(math.ceil(fairness_alpha * max(1, surplus))))
+    # ทำ quota เป้าหมายสำหรับ Top-K (ปัดให้รวม = top_k)
+    tgt = {c: int(round(p_mix[c] * int(top_k))) for c in pool_cats}
+    drift = int(top_k) - sum(tgt.values())
+    if drift != 0:
+        # เติม/ลบที่มี p_mix สูง/ต่ำ ตามสัญญาณ drift
+        order_c = sorted(pool_cats, key=lambda x: p_mix[x], reverse=(drift > 0))
+        i = 0
+        while drift != 0 and order_c:
+            c = order_c[i % len(order_c)]
+            tgt[c] += 1 if drift > 0 else -1
+            drift += -1 if drift > 0 else 1
+            i += 1
+    # ไม่ให้มี quota ติดลบ (กัน corner case)
+    for c in list(tgt.keys()):
+        tgt[c] = max(0, tgt[c])
 
-            i = len(out_head) - 1
-            while budget_swaps > 0 and i >= 0 and ratio_violate(a, b):
-                if cat_of(out_head[i]) == primary:
-                    # หา secondary ใน tail
-                    j_tail = None
-                    for j in range(len(tail)):
-                        if cat_of(tail[j]) == secondary and not _runlen_violate(run_hist, secondary, cap_top):
-                            j_tail = j; break
-                    if j_tail is not None:
-                        sec = tail.pop(j_tail)
-                        prim = out_head[i]
-                        out_head[i] = sec
-                        tail.insert(0, prim)  # ส่ง primary ลงไปท้ายนิดหน่อย
-                        a -= 1; b += 1
-                        budget_swaps -= 1
-                i -= 1
+    # ตัวนับการวางจริงภายใน Top-K
+    placed_topk = defaultdict(int)
 
-    # ---------- Step 3: ต่อ tail และคุม run-length หลังหัว ----------
-    out = out_head[:]
-    run_hist2 = [cat_of(x) for x in out_head][-10:]
-    for pid in tail:
-        c = cat_of(pid)
-        # soft: ถ้าเกินก็ยอมบ้างเมื่อไม่มีตัวเลือก
-        if _runlen_violate(run_hist2, c, cap_after):
-            # ลองสลับหาอันถัดไปที่ไม่ชน cap
-            swapped = False
-            for k in range(len(tail)):
-                pid2 = tail[k]
-                c2 = cat_of(pid2)
-                if not _runlen_violate(run_hist2, c2, cap_after):
-                    out.append(pid2)
-                    run_hist2.append(c2)
-                    tail[k] = pid
-                    swapped = True
-                    break
-            if swapped:
-                continue
-        out.append(pid)
-        run_hist2.append(c)
+    # ---------- helpers ----------
+    def _cap_for_pos(pos: int) -> int:
+        return int(cap_top) if pos < int(top_k) else int(cap_after)
 
+    def _ratio_hit(cnt_map: Dict[str, int], new_c: str, ratio: float) -> bool:
+        temp = cnt_map.copy()
+        temp[new_c] += 1
+        if not temp:
+            return False
+        pairs = sorted(temp.items(), key=lambda x: x[1], reverse=True)
+        if len(pairs) >= 2:
+            a, b = pairs[0][1], pairs[1][1]
+            return (b == 0 and a > 0) or (float(a) > float(ratio) * float(max(1, b)))
+        # ถ้ามีหมวดเดียวในหน้าต่างและจะยาวเกินไป ก็ถือว่าชนเล็กน้อย
+        return (len(pairs) == 1 and pairs[0][1] >= max(2, _cap_for_pos(len(out))))
+
+    def _abab_penalty(hist: deque, cand_c: str) -> float:
+        # ถ้าล่าสุดเป็น A,B,A,B แล้วกำลังจะต่อ A หรือ B ให้เพนัลตี้เล็กน้อย
+        if len(hist) < 4:
+            return 0.0
+        h = list(hist)[-4:]
+        if h[0] == h[2] and h[1] == h[3] and h[0] != h[1]:
+            if cand_c in (h[-1], h[-2]) and cand_c != h[-3]:
+                return 1.0
+        return 0.0
+
+    # ---------- main loop ----------
+    pos = 0
+    while remaining:
+        cap_now = _cap_for_pos(pos)
+        lookahead = remaining[:60]
+
+        # นับสัดส่วนในหน้าต่างตอนนี้ (ใช้คุม ratio_cap)
+        cnt_now = defaultdict(int)
+        for c in cat_window:
+            cnt_now[c] += 1
+
+        best_j = None
+        best_score = -1e9
+        best_dbg = {
+            "pen_runlen": False,
+            "pen_ratio": False,
+            "pen_abab": False,
+            "boost_secondary": False,
+            "bonus_quota": 0.0,
+            "bonus_urgency": 0.0,
+            "base": 0.0,
+            "score": 0.0,
+            "cap_now": int(cap_now),
+        }
+        any_feasible = False   # มีตัวเลือกที่ไม่ชน cap run-length หรือไม่
+
+        # ช่อง Top-K ที่เหลือ (ใช้คิด urgency)
+        slots_left_topk = max(0, int(top_k) - pos)
+
+        for j, pid in enumerate(lookahead):
+            c = pid_to_cat.get(int(pid), "Unknown")
+            base = float(base_scores.get(int(pid), 0.0))
+
+            # 1) hard-avoid run-length ถ้าเกิน cap (ยกเว้นไม่มีตัวอื่นให้เลือก)
+            next_run = runlen_now[c] + 1 if c == last_cat else 1
+            hit_run = (cap_now > 0 and next_run > cap_now)
+
+            # 2) ratio window penalty
+            hit_ratio = _ratio_hit(cnt_now, c, float(ratio_cap))
+
+            # 3) anti-ABAB
+            pen_abab = _abab_penalty(cat_window, c)
+
+            # 4) quota & urgency (เฉพาะในช่วง Top-K เท่านั้น)
+            quota_bonus = 0.0
+            urgency_bonus = 0.0
+            if pos < int(top_k):
+                need = int(tgt.get(c, 0)) - int(placed_topk.get(c, 0))
+                if need > 0:
+                    # ดึงเข้าหา quota
+                    quota_bonus = float(fairness_alpha) * float(need)
+                    # ถ้าใกล้หมดสลอต Top-K แต่ยังขาด → เร่งให้ขึ้นก่อน
+                    if slots_left_topk > 0:
+                        urgency = max(0.0, float(need) / float(slots_left_topk))
+                        # scale เบาๆ กันกระโดดแรงเกิน
+                        urgency_bonus = 0.5 * float(fairness_alpha) * urgency
+
+            # 5) balanced-pair secondary boost (คงของเดิม)
+            boosted = False
+            if prefer_top2_for_user and len(prefer_top2_for_user) >= 2:
+                if c == prefer_top2_for_user[1]:
+                    quota_bonus += float(max(0.0, fairness_alpha))  # รวมกับ quota_bonus ไปเลย
+                    boosted = True
+
+            # รวมคะแนน
+            score = base \
+                    - (penalty_big if hit_run else 0.0) \
+                    - (penalty_ratio if hit_ratio else 0.0) \
+                    - (0.20 * pen_abab) \
+                    + quota_bonus + urgency_bonus
+
+            # ถือว่า "feasible" ถ้าไม่ชน run-length cap ตอนนี้
+            if not hit_run:
+                any_feasible = True
+
+            # เลือกคะแนนดีที่สุด (ยังไม่ยอมของที่ชน run เว้นไม่มีตัวเลือก)
+            prefer = (not hit_run) if any_feasible else True
+            if best_j is None or (prefer and score > best_score) or (not any_feasible and score > best_score):
+                best_j = j
+                best_score = score
+                best_dbg = {
+                    "pen_runlen": bool(hit_run),
+                    "pen_ratio": bool(hit_ratio),
+                    "pen_abab": bool(pen_abab > 0.0),
+                    "boost_secondary": bool(boosted),
+                    "bonus_quota": float(quota_bonus),
+                    "bonus_urgency": float(urgency_bonus),
+                    "base": float(base),
+                    "score": float(score),
+                    "cap_now": int(cap_now),
+                }
+
+        # ถ้าไม่มีตัวเลือกที่ไม่ชน run-length เลย → ยอมผ่อนปรน โดยเลือกตัวที่ "ชนแต่น้อยสุด" (best_j ที่คำนวณไว้)
+        if best_j is None:
+            pid = remaining.pop(0)
+        else:
+            pid = remaining.pop(best_j)
+
+        # อัปเดตสถานะและบันทึกเหตุผล
+        c = pid_to_cat.get(int(pid), "Unknown")
+        out.append(int(pid))
+
+        if c == last_cat:
+            runlen_now[c] += 1
+        else:
+            runlen_now = defaultdict(int)
+            runlen_now[c] = 1
+            last_cat = c
+
+        cat_window.append(c)
+        if pos < int(top_k):
+            placed_topk[c] += 1
+
+        try:
+            steps_log.append({
+                "pos": pos + 1,
+                "pid": int(pid),
+                "cat": c,
+                "cat_code": _cat_code(c),
+                **best_dbg
+            })
+        except Exception:
+            pass
+
+        pos += 1
+
+    # story logs ออกไปให้ดีบั๊กต่อได้
+    if isinstance(log_ctx, dict):
+        log_ctx.setdefault("rebalance", {})
+        log_ctx["rebalance"]["steps"] = steps_log
+        log_ctx["rebalance"]["params"] = {
+            "top_k": int(top_k),
+            "cap_top": int(cap_top),
+            "cap_after": int(cap_after),
+            "window": int(window),
+            "ratio_cap": float(ratio_cap),
+            "alpha": float(fairness_alpha),
+        }
     return out
 
 def _apply_category_rebalance(
@@ -1697,15 +2255,16 @@ def _apply_category_rebalance(
     fairness_alpha: float = FAIRNESS_ALPHA
 ) -> List[int]:
     """
-    ใช้ rebalancer 'เวอร์ชันใหม่' ที่มี signature:
-      _rebalance_by_category(order_ids, content_df, base_scores=None, *,
-                             top_k, cap_top, cap_after, window, ratio_cap,
-                             fairness_alpha, prefer_top2_for_user)
+    ใช้ rebalancer 'เวอร์ชันใหม่' และรองรับโหมด Balanced Pair (Electronics ↔ Beauty) แบบ 1:1:
+      - ถ้า user ชอบทั้ง 2 หมวด (อัตโนมัติจากโปรไฟล์ Top-2) หรือถูกระบุใน BALANCED_PAIR_USERS:
+          * cap_top = 1 (บังคับสลับใน Top-K)
+          * fairness_ratio_cap = 1.0
+          * fairness_alpha >= BALANCED_PAIR_ALPHA
+          * prefer_top2_for_user = (primary, secondary) ที่มาจากโปรไฟล์/ตั้งค่า
 
-    ขั้นตอน:
-      - คำนวณโปรไฟล์หมวดของผู้ใช้ -> เลือกหมวดโปรด 2 อันดับแรก (primary/secondary)
-      - เรียก rebalancer โดยตั้งค่า fairness ใน Top-K และ window = fairness_topk
-      - logging พารามิเตอร์ที่ใช้
+      - บันทึก log parameters ที่ใช้จริง
+
+    หมายเหตุ: ถ้าไม่เข้าโหมด Balanced Pair จะใช้ค่าปกติจาก config
     """
     try:
         # เตรียม user events (ถ้ายังไม่ได้ส่งมา)
@@ -1713,14 +2272,16 @@ def _apply_category_rebalance(
             e = _eng()
             events_all = _load_events_all(e)
             user_events = events_all[events_all["user_id"] == int(user_id)]
+        else:
+            events_all = None  # ไม่จำเป็นต้องโหลดซ้ำ
 
-        # โปรไฟล์หมวดของ user -> top2 หมวดที่ชอบ
+        # โปรไฟล์หมวด -> Top2 เริ่มต้น (ปกติ)
         prof = _user_category_profile(int(user_id), user_events, content_df)
         if prof is not None and prof.size >= 2:
             top2_idx = np.argsort(prof)[::-1][:2]
             prefer_top2 = [CATEGORY_COLS[int(top2_idx[0])], CATEGORY_COLS[int(top2_idx[1])]]
         else:
-            # fallback: ดูสัดส่วนหมวดในลิสต์ head
+            # fallback: นับจากหัวลิสต์เดิม
             def _cat_of(pid: int) -> str:
                 return category_by_pid(content_df, int(pid))
             cnt = defaultdict(int)
@@ -1734,23 +2295,43 @@ def _apply_category_rebalance(
             else:
                 prefer_top2 = [CATEGORY_COLS[0], CATEGORY_COLS[0]]
 
-        _append_rec_log([f"[{_fmt_th(_now_th())}][rebalance] total={len(order)} "
-                         f"caps=(top:{cap_top}, after:{cap_after}) top_k={fairness_topk} "
-                         f"pref_two=({prefer_top2[0]}, {prefer_top2[1]}) "
-                         f"ratio_cap={fairness_ratio_cap} alpha={fairness_alpha}"])
+        # ตรวจว่าจะเข้าโหมด Balanced Pair หรือไม่
+        enabled_balanced, pair_from_checker = _should_force_balanced_pair(int(user_id), user_events, content_df)
 
-        # เรียก rebalancer 'เวอร์ชันใหม่' ด้วยพารามิเตอร์ที่ถูกต้อง
+        cap_top_use   = int(cap_top)
+        cap_after_use = int(cap_after)
+        ratio_cap_use = float(fairness_ratio_cap)
+        alpha_use     = float(fairness_alpha)
+        prefer_use    = prefer_top2
+
+        if enabled_balanced:
+            # บังคับค่าเฉพาะโหมด balanced
+            cap_top_use   = min(cap_top_use, int(BALANCED_PAIR_CAP_TOP))
+            ratio_cap_use = min(ratio_cap_use, float(BALANCED_PAIR_RATIO_CAP))
+            alpha_use     = max(alpha_use, float(BALANCED_PAIR_ALPHA))
+            # จัดคู่ตาม checker (จะเรียง primary=ที่ user ชอบกว่า)
+            if pair_from_checker and pair_from_checker[0] and pair_from_checker[1]:
+                prefer_use = [pair_from_checker[0], pair_from_checker[1]]
+
+        # Log parameters ก่อนเรียก rebalancer
+        _append_rec_log([f"[{_fmt_th(_now_th())}][rebalance] total={len(order)} "
+                         f"caps=(top:{cap_top_use}, after:{cap_after_use}) top_k={fairness_topk} "
+                         f"pref_two=({prefer_use[0]}, {prefer_use[1]}) "
+                         f"ratio_cap={ratio_cap_use} alpha={alpha_use} "
+                         f"balanced_pair={'on' if enabled_balanced else 'off'}"])
+
+        # เรียก rebalancer
         out = _rebalance_by_category(
             order_ids=order,
             content_df=content_df,
-            base_scores=None,                     # ให้ rebalancerคำนวน default เอง หรือจะส่ง base_scores ก็ได้
+            base_scores=None,
             top_k=int(fairness_topk),
-            cap_top=int(cap_top),
-            cap_after=int(cap_after),
-            window=int(fairness_topk),            # ให้หน้าต่าง fairness เท่ากับ Top-K
-            ratio_cap=float(fairness_ratio_cap),
-            fairness_alpha=float(fairness_alpha),
-            prefer_top2_for_user=prefer_top2      # ส่ง [primary, secondary]
+            cap_top=int(cap_top_use),
+            cap_after=int(cap_after_use),
+            window=int(fairness_topk),
+            ratio_cap=float(ratio_cap_use),
+            fairness_alpha=float(alpha_use),
+            prefer_top2_for_user=prefer_use
         )
         return out
 
@@ -1758,19 +2339,32 @@ def _apply_category_rebalance(
         _append_rec_log([f"[{_fmt_th(_now_th())}][rebalance][WARN] fallback (skip) due to {ex}"])
         return order
 
-def _mmr_select(candidates: List[int], scores: Dict[int,float], simfunc, lam: float, k: int) -> List[int]:
+def _mmr_select(candidates: List[int], scores: Dict[int,float], simfunc, lam: float, k: int, log_cb=None) -> List[int]:
+    """
+    เพิ่ม log_cb: callback(dict) ต่อรอบที่เลือก เช่น {"chosen":pid,"pos":n,"mmr":v,"rel":r,"div":d}
+    """
     selected = []
     cand = list(dict.fromkeys(candidates))  # de-dupe preserve order
     while cand and len(selected) < k:
         best_id, best_val = None, -1e9
+        best_rel, best_div = 0.0, 0.0
         for pid in cand:
             rel = scores.get(pid, 0.0)
             div = max(simfunc(pid, s) for s in selected[-MMR_MAX_REF:]) if selected else 0.0
             val = lam*rel - (1-lam)*div
             if val > best_val:
-                best_val = val; best_id = pid
-        if best_id is None: break
+                best_val, best_id, best_rel, best_div = val, pid, rel, div
+        if best_id is None:
+            break
         selected.append(best_id)
+        if callable(log_cb):
+            try:
+                log_cb({
+                    "chosen": int(best_id), "pos": len(selected),
+                    "mmr": float(best_val), "rel": float(best_rel), "div": float(best_div)
+                })
+            except Exception:
+                pass
         cand = [x for x in cand if x != best_id]
     return selected
 
@@ -1985,13 +2579,17 @@ def _rank(
     hybrid_override_T: Optional[Dict[int, float]] = None
 ) -> List[int]:
     """
-    เวอร์ชันปรับใหม่:
-      - กระจายหมวดแบบ soft-constraint ทั้งลิสต์หลัก (top20+tail) ด้วย _rebalance_by_category
-      - interacted_tail อยู่ท้ายจริง ๆ, cool_tail ท้ายสุด
-      - ทำทั้งหมดนี้ 'ก่อน' _inject_new_today (เรียก rebalancerใน _rank; inject ทำใน handler)
+    เวอร์ชันปรับใหม่ + story logs:
+      - gating เหตุผล (CAT/TEXT/ENG) สำหรับ top20 candidates
+      - STRICT GATE: ต้องผ่าน CAT & TEXT & ENG; ถ้าไม่มีใครผ่านครบ -> fallback ปกติ
+      - BOOST: ถ้ามี strict ผ่านครบ จะบูสต์ base_score ให้กลุ่มนี้ขึ้นก่อน
+      - MMR เลือก 20 ตัว พร้อม log rel/div/mmr ต่ออันดับ
+      - soft re-balance (มีเหตุผลต่อ pos)
+      - cooldown/seen penalty สรุปจำนวน
     """
     now = datetime.utcnow()
     TEXT_GATE = 0.40
+    STRICT_GATE_BONUS = 0.28  # << บูสต์สำหรับโพสต์ที่ผ่านครบ 3 เกต
 
     # เตรียมเวกเตอร์/โปรไฟล์เพื่อคำนวณ E/C/F/T/R
     _vectorize_texts(content_df)
@@ -2068,7 +2666,7 @@ def _rank(
 
     pool_primary = _drop_forbidden(list(dict.fromkeys([*unseen, *seen_no])))
 
-    # สร้าง top20 candidates ด้วย gate พื้นฐาน (C/T + engagement)
+    # ============== GATING (CAT/TEXT/ENG) + STORY LOG ==============
     def _cat_of(pid: int) -> str:
         return category_by_pid(content_df, pid)
     def _eng_val(pid: int) -> float:
@@ -2077,24 +2675,89 @@ def _rank(
         except Exception:
             return 0.0
 
-    top20_cands = []
+    gating_logs = []
+    strict_cands, or_cands = [], []  # STRICT = CAT&TEXT&ENG ; OR = (CAT or TEXT) & ENG
     thr_map = ptiles.get(str(ENG_PCTL_TOP20), {}) or {}
     for pid in pool_primary:
         c, t = scores_C.get(pid, 0.0), scores_T.get(pid, 0.0)
         cat  = _cat_of(pid)
         thr  = float(thr_map.get(cat, thr_map.get("__global__", 0.0)))
-        if (c >= CAT_MATCH_TOP20 or t >= TEXT_GATE) and _eng_val(pid) >= thr:
-            top20_cands.append(pid)
+        eok  = (_eng_val(pid) >= thr)
+        cat_ok = (c >= CAT_MATCH_TOP20)
+        txt_ok = (t >= TEXT_GATE)
 
-    if len(top20_cands) < 20:
-        relax = sorted([p for p in pool_primary if p not in top20_cands],
-                       key=lambda x: (scores_C.get(x, 0.0), scores_T.get(x, 0.0), base_score.get(x, 0.0)),
-                       reverse=True)
-        cand_for_top20 = list(dict.fromkeys([*top20_cands, *relax]))
+        pass_strict = bool(cat_ok and txt_ok and eok)
+        pass_or     = bool((cat_ok or txt_ok) and eok)
+
+        if pass_strict:
+            strict_cands.append(pid)
+        elif pass_or:
+            or_cands.append(pid)
+
+        if len(gating_logs) < LOG_TOPN_PER_ITEM:
+            gating_logs.append({
+                "pid": int(pid), "cat": cat, "cat_code": _cat_code(cat),
+                "C": float(c), "T": float(t), "E": float(_eng_val(pid)),
+                "thr_E": float(thr),
+                "pass_CAT": bool(cat_ok), "pass_TEXT": bool(txt_ok), "pass_ENG": bool(eok),
+                "pass_STRICT": bool(pass_strict),   # << เพิ่มฟิลด์ strict
+                "passed_or": bool(pass_or),
+                "base": float(base_score.get(pid, 0.0)),
+            })
+
+    gating_mode = "strict+fallback" if len(strict_cands) > 0 else "fallback-normal"
+    try:
+        _log_story("gating", {
+            "uid": int(user_id),
+            "topk": 20,
+            "mode": gating_mode,
+            "strict_count": len(strict_cands),
+            "or_count": len(or_cands),
+            "logs": gating_logs,
+            "legend": CAT_LEGEND
+        })
+    except Exception:
+        pass
+
+    # ถ้ามี STRICT candidates -> บูสต์ + จัดให้มาก่อน; ถ้าไม่มี -> ใช้ fallback ปกติ
+    if len(strict_cands) > 0:
+        # บูสต์ base_score ให้กลุ่มที่ผ่านครบ 3 เกต
+        for pid in strict_cands:
+            base_score[int(pid)] = float(base_score.get(int(pid), 0.0)) + float(STRICT_GATE_BONUS)
+
+        # จัดลำดับ candidate สำหรับ Top20: STRICT -> OR -> ที่เหลือ
+        strict_set = set(strict_cands)
+        or_set     = set(or_cands)
+        rest = [p for p in pool_primary if p not in strict_set and p not in or_set]
+        # ภายในแต่ละกลุ่มเรียงตาม base_score ลดหลั่น
+        strict_sorted = sorted(strict_cands, key=lambda x: base_score.get(x, 0.0), reverse=True)
+        or_sorted     = sorted(or_cands,     key=lambda x: base_score.get(x, 0.0), reverse=True)
+        rest_sorted   = sorted(rest,         key=lambda x: base_score.get(x, 0.0), reverse=True)
+        cand_for_top20 = list(dict.fromkeys([*strict_sorted, *or_sorted, *rest_sorted]))
     else:
-        cand_for_top20 = top20_cands
+        # Fallback ปกติ (เท่าเดิม): ใช้ OR-gated เป็นแกน ถ้าน้อยกว่า 20 ก็เติมด้วยตัวคะแนนสูง
+        if len(or_cands) < 20:
+            relax = sorted([p for p in pool_primary if p not in set(or_cands)],
+                           key=lambda x: (scores_C.get(x, 0.0), scores_T.get(x, 0.0), base_score.get(x, 0.0)),
+                           reverse=True)
+            cand_for_top20 = list(dict.fromkeys([*or_cands, *relax]))
+        else:
+            cand_for_top20 = or_cands
 
-    # MMR เลือก top20 เบื้องต้น (ยังไม่บังคับ run-length ที่นี่)
+    # ============== MMR (with per-step log) ==============
+    mmr_logs = []
+    def _mmr_cb(evt: dict):
+        if len(mmr_logs) < LOG_TOPN_PER_ITEM:
+            mmr_logs.append({
+                "pos": int(evt.get("pos", 0)),
+                "pid": int(evt.get("chosen", 0)),
+                "cat": _cat_of(int(evt.get("chosen", 0))),
+                "cat_code": _cat_code(_cat_of(int(evt.get("chosen", 0)))),
+                "mmr": float(evt.get("mmr", 0.0)),
+                "rel": float(evt.get("rel", 0.0)),
+                "div": float(evt.get("div", 0.0)),
+            })
+
     def sim(a, b):
         ia, ib = _postidx.get(a, -1), _postidx.get(b, -1)
         if ia < 0 or ib < 0: return 0.0
@@ -2103,9 +2766,13 @@ def _rank(
         den = np.linalg.norm(va.data) * np.linalg.norm(vb.data) if va.nnz and vb.nnz else 0.0
         return num/den if den>0 else 0.0
 
-    top20_raw = _mmr_select(cand_for_top20, base_score, sim, MMR_LAMBDA, k=20)
-
+    top20_raw = _mmr_select(cand_for_top20, base_score, sim, MMR_LAMBDA, k=20, log_cb=_mmr_cb)
     chosen = set(top20_raw)
+
+    try:
+        _log_story("mmr", {"uid": int(user_id), "lambda": float(MMR_LAMBDA), "steps": mmr_logs})
+    except Exception:
+        pass
 
     # tail (ยังไม่รวม interacted/cooldown)
     all_ids = content_df["post_id"].astype(int).tolist()
@@ -2118,14 +2785,16 @@ def _rank(
         rest_candidates.append(pid)
     tail = sorted(rest_candidates, key=lambda x: base_score.get(x, 0.0), reverse=True)
 
-    # ---- NEW: ทำ soft re-balance สำหรับ (top20_raw + tail) ทั้งชุด ----
+    # ---- soft re-balance (top20 + tail)
     main_before = top20_raw + tail
+    rb_ctx = {}
     main_after  = _rebalance_by_category(
-        main_before, content_df, base_score,
-        cap_top=RUNLEN_CAP_TOP20, cap_after=RUNLEN_CAP_AFTER, top_k=20
+        order_ids=main_before, content_df=content_df, base_scores=base_score,
+        cap_top=RUNLEN_CAP_TOP20, cap_after=RUNLEN_CAP_AFTER, top_k=20,
+        log_ctx=rb_ctx
     )
 
-    # ส่วนที่เหลือ
+    # ส่วน interacted/cooldown ท้าย
     interacted_tail = [pid for pid in interacted
                        if pid not in set(main_after)
                        and pid not in cooldown_ids
@@ -2138,7 +2807,24 @@ def _rank(
     cool_tail = sorted(cool_tail, key=lambda x: base_score.get(x, 0.0), reverse=True)
 
     order = main_after + interacted_tail + cool_tail
+
+    # STORY สรุป cooldown/penalty และ fairness
+    try:
+        _log_story("rank.final", {
+            "uid": int(user_id),
+            "cooldown_count": len(cooldown_ids),
+            "interacted_tail": interacted_tail[:LOG_TOPN_PER_ITEM],
+            "order_head": order[:LOG_TOPN_PER_ITEM],
+            "cat_seq_head": _encode_cat_seq(order[:LOG_TOPN_PER_ITEM], content_df),
+            "fairness": _fairness_stats(order, content_df, topk=20),
+            "rebalance_params": rb_ctx.get("rebalance", {}).get("params", {}),
+            "gating_mode": gating_mode,
+        })
+    except Exception:
+        pass
+
     return [int(x) for x in dict.fromkeys(order)]
+
 
 def _split_to_unseen_seenno_interacted(uid: int, content_df: pd.DataFrame, events_all: pd.DataFrame):
     """
@@ -2178,6 +2864,12 @@ def _split_to_unseen_seenno_interacted(uid: int, content_df: pd.DataFrame, event
 # ที่นี่สมมติคุณจะใช้ @app.route('/ai/recommend', methods=['POST'])
 @verify_token
 def ai_recommend_handler():
+    """
+    เพิ่ม story log ส่วน header เพื่อ snapshot config/weights และท้ายสุดสรุป pipeline
+    """
+    
+    if _HEALTH.get("reloading"):
+        return jsonify({"error": "Service is reloading, please retry in a moment."}), 503
     try:
         body = _safe_get_body()
 
@@ -2195,7 +2887,6 @@ def ai_recommend_handler():
         page_size  = max(1, min(page_size, 100))
         refresh    = _as_bool(body.get("refresh") or request.args.get("refresh"), False)
 
-        # ดีฟอลต์คืนทั้งหมด ถ้าไม่ส่ง all
         return_all = _as_bool(body.get("all") or request.args.get("all"), True)
         debug      = _as_bool(body.get("debug") or request.args.get("debug"), False)
 
@@ -2203,14 +2894,54 @@ def ai_recommend_handler():
             with _cache_lock:
                 recommendation_cache.pop(uid, None)
 
-        # 1) จัดอันดับหลัก (ไม่มี zone21 ใน _rank แล้ว)
+        # HEADER STORY: snapshot config/weights
+        try:
+            e = _eng()
+            content_df = _load_content_view(e)
+            events_all = _load_events_all(e)
+            _log_story("request.header", {
+                "uid": int(uid),
+                "code_hash": CODE_VERSION_HASH,
+                "weights": {
+                    "hybrid": HYBRID_WEIGHTS,
+                    "rank": {"E": WEIGHT_E, "C": WEIGHT_C, "F": WEIGHT_F, "T": WEIGHT_T, "R": WEIGHT_R},
+                    "map_hybrid_to_rank": bool(MAP_HYBRID_TO_RANK)
+                },
+                "fairness": {
+                    "topk": int(FAIRNESS_TOPK),
+                    "cap_top": int(RUNLEN_CAP_TOP20),
+                    "cap_after": int(RUNLEN_CAP_AFTER),
+                    "ratio_cap": float(FAIRNESS_RATIO_CAP),
+                    "alpha": float(FAIRNESS_ALPHA),
+                },
+                "inject": {
+                    "positions": "random(21-30)",  # << เปลี่ยน Log: บอกว่าใช้สุ่ม
+                    "window_h": 24
+                },
+                "ttl": {
+                    "use_ttl_seen": bool(USE_TTL_SEEN),
+                    "history_ttl_sec": int(IMPRESSION_HISTORY_TTL_SECONDS),
+                    "cooldown_sec": int(NO_SHOW_COOLDOWN_SECONDS),
+                    "seen_penalty_alpha": float(SEEN_PENALTY_ALPHA),
+                    "half_life_sec": int(SEEN_HALF_LIFE_SECONDS)
+                },
+                "data_sizes": {
+                    "content_rows": int(len(content_df)),
+                    "events_rows": int(len(events_all))
+                },
+                "legend": CAT_LEGEND
+            })
+        except Exception:
+            pass
+
+        # 1) อันดับหลัก
         ids_all = get_hybridrecommendation_order(uid, use_cache=(not refresh))
         total   = len(ids_all)
 
-        # 2) ฉีด "โพสต์ใหม่ใน 24 ชม." เข้า slot 21–30 ที่นี่ "ที่เดียว"
-        ids_all = _inject_new_today(ids_all, uid, positions=(22, 26, 29), hours=24)
+        # 2) inject โพสต์ใหม่เข้า slot 21–30 (สุ่มตำแหน่งอัตโนมัติ)
+        ids_all = _inject_new_today(ids_all, uid, positions=None, hours=24)  # << เปลี่ยนตรงนี้
 
-        # 3) เลือก candidate ids สำหรับ fetch (กันดรอปเพราะ status/self-post)
+        # 3) candidates สำหรับ fetch (กันดรอป inactive/self)
         def _candidate_ids_for_page(ids_all: List[int], start: int, page_size: int) -> List[int]:
             if return_all:
                 seen=set(); out=[]
@@ -2218,7 +2949,7 @@ def ai_recommend_handler():
                     if p not in seen:
                         out.append(p); seen.add(p)
                 return out
-            # เก็บมากกว่าหน้าจริง 2.5x เผื่อดรอป self-post และ inactive
+            # over-fetch 2.5x กันดรอป
             seen=set(); out=[]
             i = max(0, start)
             target = int(page_size * (2.5 if not INCLUDE_SELF_POSTS_IN_FEED else 2.0))
@@ -2232,7 +2963,7 @@ def ai_recommend_handler():
         cand_ids = _candidate_ids_for_page(ids_all, start, page_size)
         posts = fetch_posts_by_ids(cand_ids, uid)
 
-        # 4) page cut ตามลำดับจริง
+        # 4) page cut
         if not return_all:
             mp = {int(p["id"]): p for p in posts}
             page_posts, i, seen_page = [], start, set()
@@ -2243,21 +2974,42 @@ def ai_recommend_handler():
                 i += 1
             posts = page_posts
 
-        # -------- LOG ลงไฟล์ --------
+        # LOG เดิม: segments/order
         _log_recommendation(uid=uid, start=start, page_size=page_size,
                             return_all=return_all, posts=posts)
 
-        # สำคัญ: ไม่ mark seen ที่นี่
-        if SEEN_ACCESS_SUMMARY_ON_RECOMMEND and refresh:
-            cnt = _seen_pop_count()
-            if cnt > 0:
-                try:
-                    from zoneinfo import ZoneInfo
-                    now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
-                    ts = now_th.strftime("%Y-%m-%d %H:%M:%S ICT")
-                except Exception:
-                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{ts}] suppressed /ai/seen access logs: {cnt} lines since last refresh")
+        # [ADD] HUMAN-READABLE SUMMARY (คั่นด้วย //////////////// ให้อ่านไว)
+        try:
+            e = _eng()
+            content_df_hr = _load_content_view(e)
+            events_all_hr = _load_events_all(e)
+            user_events_hr = events_all_hr[events_all_hr["user_id"] == int(uid)] if "user_id" in events_all_hr.columns else events_all_hr.iloc[:0]
+            enabled_balanced, pair_used = _should_force_balanced_pair(int(uid), user_events_hr, content_df_hr)
+
+            cat_seq_20 = _encode_cat_seq(ids_all[:20], content_df_hr)
+            cat_seq_10 = _encode_cat_seq(ids_all[:10], content_df_hr)
+
+            sections = [
+                ("Who & Request",
+                 [f"uid={uid} start={start} page_size={page_size} return_all={return_all}",
+                  f"total_candidates={total} returned={len(posts)}"]),
+
+                ("Fairness Params (final-use)",
+                 [f"balanced_pair={'ON' if enabled_balanced else 'OFF'} pair={pair_used if enabled_balanced else '-'}",
+                  f"top_k={FAIRNESS_TOPK} cap_top={(BALANCED_PAIR_CAP_TOP if enabled_balanced else RUNLEN_CAP_TOP20)} "
+                  f"cap_after={RUNLEN_CAP_AFTER} ratio_cap={(BALANCED_PAIR_RATIO_CAP if enabled_balanced else FAIRNESS_RATIO_CAP)} "
+                  f"alpha={(max(FAIRNESS_ALPHA, BALANCED_PAIR_ALPHA) if enabled_balanced else FAIRNESS_ALPHA)}"]),
+
+                ("Top20 Category Seq (codes)",
+                 [",".join(map(str, cat_seq_20))]),
+                ("Top10 Category Seq (codes)",
+                 [",".join(map(str, cat_seq_10))]),
+                ("Top IDs (head)",
+                 [",".join(map(str, ids_all[:min(LOG_TOPN_PER_ITEM, len(ids_all))]))]),
+            ]
+            _log_human_block("RECSYS SUMMARY", sections)
+        except Exception:
+            pass
 
         if debug:
             return jsonify({
@@ -2286,57 +3038,36 @@ def ai_recommend_handler():
         _append_rec_log([f"[{ts}][/ai/recommend][ERROR] {ex} {traceback.format_exc()}"])
         return jsonify({"error": "Internal Server Error"}), 500
 
+
 def _inject_new_today(
     ids_all: List[int],
     user_id: int,
-    positions: Tuple[int, ...] = (22, 26, 29),
+    positions: Optional[Tuple[int, ...]] = None,  # << เปลี่ยน: อนุญาต None เพื่อให้สุ่ม
     hours: int = 24,
     insert_cap: Optional[int] = None
 ) -> List[int]:
     """
-    แทรก 'โพสต์ใหม่ภายใน N ชั่วโมง' โดยดูเวลา/สถานะจากตาราง POSTS_TABLE (posts) โดยตรง
-    เกณฑ์คัดเลือก:
-      - created_at/updated_at ใน posts อยู่ภายในหน้าต่างเวลาที่กำหนด (ดีฟอลต์ 24 ชั่วโมง, โซนเวลาไทย)
-      - ผู้ใช้ยังไม่เคยเห็น (ดูจาก blocklist ที่จะถูกเติมเมื่อเรียก /ai/seen)
-      - ผู้ใช้ยังไม่มี interaction ใด ๆ กับโพสต์นั้น
-      - ไม่ใช่โพสต์ที่ผู้ใช้เป็นเจ้าของเอง (ถ้า INCLUDE_SELF_POSTS_IN_FEED=False)
-      - สถานะโพสต์ 'active' (หรือถ้าคอลัมน์ status ไม่มี/เป็น NULL จะไม่ตัดทิ้ง)
-
-    ถ้าผู้สมัคร > NEW_INSERT_MAX:
-      - สุ่มแบบถ่วงน้ำหนัก (roulette) โดยให้น้ำหนักมาจาก:
-          w = 0.65*base_score_norm + 0.25*engagement_norm + 0.10*recency_norm
-        ซึ่ง base_score_norm มาจากสกอร์คำนวณปกติ (_compute_basescore_for),
-        engagement_norm มาจากคอลัมน์ ENGAGE_COL ใน content view,
-        recency_norm มาจากอายุโพสต์ในหน้าต่าง (ใหม่กว่า = คะแนนสูงกว่า)
-      - เลือกแบบ “without replacement” ให้ได้ไม่เกิน NEW_INSERT_MAX ตัว
-
-    หมายเหตุ:
-      - เมื่อโพสต์ถูกแสดงและผู้ใช้เรียก /ai/seen แล้ว จะถูกบันทึกใน
-        new_injected_seen_blocklist[user_id] ทำให้รอบต่อไปไม่ถูกบังคับแทรกอีก
-      - ตำแหน่งแทรกยังเป็น positions ที่กำหนดไว้
+    แทรก 'โพสต์ใหม่' พร้อม story log: รายชื่อ candidates + น้ำหนัก base/eng/recency + chosen
+    - ถ้า positions=None => จะ 'สุ่ม' ตำแหน่งช่วง 21–30 (1-based) ตาม seed รายวันของ user
+    - ถ้า positions ถูกส่งมา (tuple ของเลข 1-based) จะใช้ตามนั้น
     """
     try:
         e = _eng()
 
-        # ---------- โหลด data ที่จำเป็น ----------
-        content_df = _load_content_view(e)          # ใช้เพื่อดึง ENGAGE_COL / category ฯลฯ
-        events_all = _load_events_all(e)            # ใช้ฟิลเตอร์ interacted
-        valid_content_ids = set(pd.to_numeric(content_df["post_id"], errors="coerce").dropna().astype(int).tolist())
+        content_df = _load_content_view(e)
+        events_all = _load_events_all(e)
 
-        # interaction ของ user (ทุกชนิดที่อยู่ใน ACTION_WEIGHT)
         ev_user = events_all[events_all.get("user_id") == int(user_id)] if "user_id" in events_all.columns else events_all.iloc[:0]
         interacted_set = set(pd.to_numeric(ev_user.get("post_id"), errors="coerce").dropna().astype(int).tolist()) if not ev_user.empty else set()
 
-        # blocklist จากการเห็นแล้ว (ถูกเติมโดย /ai/seen)
         seen_block = new_injected_seen_blocklist.get(int(user_id), set()).copy()
 
-        # self posts (ไม่นำมา inject ถ้า flag ปิด)
         try:
             self_posts = set(_get_authored_ids(e, int(user_id)))
         except Exception:
             self_posts = set()
 
-        # โซนเวลาไทย + cutoff window
+        # เวลา TH สำหรับหน้าต่างโพสต์ใหม่
         try:
             from zoneinfo import ZoneInfo
             now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
@@ -2344,8 +3075,7 @@ def _inject_new_today(
             now_th = datetime.utcnow() + timedelta(hours=7)
         cutoff = now_th - timedelta(hours=int(hours))
 
-        # ---------- ดึง timestamp จาก 'posts' โดยตรง ----------
-        # เลือกเฉพาะ id, user_id, created_at, updated_at, status
+        # โหลด posts table เบื้องต้น
         try:
             sql = sqltext(f"""
                 SELECT id, user_id, created_at, updated_at, status
@@ -2355,16 +3085,14 @@ def _inject_new_today(
         except Exception:
             posts_df = pd.DataFrame(columns=["id","user_id","created_at","updated_at","status"])
 
-        # ทำความสะอาดชนิดข้อมูล
-        if not posts_df.empty:
-            posts_df["id"] = pd.to_numeric(posts_df["id"], errors="coerce").astype("Int64")
-            posts_df = posts_df.dropna(subset=["id"]).copy()
-            posts_df["id"] = posts_df["id"].astype(int)
-        else:
+        if posts_df.empty:
             _append_rec_log([f"[{_fmt_th(_now_th())}][inject][WARN] posts table empty — skip injection"])
             return ids_all
 
-        # ฟิลเตอร์สถานะ active ถ้ามีคอลัมน์ status
+        posts_df["id"] = pd.to_numeric(posts_df["id"], errors="coerce").astype("Int64")
+        posts_df = posts_df.dropna(subset=["id"]).copy()
+        posts_df["id"] = posts_df["id"].astype(int)
+
         if "status" in posts_df.columns:
             try:
                 mask_active = (posts_df["status"].astype(str).str.lower() == "active") | (posts_df["status"].isna())
@@ -2372,29 +3100,22 @@ def _inject_new_today(
             except Exception:
                 pass
 
-        # สร้าง timestamp ที่ใช้ตัดสิน (updated_at > created_at > นับเป็น NaT ถ้าไม่มี)
         def _pick_ts(row):
             cand = None
             for c in ("updated_at","created_at"):
                 if c in row and pd.notna(row[c]):
-                    try:
-                        cand = pd.to_datetime(row[c], errors="coerce")
-                        if pd.isna(cand):
-                            continue
-                        break
-                    except Exception:
-                        continue
+                    t = pd.to_datetime(row[c], errors="coerce")
+                    if not pd.isna(t):
+                        cand = t; break
             return cand if cand is not None else pd.NaT
 
         posts_df["ts"] = posts_df.apply(_pick_ts, axis=1)
 
-        # แปลงเป็นเวลาไทยเพื่อเทียบ cutoff
         def _to_th(ts: pd.Timestamp) -> Optional[datetime]:
             try:
                 if pd.isna(ts): return None
                 t = pd.Timestamp(ts)
                 if t.tzinfo is None:
-                    # localize เป็น ICT
                     return t.tz_localize("Asia/Bangkok").to_pydatetime()
                 return t.tz_convert("Asia/Bangkok").to_pydatetime()
             except Exception:
@@ -2402,32 +3123,45 @@ def _inject_new_today(
 
         posts_df["ts_th"] = posts_df["ts"].apply(_to_th)
 
-        # ---------- กำหนด candidate ----------
-        # เงื่อนไข: ภายใน window, ไม่ self (ตาม flag), ไม่เคยเห็น (blocklist), ไม่เคย interact
-        def _eligible(row) -> bool:
-            pid = int(row["id"])
-            tth = row["ts_th"]
-            if tth is None or tth < cutoff:
-                return False
-            if pid in interacted_set:
-                return False
-            if pid in seen_block:
-                return False
-            if not INCLUDE_SELF_POSTS_IN_FEED and "user_id" in row and pd.notna(row["user_id"]):
+        def _eligible_common(pid: int, uid_owner: Optional[int]) -> bool:
+            if pid in interacted_set: return False
+            if pid in seen_block: return False
+            if not INCLUDE_SELF_POSTS_IN_FEED and uid_owner is not None:
                 try:
-                    if int(row["user_id"]) == int(user_id):
+                    if int(uid_owner) == int(user_id):
                         return False
                 except Exception:
                     pass
             return True
 
-        cand_df = posts_df.loc[posts_df.apply(_eligible, axis=1)].copy()
-        if cand_df.empty:
-            _append_rec_log([f"[{_fmt_th(_now_th())}][inject] uid={user_id} candidates=0 positions={positions} window_h={hours}"])
-            return ids_all
+        def _eligible_window(row) -> bool:
+            pid = int(row["id"])
+            tth = row["ts_th"]
+            if tth is None or tth < cutoff:
+                return False
+            return _eligible_common(pid, row.get("user_id") if "user_id" in row else None)
 
-        # ---------- คำนวณน้ำหนักสุ่มแบบ bias ----------
-        # 1) base_score จากระบบจัดอันดับปกติ (ถ้ามี)
+        cand_df = posts_df.loc[posts_df.apply(_eligible_window, axis=1)].copy()
+
+        fallback_used = False
+        if cand_df.empty:
+            tmp = posts_df.copy()
+            tmp["ts_th_sort"] = tmp["ts_th"].apply(lambda x: x if isinstance(x, datetime) else datetime(1970,1,1))
+            tmp = tmp.sort_values("ts_th_sort", ascending=False)
+            fallback_ids = []
+            for _, r in tmp.iterrows():
+                pid = int(r["id"])
+                if _eligible_common(pid, r.get("user_id") if "user_id" in r else None):
+                    fallback_ids.append(pid)
+                if len(fallback_ids) >= min(NEW_INSERT_MAX, 3):
+                    break
+            if not fallback_ids:
+                _append_rec_log([f"[{_fmt_th(_now_th())}][inject] uid={user_id} candidates=0 (no-24h) fallback=0 positions={'random(21-30)' if positions is None else positions} window_h={hours}"])
+                return ids_all
+            cand_df = posts_df[posts_df["id"].isin(fallback_ids)].copy()
+            fallback_used = True
+
+        # คำนวณน้ำหนักเลือก candidates (base+eng+recency)
         try:
             base_scores = _compute_basescore_for(
                 user_id=int(user_id),
@@ -2440,7 +3174,6 @@ def _inject_new_today(
         except Exception:
             base_scores = {}
 
-        # 2) engagement map จาก content view (บางโพสต์ใน posts อาจยังไม่มีใน content view ให้ 0)
         try:
             eng_map = dict(zip(
                 content_df["post_id"].astype(int).tolist(),
@@ -2449,18 +3182,21 @@ def _inject_new_today(
         except Exception:
             eng_map = {}
 
-        # 3) recency score ภายในหน้าต่าง (ยิ่งใกล้ now_th คะแนนยิ่งสูง)
         def _recency_norm(th: datetime) -> float:
-            # map cutoff..now_th -> 0..1
             try:
-                span = (now_th - cutoff).total_seconds()
-                age  = (now_th - th).total_seconds()
-                val  = 1.0 - max(0.0, min(1.0, age / max(span, 1.0)))
-                return float(val)
+                if fallback_used:
+                    span = 7*24*3600.0
+                    age  = (now_th - th).total_seconds() if isinstance(th, datetime) else span
+                    val  = 1.0 - max(0.0, min(1.0, age / span))
+                    return float(val)
+                else:
+                    span = (now_th - cutoff).total_seconds()
+                    age  = (now_th - th).total_seconds()
+                    val  = 1.0 - max(0.0, min(1.0, age / max(span, 1.0)))
+                    return float(val)
             except Exception:
                 return 0.0
 
-        # เตรียม normalization helper ต่อคอลัมน์
         def _norm(series_vals: List[float]) -> Dict[int, float]:
             if not series_vals:
                 return {}
@@ -2470,49 +3206,50 @@ def _inject_new_today(
                 return {}
             return {i: (float(v) - mn) / (mx - mn) for i, v in enumerate(series_vals)}
 
-        # เก็บ raw components ต่อแคนดิเดต
-        raw_base, raw_eng, raw_rec = [], [], []
         cand_ids = cand_df["id"].astype(int).tolist()
+        raw_base, raw_eng, raw_rec = [], [], []
+        tth_map = {}
         for pid in cand_ids:
             raw_base.append(float(base_scores.get(int(pid), 0.0)))
             raw_eng.append(float(eng_map.get(int(pid), 0.0)))
             tth = cand_df.loc[cand_df["id"] == pid, "ts_th"].values[0]
+            tth_map[int(pid)] = tth if isinstance(tth, datetime) else None
             raw_rec.append(_recency_norm(tth) if isinstance(tth, datetime) else 0.0)
 
-        nmap_base = _norm(raw_base)  # index-based
+        nmap_base = _norm(raw_base)
         nmap_eng  = _norm(raw_eng)
-        # recency อยู่ใน [0,1] อยู่แล้ว ไม่ต้อง normalize อีกรอบ
 
-        # รวมเป็น weight: 0.65*base + 0.25*eng + 0.10*rec
         weights = []
+        per_item_log = []
         for i, pid in enumerate(cand_ids):
             b = nmap_base.get(i, 0.0)
             g = nmap_eng.get(i, 0.0)
             r = raw_rec[i]
             w = 0.65*b + 0.25*g + 0.10*r
-            # ปรับเพิ่มเล็กน้อยถ้าโพสต์นี้ก็อยู่ใน ids_all เดิม (จะร้อยเรียงกับลิสต์หลักได้กลมกลืน)
             if pid in set(ids_all):
                 w += 0.02
             weights.append(max(0.0, float(w)))
+            per_item_log.append({
+                "pid": int(pid),
+                "base_norm": float(b),
+                "eng_norm": float(g),
+                "rec_norm": float(r),
+                "weight": float(weights[-1]),
+                "ts_th": tth_map.get(int(pid)),
+                "in_feed_before": bool(pid in set(ids_all))
+            })
 
-        # ---------- เลือกโพสต์ที่จะ "แทรก" ----------
+        # จำนวนที่จะฉีด
         cap = int(insert_cap) if insert_cap is not None else int(NEW_INSERT_MAX)
-        cap = max(0, min(cap, len(positions)))
-        if cap == 0:
-            return ids_all
+        cap = max(0, min(cap, max(1, len(cand_ids))))  # อย่างน้อย 1 เมื่อมี candidate
 
         rng = random.Random(_daily_seed(int(user_id)))
-        chosen: List[int] = []
 
         def _weighted_sample_without_replacement(items: List[int], wts: List[float], k: int) -> List[int]:
-            # แบบง่าย ๆ: ทำสำเนาแล้วสุ่มวน k ครั้ง
-            pool = list(items)
-            ww   = list(wts)
-            out  = []
+            pool = list(items); ww = list(wts); out = []
             for _ in range(min(k, len(pool))):
                 s = sum(ww)
                 if s <= 0:
-                    # ถ้าน้ำหนักรวมเป็น 0 ให้สุ่ม uniform
                     j = rng.randrange(0, len(pool))
                 else:
                     r = rng.random()*s
@@ -2522,26 +3259,57 @@ def _inject_new_today(
                         acc += ww[j]
                         if r <= acc:
                             break
-                out.append(pool.pop(j))
-                ww.pop(j)
+                out.append(pool.pop(j)); ww.pop(j)
             return out
 
-        if len(cand_ids) <= cap:
-            chosen = cand_ids[:cap]
-        else:
-            chosen = _weighted_sample_without_replacement(cand_ids, weights, cap)
+        chosen = cand_ids[:cap] if len(cand_ids) <= cap else _weighted_sample_without_replacement(cand_ids, weights, cap)
 
-        # กันซ้ำกับลิสต์เดิม (ถ้าตัวที่เลือกอยู่ใน ids_all อยู่แล้ว ให้ย้ายตำแหน่งตาม slot)
+        # ===== เลือก "ตำแหน่ง inject" =====
+        # ถ้าไม่ได้ส่ง positions มา → สุ่มในช่วง 21–30 (1-based), ไม่ซ้ำ, เรียงจากน้อยไปมาก
+        if positions is None:
+            lo_1based, hi_1based = 21, 30
+            # clamp hi ตามความยาวลิสต์ (อนุโลมให้แทรกปลายลิสต์ได้โดยมี clamp ตอน insert อีกชั้น)
+            hi_1based = max(lo_1based, min(hi_1based, max(lo_1based, len(ids_all))))
+            k = min(cap, hi_1based - lo_1based + 1)
+            pool_pos = list(range(lo_1based, hi_1based + 1))
+            if k <= 0 or not pool_pos:
+                positions_local = tuple()
+            else:
+                positions_local = tuple(sorted(rng.sample(pool_pos, k)))
+        else:
+            positions_local = positions
+
+        # ประกอบฟีด: เอา chosen ออกก่อนแล้วค่อย insert กลับตามตำแหน่ง
         base = [p for p in ids_all if p not in set(chosen)]
         for i, pid in enumerate(chosen):
-            pos = positions[min(i, len(positions)-1)] - 1
-            pos = min(max(0, pos), len(base))
+            if not positions_local:
+                # ถ้าไม่มีตำแหน่ง (เช่นฟีดสั้นเกิน) -> แปะท้าย
+                base.append(int(pid))
+                continue
+            pos_1based = positions_local[min(i, len(positions_local)-1)]
+            pos = max(0, int(pos_1based) - 1)
+            pos = min(pos, len(base))
             base.insert(pos, int(pid))
+
+        # STORY LOG
+        try:
+            _log_story("inject", {
+                "uid": int(user_id),
+                "window_h": int(hours),
+                "fallback": "latest" if fallback_used else "none",
+                "positions": list(positions_local) if positions_local else [],
+                "mode": "random(21-30)" if positions is None else "fixed",
+                "candidates": per_item_log[:LOG_TOPN_PER_ITEM],
+                "chosen": list(map(int, chosen)),
+            })
+        except Exception:
+            pass
 
         _append_rec_log([
             f"[{_fmt_th(_now_th())}][inject] uid={user_id} "
             f"candidates={len(cand_ids)} chosen={chosen} "
-            f"positions={positions} window_h={hours}"
+            f"positions={(list(positions_local) if positions_local else [])} mode={'random' if positions is None else 'fixed'} window_h={hours} "
+            f"{'fallback=latest' if fallback_used else 'fallback=none'}"
         ])
         return base
 
@@ -2654,16 +3422,13 @@ def _rebalance_by_category(
     penalty_big: float = 0.60,        # โทษหนักเมื่อจะเกิน run-length cap
     penalty_ratio: float = 0.25,      # โทษเมื่อจะทำให้สัดส่วน > 2:1 ในหน้าต่าง
     prefer_top2_for_user: Optional[List[str]] = None,
+    log_ctx: Optional[dict] = None,   # <<< NEW: injection context for story logs
 ) -> List[int]:
     """
-    Rebalancer แบบ soft:
-      - จำกัด run-length ต่อหมวด (cap_top สำหรับตำแหน่ง < top_k, cap_after สำหรับตำแหน่ง >= top_k)
-      - บังคับ soft '2:1' ระหว่างหมวดท็อปสองของผู้ใช้ในทุก 'window' (ดีฟอลต์ 20 โพสต์แรก)
-      - ใช้ adjusted score = base_score - penalties + small boosts
-      - ถ้าขาดทางเลือกจริง ๆ จะยอมให้เกินข้อจำกัดได้ (เลือกตัวที่ pen น้อยสุด)
-
-    base_scores: ถ้าไม่มี ให้ default = index-based score (สูงก่อน)
-    prefer_top2_for_user: ถ้าส่งมาจะ boost หมวดที่เป็น top2 (โดยเฉพาะหมวดรอง)
+    Rebalancer แบบ soft พร้อม story log ต่อการเลือกทุกตำแหน่ง:
+      - จำกัด run-length ต่อหมวด (cap_top/cap_after)
+      - บังคับ soft '2:1' ระหว่างหมวดท็อปสองในหน้าต่าง window
+      - base_score - penalties + small boosts
     """
     if not order_ids:
         return []
@@ -2683,7 +3448,6 @@ def _rebalance_by_category(
 
     # เตรียมคะแนนฐาน
     if base_scores is None:
-        # ให้คะแนนสูงกับอันดับต้น ๆ ของ order เดิม
         base_scores = {}
         n = len(order_ids)
         for rank, pid in enumerate(order_ids):
@@ -2692,116 +3456,124 @@ def _rebalance_by_category(
     # เตรียม candidate queue
     remaining = list(order_ids)
 
-    # เก็บ counts/หน้าต่างสำหรับ fairness
+    # สำหรับ fairness window
     cat_window = deque(maxlen=max(1, int(window)))
-    # ตัวนับ run-length ต่อหมวด (สำหรับตำแหน่งล่าสุด ๆ)
     runlen_now = defaultdict(int)
     last_cat: Optional[str] = None
 
     out: List[int] = []
+    steps_log: List[Dict[str, Any]] = []  # <<< เก็บเหตุผลรายตำแหน่ง
 
-    # helper หา run-length cap ของตำแหน่งนี้
     def _cap_for_pos(pos: int) -> int:
         return int(cap_top) if pos < int(top_k) else int(cap_after)
-
-    # helper คืน top2 counts ในหน้าต่างล่าสุด
-    def _top2_counts() -> List[Tuple[str, int]]:
-        cnt = defaultdict(int)
-        for c in cat_window:
-            cnt[c] += 1
-        items = sorted(cnt.items(), key=lambda x: x[1], reverse=True)
-        return items[:2]
-
-    # boost สำหรับหมวดรอง
-    boost_secondary = float(fairness_alpha)
 
     i = 0
     while remaining:
         cap_now = _cap_for_pos(i)
-        # ดูผู้สมัคร top-M ตัวแรกเพื่อลด O(n^2) (เลือกจาก 60 ตัวแรกพอ)
         lookahead = remaining[:60]
 
         best_j = None
         best_score = -1e9
+        best_dbg = {
+            "pen_runlen": False,
+            "pen_ratio": False,
+            "boost_secondary": False
+        }
 
-        # วิเคราะห์สถิติหน้าต่างปัจจุบัน
-        t2 = _top2_counts()
-        if len(t2) == 0:
-            top_cat, top_cnt = None, 0
-            sec_cat, sec_cnt = None, 0
-        elif len(t2) == 1:
-            (top_cat, top_cnt) = t2[0]
-            sec_cat, sec_cnt = None, 0
-        else:
-            (top_cat, top_cnt), (sec_cat, sec_cnt) = t2[0], t2[1]
+        # สถิติปัจจุบันใน window
+        cnt_now = defaultdict(int)
+        for c in cat_window:
+            cnt_now[c] += 1
 
         for j, pid in enumerate(lookahead):
             c = pid_to_cat.get(int(pid), "Unknown")
             base = float(base_scores.get(int(pid), 0.0))
             score = base
 
-            # 1) run-length penalty (ถ้าจะทำให้ยาวเกิน cap)
-            # นับ run-length ถ้า cat เดิมซ้ำ
-            if c == last_cat:
-                next_run = runlen_now[c] + 1
-            else:
-                next_run = 1
+            # 1) run-length penalty
+            next_run = runlen_now[c] + 1 if c == last_cat else 1
+            hit_run = (cap_now > 0 and next_run > cap_now)
+            if hit_run:
+                score -= penalty_big
 
-            if cap_now > 0 and next_run > cap_now:
-                score -= penalty_big  # โทษหนัก
-
-            # 2) fairness ratio penalty ในหน้าต่าง
-            # สมมติเลือก c แล้วอัปเดต count ภายในหน้าต่าง window virtual
-            cand_cnts = defaultdict(int)
-            for cc in cat_window:
-                cand_cnts[cc] += 1
-            cand_cnts[c] += 1
-            # หา top2 หลังเลือกตัวนี้
-            cand_sorted = sorted(cand_cnts.items(), key=lambda x: x[1], reverse=True)
+            # 2) fairness ratio penalty (ลองอัปเดตหน้าต่างตามสมมติ)
+            cnt2 = cnt_now.copy()
+            cnt2[c] += 1
+            cand_sorted = sorted(cnt2.items(), key=lambda x: x[1], reverse=True)
+            hit_ratio = False
             if len(cand_sorted) >= 2:
                 (c_top, n_top), (c_sec, n_sec) = cand_sorted[0], cand_sorted[1]
-                # ถ้า cat ที่เลือกคือ top และจะทำให้ top > ratio_cap * sec มากไป → โดนโทษ
-                # (ใช้ n_sec>=1 เพื่อหลีกเลี่ยงหาร 0; ถ้าไม่มี sec ยังไม่ลงโทษรุนแรง)
                 if n_sec >= 1 and c == c_top and float(n_top) > float(ratio_cap) * float(n_sec):
-                    # โทษตามระดับที่เกิน
                     overflow = float(n_top) - float(ratio_cap) * float(n_sec)
                     score -= penalty_ratio * (1.0 + 0.25 * overflow)
+                    hit_ratio = True
             else:
-                # ถ้าทั้งหน้าต่างยังมีหมวดเดียวอยู่ยาว และ cap_now > 0 แล้วกำลังจะลากยาว ให้เตือนด้วยโทษอ่อน
                 if (len(cand_sorted) == 1) and (cand_sorted[0][1] >= max(2, cap_now)):
                     score -= 0.10
 
-            # 3) boost เล็กน้อยให้ "หมวดรองของผู้ใช้" (ช่วยให้สู้คะแนนหมวดยอดนิยมได้)
-            if prefer_top2_for_user:
-                # สมมติ prefer_top2_for_user = [primary, secondary]
-                if len(prefer_top2_for_user) >= 2:
-                    sec_name = prefer_top2_for_user[1]
-                    if c == sec_name:
-                        score += boost_secondary
-                # จะบูสต์ primary นิด ๆ ก็ได้ แต่เราขอไม่ทำเพื่อให้รองขึ้นได้จริง
+            # 3) boost ให้หมวดรองของผู้ใช้
+            boosted = False
+            if prefer_top2_for_user and len(prefer_top2_for_user) >= 2:
+                sec_name = prefer_top2_for_user[1]
+                if c == sec_name:
+                    score += float(fairness_alpha)
+                    boosted = True
 
             if score > best_score:
                 best_score = score
                 best_j = j
+                best_dbg = {
+                    "pen_runlen": bool(hit_run),
+                    "pen_ratio": bool(hit_ratio),
+                    "boost_secondary": bool(boosted),
+                    "base": float(base),
+                    "score": float(score),
+                    "cap_now": int(cap_now),
+                }
 
-        # ถ้าทางเลือกทั้งหมดโดนโทษจนติดลบมาก ๆ ให้ผ่อนปรน: เลือกตัวแรกของ remaining
+        # เลือกผู้ชนะ
         if best_j is None:
             pid = remaining.pop(0)
         else:
             pid = remaining.pop(best_j)
 
-        # วางลงผลลัพธ์ + อัปเดตสถานะ
-        out.append(int(pid))
+        # อัปเดต out / run-length / window
         c = pid_to_cat.get(int(pid), "Unknown")
         if c == last_cat:
             runlen_now[c] += 1
         else:
-            # reset run-length ของหมวดอื่น
             runlen_now = defaultdict(int)
             runlen_now[c] = 1
             last_cat = c
         cat_window.append(c)
+        out.append(int(pid))
+
+        # บันทึกเหตุผลตำแหน่งนี้
+        try:
+            steps_log.append({
+                "pos": i + 1,
+                "pid": int(pid),
+                "cat": c,
+                "cat_code": _cat_code(c),
+                **best_dbg
+            })
+        except Exception:
+            pass
+
         i += 1
+
+    # push ลง log_ctx ถ้ามี
+    if isinstance(log_ctx, dict):
+        log_ctx.setdefault("rebalance", {})
+        log_ctx["rebalance"]["steps"] = steps_log
+        log_ctx["rebalance"]["params"] = {
+            "top_k": int(top_k),
+            "cap_top": int(cap_top),
+            "cap_after": int(cap_after),
+            "window": int(window),
+            "ratio_cap": float(ratio_cap),
+            "alpha": float(fairness_alpha),
+        }
 
     return out
 
@@ -4289,4 +5061,3 @@ if __name__ == '__main__':
         debug=False,
         request_handler=SelectiveWSGIRequestHandler  # << ใช้งาน handler กรอง /ai/seen
     )
-
