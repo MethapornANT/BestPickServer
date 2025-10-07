@@ -5859,85 +5859,144 @@ app.post("/api/check-block-status", (req, res) => {
 //########################################################   Order API  ########################################################
 
 
+// POST /api/orders (สร้างใหม่ หรือ ต่ออายุ)
+app.post("/api/orders", upload.single("image"), (req, res) => {
+  console.log("[INFO] Received POST /api/orders request");
 
-// POST /api/orders (รองรับทั้งการสร้างใหม่และการต่ออายุ)
-app.post("/api/orders", upload.single('image'), (req, res) => {
-    console.log('[INFO] Received POST /api/orders request');
-    
-    // เพิ่ม renew_ads_id เข้ามา
-    const { user_id, package_id, title, content, link, prompay_number, ad_start_date, renew_ads_id } = req.body;
-    const imageFile = req.file;
+  const {
+    user_id,
+    package_id,
+    title,
+    content,
+    link,
+    prompay_number,
+    ad_start_date,
+    renew_ads_id
+  } = req.body;
+  const imageFile = req.file;
 
-    console.log('Received Body:', req.body);
-    if(renew_ads_id) console.log('This is a RENEWAL request for Ad ID:', renew_ads_id);
-
-    // --- Validation ---
-    // ถ้าเป็นการต่ออายุ (มี renew_ads_id) จะไม่ต้องการ title, content, image, ad_start_date
-    if (!user_id || !package_id || !prompay_number) {
-        if (imageFile) fs.unlinkSync(imageFile.path);
-        return res.status(400).json({ error: 'Missing required fields' });
+  const cleanupUploadIfAny = () => {
+    if (imageFile) {
+      try { fs.unlinkSync(imageFile.path); } catch {}
     }
-    
-    // ตรวจสอบข้อมูลที่จำเป็นสำหรับการสร้างโฆษณาใหม่เท่านั้น
-    if (!renew_ads_id) {
-        if (!title || !content) {
-            if (imageFile) fs.unlinkSync(imageFile.path);
-            return res.status(400).json({ error: 'Title and content are required for a new ad.' });
-        }
-        if (!imageFile) {
-            return res.status(400).json({ error: 'Missing required image file for a new ad.' });
-        }
-        if (!ad_start_date) {
-            if (imageFile) fs.unlinkSync(imageFile.path);
-            return res.status(400).json({ error: 'Please select an ad start date for a new ad.' });
-        }
+  };
+
+  const isRenewal = !!renew_ads_id;
+  console.log("Received Body:", req.body);
+  if (isRenewal) console.log("This is a RENEWAL request for Ad ID:", renew_ads_id);
+
+  // -------- Basic required fields (both modes) ----------
+  if (!user_id || !package_id || !prompay_number) {
+    cleanupUploadIfAny();
+    return res.status(400).json({ error: "Missing required fields: user_id, package_id, prompay_number" });
+  }
+
+  // -------- Mode-specific validation ----------
+  if (!isRenewal) {
+    // New ad creation requires title, content, image, ad_start_date
+    if (!title || !content) {
+      cleanupUploadIfAny();
+      return res.status(400).json({ error: "Title and content are required for a new ad." });
     }
-    
-    pool.query('SELECT * FROM ad_packages WHERE package_id = ?', [package_id], (err, pkg) => {
-        if (err || pkg.length === 0) {
-            if (imageFile) fs.unlinkSync(imageFile.path);
-            return res.status(err ? 500 : 400).json({ error: err ? 'Database error' : 'Invalid package' });
-        }
-        
-        const amount = pkg[0].price;
-        const duration = pkg[0].duration_days;
+    if (!imageFile) {
+      return res.status(400).json({ error: "Missing required image file for a new ad." });
+    }
+    if (!ad_start_date) {
+      cleanupUploadIfAny();
+      return res.status(400).json({ error: "Please select an ad start date for a new ad." });
+    }
+  } else {
+    // Renewal must NOT include title/content/ad_start_date/image
+    if (title || content || ad_start_date) {
+      cleanupUploadIfAny();
+      return res.status(400).json({ error: "Renewal should not include title/content/ad_start_date." });
+    }
+    if (imageFile) {
+      cleanupUploadIfAny();
+      return res.status(400).json({ error: "Renewal should not upload image." });
+    }
+  }
 
-        const orderSql = `
-          INSERT INTO orders (user_id, amount, status, created_at, updated_at, prompay_number, package_id, renew_ads_id)
-          VALUES (?, ?, 'pending', NOW(), NOW(), ?, ?, ?)
-        `;
-        
-        pool.query(orderSql, [user_id, amount, prompay_number, package_id, renew_ads_id || null], (err, result) => {
-            if (err) {
-                if (imageFile) fs.unlinkSync(imageFile.path);
-                return res.status(500).json({ error: 'Database error creating order' });
-            }
-            
-            const order_id = result.insertId;
-            console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);
+  // -------- Check package validity ----------
+  pool.query("SELECT * FROM ad_packages WHERE package_id = ?", [package_id], (err, pkg) => {
+    if (err) {
+      cleanupUploadIfAny();
+      return res.status(500).json({ error: "Database error (ad_packages)" });
+    }
+    if (!pkg || pkg.length === 0) {
+      cleanupUploadIfAny();
+      return res.status(400).json({ error: "Invalid package" });
+    }
 
-            // ถ้าเป็นการสร้างโฆษณาใหม่ (ไม่มี renew_ads_id) ให้ INSERT ลงตาราง ads ด้วย
-            if (!renew_ads_id) {
-                const imagePath = `/uploads/${imageFile.filename}`;
-                const adSql = `
-                  INSERT INTO ads (user_id, order_id, title, content, link, image, status, show_at, created_at, expiration_date)
-                  VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW(), DATE_ADD(?, INTERVAL ? DAY))
-                `;
-                pool.query(adSql, [user_id, order_id, title, content, link || '', imagePath, ad_start_date, ad_start_date, duration], (err2) => {
-                    if (err2) {
-                        console.error('[ERROR] Database error creating ad for order ID ' + order_id + ':', err2);
-                        return res.status(500).json({ error: 'Database error creating ad' });
-                    }
-                    console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
-                    res.status(201).json({ order_id, amount, duration });
-                });
-            } else {
-                // ถ้าเป็นการต่ออายุ เราจะสร้างแค่ Order ไม่ต้องสร้าง Ad ใหม่
-                console.log(`[INFO] Renewal Order ID ${order_id} created for Ad ID ${renew_ads_id}.`);
+    const amount = pkg[0].price;
+    const duration = pkg[0].duration_days;
+
+    // -------- If renewal, verify ad exists and belongs to user ----------
+    const proceedCreateOrder = () => {
+      const orderSql = `
+        INSERT INTO orders (user_id, amount, status, created_at, updated_at, prompay_number, package_id, renew_ads_id)
+        VALUES (?, ?, 'pending', NOW(), NOW(), ?, ?, ?)
+      `;
+      pool.query(
+        orderSql,
+        [user_id, amount, prompay_number, package_id, isRenewal ? renew_ads_id : null],
+        (err2, result) => {
+          if (err2) {
+            cleanupUploadIfAny();
+            return res.status(500).json({ error: "Database error creating order" });
+          }
+          const order_id = result.insertId;
+          console.log(`[INFO] Order ID ${order_id} created with status 'pending'.`);
+
+          if (!isRenewal) {
+            const imagePath = `/uploads/${imageFile.filename}`;
+            const adSql = `
+              INSERT INTO ads (user_id, order_id, title, content, link, image, status, show_at, created_at, expiration_date)
+              VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NOW(), DATE_ADD(?, INTERVAL ? DAY))
+            `;
+            pool.query(
+              adSql,
+              [user_id, order_id, title, content, link || "", imagePath, ad_start_date, ad_start_date, duration],
+              (err3) => {
+                if (err3) {
+                  console.error("[ERROR] Database error creating ad for order:", err3);
+                  return res.status(500).json({ error: "Database error creating ad" });
+                }
+                console.log(`[INFO] Ad created for Order ID ${order_id} with status 'pending'.`);
                 res.status(201).json({ order_id, amount, duration });
-            }
-        });
-    });
+              }
+            );
+          } else {
+            console.log(`[INFO] Renewal Order ID ${order_id} created for Ad ID ${renew_ads_id}.`);
+            res.status(201).json({ order_id, amount, duration });
+          }
+        }
+      );
+    };
+
+    if (isRenewal) {
+      const checkAdSql = `
+        SELECT id, user_id, status, expiration_date 
+        FROM ads 
+        WHERE id = ? LIMIT 1
+      `;
+      pool.query(checkAdSql, [renew_ads_id], (errAd, rows) => {
+        if (errAd) {
+          return res.status(500).json({ error: "Database error checking ad for renewal" });
+        }
+        if (!rows || rows.length === 0) {
+          return res.status(400).json({ error: "Ad to renew not found" });
+        }
+        if (String(rows[0].user_id) !== String(user_id)) {
+          return res.status(403).json({ error: "You do not own the ad you are trying to renew" });
+        }
+        // Optional: prevent renewing 'rejected' or similar
+        proceedCreateOrder();
+      });
+    } else {
+      proceedCreateOrder();
+    }
+  });
 });
 
 

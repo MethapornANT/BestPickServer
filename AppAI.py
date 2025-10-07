@@ -2867,7 +2867,7 @@ def ai_recommend_handler():
     """
     เพิ่ม story log ส่วน header เพื่อ snapshot config/weights และท้ายสุดสรุป pipeline
     """
-    
+
     if _HEALTH.get("reloading"):
         return jsonify({"error": "Service is reloading, please retry in a moment."}), 503
     try:
@@ -2894,6 +2894,104 @@ def ai_recommend_handler():
             with _cache_lock:
                 recommendation_cache.pop(uid, None)
 
+        # ========= COLD-START SHORT-CIRCUIT (ใหม่กริบ = เรียงตาม engagement ล้วน) =========
+        def _is_brand_new_user_local(user_id: int) -> bool:
+            try:
+                e = _eng()
+                with e.connect() as conn:
+                    q_evt = conn.execute(sa_text(f"SELECT COUNT(*) FROM {EVENT_TABLE} WHERE user_id=:uid"),
+                                         {"uid": int(user_id)}).scalar() or 0
+                    q_like = conn.execute(sa_text(f"SELECT COUNT(*) FROM {LIKES_TABLE} WHERE user_id=:uid"),
+                                          {"uid": int(user_id)}).scalar() or 0
+                    q_follow = conn.execute(sa_text(
+                        f"SELECT "
+                        f"(SELECT COUNT(*) FROM {FOLLOWS_TABLE} WHERE follower_id=:uid) + "
+                        f"(SELECT COUNT(*) FROM {FOLLOWS_TABLE} WHERE following_id=:uid)"
+                    ), {"uid": int(user_id)}).scalar() or 0
+                    q_authored = conn.execute(sa_text(f"SELECT COUNT(*) FROM {POSTS_TABLE} WHERE user_id=:uid"),
+                                              {"uid": int(user_id)}).scalar() or 0
+                return (int(q_evt) + int(q_like) + int(q_follow) + int(q_authored)) == 0
+            except Exception:
+                return False  # เช็คไม่ได้ให้ถือว่าไม่ใหม่ เพื่อกันพัง
+
+        if _is_brand_new_user_local(uid):
+            # ----- FIX: ไม่อ้าง 'id' ตรงๆ อีก ดึงผ่าน _load_content_view แล้วหา column อัตโนมัติ -----
+            e = _eng()
+            content_df_full = _load_content_view(e)  # เอาทุกคอลัมน์จาก view เดิมของระบบ
+
+            # เดาชื่อคอลัมน์ id และ engagement แบบ robust
+            id_candidates  = ["post_id", "PostID", "PostId", "POST_ID", "id", "ID"]
+            eng_candidates = [ENGAGE_COL, "eng", "Engagement", "PostEngagement", "post_engagement"]
+
+            id_col  = next((c for c in id_candidates  if c in content_df_full.columns), None)
+            eng_col = next((c for c in eng_candidates if c in content_df_full.columns), None)
+
+            if not id_col or not eng_col:
+                raise RuntimeError(f"cold-start: missing id/eng column; have={list(content_df_full.columns)}")
+
+            df = content_df_full[[id_col, eng_col]].rename(columns={id_col: "post_id", eng_col: "eng"}).copy()
+
+            # safety cast
+            df["post_id"] = pd.to_numeric(df["post_id"], errors="coerce")
+            df = df.dropna(subset=["post_id"])
+            df["post_id"] = df["post_id"].astype(int)
+            df["eng"] = pd.to_numeric(df["eng"], errors="coerce").fillna(0.0)
+
+            # sort ตาม engagement มาก->น้อย; ผูกปมด้วย post_id กันแกว่ง
+            df = df.sort_values(["eng", "post_id"], ascending=[False, False])
+            ids_all = df["post_id"].tolist()
+            total   = len(ids_all)
+
+            # candidate / fetch / page cut เหมือนเดิม
+            def _candidate_ids_for_page(ids_all: List[int], start: int, page_size: int) -> List[int]:
+                if return_all:
+                    seen=set(); out=[]
+                    for p in ids_all:
+                        if p not in seen:
+                            out.append(p); seen.add(p)
+                    return out
+                seen=set(); out=[]
+                i = max(0, start)
+                target = int(page_size * (2.5 if not INCLUDE_SELF_POSTS_IN_FEED else 2.0))
+                while i < len(ids_all) and len(out) < target:
+                    p = ids_all[i]
+                    if p not in seen:
+                        out.append(p); seen.add(p)
+                    i += 1
+                return out
+
+            cand_ids = _candidate_ids_for_page(ids_all, start, page_size)
+            posts = fetch_posts_by_ids(cand_ids, uid)
+
+            if not return_all:
+                mp = {int(p["id"]): p for p in posts}
+                page_posts, i, seen_page = [], start, set()
+                while len(page_posts) < page_size and i < len(ids_all):
+                    pid = int(ids_all[i])
+                    if pid not in seen_page and pid in mp:
+                        page_posts.append(mp[pid]); seen_page.add(pid)
+                    i += 1
+                posts = page_posts
+
+            _log_recommendation(uid=uid, start=start, page_size=page_size,
+                                return_all=return_all, posts=posts)
+
+            if debug:
+                return jsonify({
+                    "posts": posts,
+                    "debug": {
+                        "mode": "cold-engagement",
+                        "total_candidates": total,
+                        "start": start,
+                        "page_size": page_size,
+                        "include_self_posts": INCLUDE_SELF_POSTS_IN_FEED,
+                        "map_hybrid_to_rank": MAP_HYBRID_TO_RANK
+                    }
+                }), 200
+
+            return jsonify(posts), 200
+        # ========= END COLD-START SHORT-CIRCUIT =========
+
         # HEADER STORY: snapshot config/weights
         try:
             e = _eng()
@@ -2915,7 +3013,7 @@ def ai_recommend_handler():
                     "alpha": float(FAIRNESS_ALPHA),
                 },
                 "inject": {
-                    "positions": "random(21-30)",  # << เปลี่ยน Log: บอกว่าใช้สุ่ม
+                    "positions": "random(21-30)",
                     "window_h": 24
                 },
                 "ttl": {
@@ -2939,7 +3037,7 @@ def ai_recommend_handler():
         total   = len(ids_all)
 
         # 2) inject โพสต์ใหม่เข้า slot 21–30 (สุ่มตำแหน่งอัตโนมัติ)
-        ids_all = _inject_new_today(ids_all, uid, positions=None, hours=24)  # << เปลี่ยนตรงนี้
+        ids_all = _inject_new_today(ids_all, uid, positions=None, hours=24)
 
         # 3) candidates สำหรับ fetch (กันดรอป inactive/self)
         def _candidate_ids_for_page(ids_all: List[int], start: int, page_size: int) -> List[int]:
@@ -2978,7 +3076,7 @@ def ai_recommend_handler():
         _log_recommendation(uid=uid, start=start, page_size=page_size,
                             return_all=return_all, posts=posts)
 
-        # [ADD] HUMAN-READABLE SUMMARY (คั่นด้วย //////////////// ให้อ่านไว)
+        # [ADD] HUMAN-READABLE SUMMARY
         try:
             e = _eng()
             content_df_hr = _load_content_view(e)
@@ -3037,7 +3135,6 @@ def ai_recommend_handler():
         ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         _append_rec_log([f"[{ts}][/ai/recommend][ERROR] {ex} {traceback.format_exc()}"])
         return jsonify({"error": "Internal Server Error"}), 500
-
 
 def _inject_new_today(
     ids_all: List[int],
