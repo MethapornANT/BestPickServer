@@ -2894,7 +2894,7 @@ def ai_recommend_handler():
             with _cache_lock:
                 recommendation_cache.pop(uid, None)
 
-        # ========= COLD-START SHORT-CIRCUIT (ใหม่กริบ = เรียงตาม engagement ล้วน) =========
+        # ========= COLD-START SHORT-CIRCUIT =========
         def _is_brand_new_user_local(user_id: int) -> bool:
             try:
                 e = _eng()
@@ -2915,34 +2915,51 @@ def ai_recommend_handler():
                 return False  # เช็คไม่ได้ให้ถือว่าไม่ใหม่ เพื่อกันพัง
 
         if _is_brand_new_user_local(uid):
-            # ----- FIX: ไม่อ้าง 'id' ตรงๆ อีก ดึงผ่าน _load_content_view แล้วหา column อัตโนมัติ -----
+            # ดึงคอนเทนต์ + คอลัมน์ id/eng แบบเดิม
             e = _eng()
-            content_df_full = _load_content_view(e)  # เอาทุกคอลัมน์จาก view เดิมของระบบ
+            content_df_full = _load_content_view(e)
 
-            # เดาชื่อคอลัมน์ id และ engagement แบบ robust
             id_candidates  = ["post_id", "PostID", "PostId", "POST_ID", "id", "ID"]
             eng_candidates = [ENGAGE_COL, "eng", "Engagement", "PostEngagement", "post_engagement"]
 
             id_col  = next((c for c in id_candidates  if c in content_df_full.columns), None)
             eng_col = next((c for c in eng_candidates if c in content_df_full.columns), None)
-
             if not id_col or not eng_col:
                 raise RuntimeError(f"cold-start: missing id/eng column; have={list(content_df_full.columns)}")
 
             df = content_df_full[[id_col, eng_col]].rename(columns={id_col: "post_id", eng_col: "eng"}).copy()
-
-            # safety cast
             df["post_id"] = pd.to_numeric(df["post_id"], errors="coerce")
             df = df.dropna(subset=["post_id"])
             df["post_id"] = df["post_id"].astype(int)
-            df["eng"] = pd.to_numeric(df["eng"], errors="coerce").fillna(0.0)
+            df["eng"]     = pd.to_numeric(df["eng"], errors="coerce").fillna(0.0)
 
-            # sort ตาม engagement มาก->น้อย; ผูกปมด้วย post_id กันแกว่ง
-            df = df.sort_values(["eng", "post_id"], ascending=[False, False])
-            ids_all = df["post_id"].tolist()
+            # ==== ใช้ระบบบัคเก็ต + penalty ที่มีอยู่แล้ว ====
+            # บัคเก็ต: unseen > seen_no_pos > interacted  (อ้าง helper เดิม)
+            # NOTE: ไม่เพิ่มระบบใหม่ ไม่แตะสคีมา
+            events_all = _load_events_all(e)
+            ordered_pool = df["post_id"].tolist()
+
+            unseen_ids, seen_no_pos_ids, interacted_ids = _split_seen_buckets(uid, ordered_pool, events_all)
+
+            # แผนที่โทษ/ดีเคย์สำหรับที่ถูกเห็น (อ้าง helper เดิม)
+            penalty_map = _seen_penalty_map(uid, now=_now_th())
+
+            # ฟังก์ชันเรียงในบัคเก็ต: เรียงตาม engagement และใช้ penalty สำหรับอันที่เคยเห็น/มี interaction
+            def _score(pid: int) -> float:
+                base = float(df.loc[df["post_id"] == pid, "eng"].values[0]) if pid in set(ordered_pool) else 0.0
+                pen  = float(penalty_map.get(int(pid), 1.0))
+                return base * pen
+
+            # ภายในแต่ละบัคเก็ต: เรียงคะแนนมาก→น้อย ผูกด้วย post_id กันแกว่ง
+            unseen_sorted      = sorted(unseen_ids,      key=lambda p: (_score(p), p), reverse=True)
+            seen_no_pos_sorted = sorted(seen_no_pos_ids, key=lambda p: (_score(p), p), reverse=True)
+            interacted_sorted  = sorted(interacted_ids,  key=lambda p: (_score(p), p), reverse=True)
+
+            # คิวรวม: unseen → seen_no_pos → interacted
+            ids_all = unseen_sorted + seen_no_pos_sorted + interacted_sorted
             total   = len(ids_all)
 
-            # candidate / fetch / page cut เหมือนเดิม
+            # ===== fetch/page cut เดิม =====
             def _candidate_ids_for_page(ids_all: List[int], start: int, page_size: int) -> List[int]:
                 if return_all:
                     seen=set(); out=[]
@@ -2980,7 +2997,7 @@ def ai_recommend_handler():
                 return jsonify({
                     "posts": posts,
                     "debug": {
-                        "mode": "cold-engagement",
+                        "mode": "cold-engagement+buckets+penalty",
                         "total_candidates": total,
                         "start": start,
                         "page_size": page_size,
@@ -3072,11 +3089,10 @@ def ai_recommend_handler():
                 i += 1
             posts = page_posts
 
-        # LOG เดิม: segments/order
         _log_recommendation(uid=uid, start=start, page_size=page_size,
                             return_all=return_all, posts=posts)
 
-        # [ADD] HUMAN-READABLE SUMMARY
+        # SUMMARY (เดิม)
         try:
             e = _eng()
             content_df_hr = _load_content_view(e)
@@ -3135,6 +3151,7 @@ def ai_recommend_handler():
         ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         _append_rec_log([f"[{ts}][/ai/recommend][ERROR] {ex} {traceback.format_exc()}"])
         return jsonify({"error": "Internal Server Error"}), 500
+
 
 def _inject_new_today(
     ids_all: List[int],
