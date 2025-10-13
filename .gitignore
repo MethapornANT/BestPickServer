@@ -93,6 +93,9 @@ web_modules/
 # Yarn Integrity file
 .yarn-integrity
 
+# Python Virtual Environment
+venv/
+
 # dotenv environment variable files
 .env
 .env.development.local
