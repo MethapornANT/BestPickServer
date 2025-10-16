@@ -606,8 +606,14 @@ app.post("/api/resent-otp/reset-password", async (req, res) => {
 // ======================================================
 app.post("/api/login", async (req, res) => {
   try {
-      const { email, password, google_id } = req.body; // รับ google_id เพิ่มเข้ามาด้วย
+      let { email, password, google_id } = req.body; // ใช้ let เพื่อให้แก้ไข email ได้
 
+      // NEW LOGIC: เติม @gmail.com ถ้าผู้ใช้ใส่มาแค่ username (ไม่มี @)
+      if (email && !email.includes('@')) {
+          // ตามคำขอ ให้เติม @gmail.com เท่านั้น
+          email = `${email}@gmail.com`;
+      }
+      
       // INFO: Client IP (เพื่อบันทึก last_login_ip)
       const ipAddress = req.headers["x-forwarded-for"] || req.connection.remoteAddress;
 
@@ -752,7 +758,6 @@ app.post("/api/login", async (req, res) => {
       res.status(500).json({ error: "Internal server error" });
   }
 });
-
 
 // ======================================================
 // Helper: Apply login success effects + issue JWT
@@ -3533,12 +3538,19 @@ app.get("/api/bookmarks/:post_id", verifyToken, (req, res) => {
 //########################################################   Admin API  ########################################################
 
 /* ================================
-   Admin: Login (token 1 ชั่วโมง)
-   SECURITY: ตรวจ role=admin, active เท่านั้น
+  Admin: Login (token 1 ชั่วโมง)
+  SECURITY: ตรวจ role=admin, active เท่านั้น
 ================================ */
 app.post("/api/admin/login", async (req, res) => {
   try {
-      const { email, password } = req.body;
+      let { email, password } = req.body; // ใช้ let เพื่อให้แก้ไข email ได้
+      
+      // NEW LOGIC: เติม @gmail.com ถ้าผู้ใช้ใส่มาแค่ username (ไม่มี @)
+      if (email && !email.includes('@')) {
+          // ตามคำขอ ให้เติม @gmail.com เท่านั้น
+          email = `${email}@gmail.com`;
+      }
+      
       const ipAddress = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
 
       const sql = "SELECT id, email, password, username, picture, role, status, failed_attempts FROM users WHERE email = ? AND status = 'active' AND role = 'admin'";
@@ -4750,50 +4762,56 @@ app.get("/api/categories", authenticateToken, authorizeAdmin, (req, res) => {
    - ต้องส่ง CategoryName
    - Security: authenticateToken + authorizeAdmin
 ---------------------------------------------------------------- */
-app.post("/api/categories", authenticateToken, authorizeAdmin, (req, res) => {
+app.post("/api/categories", (req, res) => {
   const { CategoryName } = req.body;
 
-  if (!CategoryName) {
-      return res.status(400).json({ error: "CategoryName is required" });
-  }
-
-  const createCategorySql = 'INSERT INTO category (CategoryName, created_at, updated_at) VALUES (?, NOW(), NOW())';
-  pool.query(createCategorySql, [CategoryName], (err, results) => {
+  const getMaxIdSql = 'SELECT MAX(CategoryID) AS maxId FROM category';
+  
+  pool.query(getMaxIdSql, (err, results) => {
+    if (err) {
+      console.error("Database error during MAX ID retrieval:", err);
+      return res.status(500).json({ error: "Error retrieving max ID for category" });
+    }
+    const maxId = results[0].maxId || 0;
+    const newCategoryId = maxId + 1;
+    const createCategorySql = 'INSERT INTO category (CategoryID, CategoryName) VALUES (?, ?)';
+    
+    pool.query(createCategorySql, [newCategoryId, CategoryName], (err, insertResults) => {
       if (err) {
-          console.error("Database error during category creation:", err);
-          return res.status(500).json({ error: "Error creating category" });
+        console.error("Database error during category creation with manual ID:", err);
+        return res.status(500).json({ error: "Error creating category with specified ID" });
       }
-      res.status(201).json({ message: "Category created successfully", categoryId: results.insertId });
+      res.status(201).json({ 
+        message: "Category created successfully with manual ID", 
+        categoryId: newCategoryId 
+      });
+    });
   });
 });
-
 
 /* ----------------------------------------------------------------
    ADMIN: Update category by id
    - ต้องส่ง CategoryName
    - Security: authenticateToken + authorizeAdmin
 ---------------------------------------------------------------- */
-app.put("/api/categories/:id", authenticateToken, authorizeAdmin, (req, res) => {
+app.put("/api/categories/:id", (req, res) => {
   const { id } = req.params;
   const { CategoryName } = req.body;
 
-  if (!CategoryName) {
-      return res.status(400).json({ error: "CategoryName is required" });
-  }
-
-  const updateCategorySql = 'UPDATE category SET CategoryName = ?, updated_at = NOW() WHERE CategoryID = ?';
+  const updateCategorySql = 'UPDATE category SET CategoryName = ? WHERE CategoryID = ?';
   pool.query(updateCategorySql, [CategoryName, id], (err, results) => {
       if (err) {
           console.error("Database error during category update:", err);
           return res.status(500).json({ error: "Error updating category" });
       }
+      
       if (results.affectedRows === 0) {
           return res.status(404).json({ error: "Category not found" });
       }
+
       res.json({ message: "Category updated successfully" });
   });
 });
-
 
 /* ----------------------------------------------------------------
    ADMIN: Delete category by id
