@@ -2441,6 +2441,7 @@ app.get("/api/notifications", verifyToken, async (req, res) => {
 // ======================================================
 // Notifications: create (comment/like/bookmark/share) — suppress self on own post
 // ======================================================
+// Notifications: create (comment/like/bookmark/share/follow) — suppress self on own post
 app.post("/api/notifications", verifyToken, (req, res) => {
   const { user_id, post_id, action_type, content, comment_id } = req.body;
 
@@ -2448,26 +2449,24 @@ app.post("/api/notifications", verifyToken, (req, res) => {
     return res.status(400).json({ error: "Missing required fields: user_id or action_type" });
   }
 
-  // เพิ่ม 'share' เข้าไปด้วย
+  // เคสที่มีโพสต์: กัน self-notify เฉพาะกลุ่มนี้
   const SELF_SUPPRESS = new Set(["comment", "like", "bookmark", "share"]);
-
   if (post_id && SELF_SUPPRESS.has(action_type)) {
     const ownerSql = "SELECT user_id FROM posts WHERE id = ?";
-    pool.query(ownerSql, [post_id], (oErr, oRows) => {
+    return pool.query(ownerSql, [post_id], (oErr, oRows) => {
       if (oErr) {
         console.error("Database error during post owner check:", oErr);
         return res.status(500).json({ error: "Error checking post owner" });
       }
       const ownerId = oRows.length ? Number(oRows[0].user_id) : null;
       if (ownerId && ownerId === Number(user_id)) {
-        // เจ้าของโพสต์กระทำเอง: ไม่สร้างแจ้งเตือน
-        return res.status(204).end();
+        return res.status(204).end(); // เจ้าของโพสต์ทำเอง ไม่สร้าง noti
       }
       return createNotification();
     });
-  } else {
-    return createNotification();
   }
+
+  return createNotification();
 
   function createNotification() {
     if (action_type === "comment") {
@@ -2476,19 +2475,23 @@ app.post("/api/notifications", verifyToken, (req, res) => {
         VALUES (?, ?, ?, 'comment', ?, NOW(), 0)
       `;
       const vals = [user_id, post_id || null, comment_id || null, content || null];
-      pool.query(sql, vals, (err, r) => {
+      return pool.query(sql, vals, (err, r) => {
         if (err) {
           console.error("notification(comment) insert error:", err);
           return res.status(500).json({ error: "Error creating notification" });
         }
         return res.status(201).json({ message: "Notification created", notification_id: r.insertId });
       });
-    } else {
-      // like/bookmark/share -> idempotent
+    }
+
+    // ---------- follow: idempotent ด้วย post_id IS NULL ----------
+    if (action_type === "follow") {
       const checkSql = `
-        SELECT id FROM notifications WHERE user_id = ? AND post_id = ? AND action_type = ? LIMIT 1
+        SELECT id FROM notifications
+        WHERE user_id = ? AND action_type = 'follow' AND post_id IS NULL
+        LIMIT 1
       `;
-      pool.query(checkSql, [user_id, post_id || null, action_type], (cErr, rows) => {
+      return pool.query(checkSql, [user_id], (cErr, rows) => {
         if (cErr) {
           console.error("notification check error:", cErr);
           return res.status(500).json({ error: "Error checking notification" });
@@ -2497,9 +2500,9 @@ app.post("/api/notifications", verifyToken, (req, res) => {
 
         const insSql = `
           INSERT INTO notifications (user_id, post_id, action_type, content, created_at, read_status)
-          VALUES (?, ?, ?, ?, NOW(), 0)
+          VALUES (?, NULL, 'follow', ?, NOW(), 0)
         `;
-        pool.query(insSql, [user_id, post_id || null, action_type, content || null], (iErr, r2) => {
+        return pool.query(insSql, [user_id, content || null], (iErr, r2) => {
           if (iErr) {
             console.error("notification insert error:", iErr);
             return res.status(500).json({ error: "Error creating notification" });
@@ -2508,6 +2511,30 @@ app.post("/api/notifications", verifyToken, (req, res) => {
         });
       });
     }
+
+    // ---------- like/bookmark/share: idempotent ด้วย post_id ปกติ ----------
+    const checkSql = `
+      SELECT id FROM notifications WHERE user_id = ? AND post_id = ? AND action_type = ? LIMIT 1
+    `;
+    pool.query(checkSql, [user_id, post_id || null, action_type], (cErr, rows) => {
+      if (cErr) {
+        console.error("notification check error:", cErr);
+        return res.status(500).json({ error: "Error checking notification" });
+      }
+      if (rows.length) return res.status(200).json({ message: "Notification already exists" });
+
+      const insSql = `
+        INSERT INTO notifications (user_id, post_id, action_type, content, created_at, read_status)
+        VALUES (?, ?, ?, ?, NOW(), 0)
+      `;
+      pool.query(insSql, [user_id, post_id || null, action_type, content || null], (iErr, r2) => {
+        if (iErr) {
+          console.error("notification insert error:", iErr);
+          return res.status(500).json({ error: "Error creating notification" });
+        }
+        return res.status(201).json({ message: "Notification created", notification_id: r2.insertId });
+      });
+    });
   }
 });
 
@@ -5421,39 +5448,84 @@ app.get("/api/admin/search/reports", authenticateToken, (req, res) => {
    - สร้างความสัมพันธ์ follow และสร้าง match สำหรับแชทอัตโนมัติ
    - ป้องกันซ้ำด้วย ON DUPLICATE KEY
 ---------------------------------------------------------------- */
-app.post("/api/users/:userId/follow/:followingId", (req, res) => {
-    const { userId, followingId } = req.params;
+app.post("/api/users/:userId/follow/:followingId", verifyToken, (req, res) => {
+  const { userId, followingId } = req.params;
 
-    const followQuery = `
-        INSERT INTO follower_following (follower_id, following_id, follow_date)
-        VALUES (?, ?, NOW())
-        ON DUPLICATE KEY UPDATE follow_date = follow_date
-    `;
+  if (req.userId.toString() !== userId) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  if (userId === followingId) {
+    return res.status(400).json({ error: "cannot follow yourself" });
+  }
 
-    pool.query(followQuery, [userId, followingId], (err, result) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ error: 'Database error' });
+  // เช็ก target user มีจริง
+  pool.query("SELECT 1 FROM users WHERE id = ?", [followingId], (error, userCheck) => {
+    if (error) return res.status(500).json({ error: "DB error" });
+    if (userCheck.length === 0) return res.status(404).json({ error: "User not found" });
+
+    // เช็กว่าตามอยู่แล้วไหม
+    pool.query(
+      "SELECT 1 FROM follower_following WHERE follower_id = ? AND following_id = ?",
+      [userId, followingId],
+      (error, followCheck) => {
+        if (error) return res.status(500).json({ error: "DB error" });
+
+        // ===== UNFOLLOW =====
+        if (followCheck.length > 0) {
+          pool.query(
+            "DELETE FROM follower_following WHERE follower_id = ? AND following_id = ?",
+            [userId, followingId],
+            (error) => {
+              if (error) return res.status(500).json({ error: "DB error" });
+
+              // ลบ notification 'follow' ที่เคยสร้าง
+              const delNotifSql = `
+                DELETE FROM notifications
+                WHERE user_id = ?              -- receiver: ผู้ถูกตาม
+                  AND action_type = 'follow'
+                  AND post_id IS NULL
+                  AND content = ?
+              `;
+              const content = `User ${userId} started following you`;
+              pool.query(delNotifSql, [followingId, content], (e2) => {
+                if (e2) return res.status(500).json({ error: "DB error" });
+                return res.status(200).json({ message: "Unfollowed" });
+              });
+            }
+          );
+          return;
         }
 
-        const createMatchQuery = `
-            INSERT INTO matches (user1ID, user2ID, matchDate)
-            VALUES (?, ?, NOW())
-            ON DUPLICATE KEY UPDATE matchDate = matchDate
+        // ===== FOLLOW =====
+        const insertRelSql = `
+          INSERT INTO follower_following (follower_id, following_id, follow_date)
+          VALUES (?, ?, NOW())
         `;
+        pool.query(insertRelSql, [userId, followingId], (error) => {
+          if (error) return res.status(500).json({ error: "DB error" });
 
-        pool.query(createMatchQuery, [userId, followingId], (err, matchResult) => {
-            if (err) {
-                console.error('Error creating match:', err);
-                // ไม่ return error เพราะ follow สำเร็จแล้ว
-            }
-            
-            res.status(200).json({ 
-                message: 'Followed successfully',
-                matchID: matchResult ? matchResult.insertId : null
-            });
+          // สร้าง noti แบบกันซ้ำ (NOT EXISTS + post_id IS NULL)
+          const content = `User ${userId} started following you`;
+          const insNotifIfNotExists = `
+            INSERT INTO notifications
+              (user_id, post_id, ads_id, action_type, content, created_at, read_status, comment_id)
+            SELECT ?, NULL, NULL, 'follow', ?, NOW(), 0, NULL
+            WHERE NOT EXISTS (
+              SELECT 1 FROM notifications
+              WHERE user_id = ?
+                AND action_type = 'follow'
+                AND post_id IS NULL
+                AND content = ?
+            )
+          `;
+          pool.query(insNotifIfNotExists, [followingId, content, followingId, content], (e2) => {
+            if (e2) return res.status(500).json({ error: "DB error" });
+            return res.status(201).json({ message: "Followed" });
+          });
         });
-    });
+      }
+    );
+  });
 });
 
 

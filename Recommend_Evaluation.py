@@ -1974,19 +1974,118 @@ def _ndcg_at_k(rels, k):
     return (dcg / idcg) if idcg > 1e-12 else 0.0
 
 def _plot_bar_at_k(summary_rows: list, ks: list, metric: str, out_base: str, title=None, ylabel=None):
+    # เตรียมแกน X/Y
     xs = [str(k) for k in ks]
     ys = [float(next(r[metric] for r in summary_rows if r["k"] == k)) for k in ks]
+
+    # กำหนดสีต่อ K ให้คงที่ทุกกราฟ
+    colors = [_K_COLORS.get(int(k), f"C{i}") for i, k in enumerate(ks)]
+
+    # วาดกราฟ
     plt.figure(figsize=(7, 4), dpi=160)
-    plt.bar(xs, ys)
+    bars = plt.bar(xs, ys, color=colors, edgecolor="white")
+
+    # ตกแต่งให้อ่านง่าย
+    plt.ylim(0, 1)  # เมตริกพวกนี้อยู่ช่วง [0,1]
+    plt.grid(axis="y", linestyle="--", alpha=0.35)
     plt.title(title or f"{metric.upper()}@K")
     plt.xlabel("K")
     plt.ylabel(ylabel or metric)
+
+    # ใส่ Legend อ้างอิงสีของ K
+    try:
+        import matplotlib.patches as mpatches
+        handles = [mpatches.Patch(color=_K_COLORS.get(int(k), f"C{i}"), label=f"K={k}") for i, k in enumerate(ks)]
+        plt.legend(handles=handles, title="Top-K", frameon=False)
+    except Exception:
+        pass
+
+    # เขียนค่าไว้บนแท่ง (อ่านค่าเร็ว)
+    for rect, val in zip(bars, ys):
+        h = rect.get_height()
+        plt.text(rect.get_x() + rect.get_width()/2., h + 0.01, f"{val:.3f}", ha='center', va='bottom', fontsize=8)
+
+    # บันทึกไฟล์
     plt.tight_layout()
     fp = os.path.join(out_base, f"{metric}_at_k.png")
     try:
         plt.savefig(fp)
     finally:
         plt.close()
+
+
+def _confusion_and_accuracy_at_k(rec_ids, targets, k):
+    """
+    คำนวณ TP/FP/FN/TN และ Accuracy@K
+    Universe = รายการ candidate ทั้งหมดที่เราจัดอันดับได้สำหรับ user (หลังตัด seen)
+    Pred(+) = top-K, Pred(-) = ที่เหลือ
+    """
+    if rec_ids is None:
+        return 0, 0, 0, 0, 0.0
+    K = max(0, min(int(k), len(rec_ids)))
+    universe = list(dict.fromkeys(rec_ids))          # กัน duplicate
+    Uset = set(universe)
+    pred_pos = set(universe[:K])
+    true_pos = set(pid for pid in targets if pid in Uset)
+
+    tp = len(pred_pos & true_pos)
+    fp = len(pred_pos - true_pos)
+    fn = len((Uset - pred_pos) & true_pos)
+    tn = len(Uset) - tp - fp - fn
+
+    denom = float(max(1, len(Uset)))
+    acc = float(tp + tn) / denom
+    return tp, fp, fn, tn, acc
+
+# ---------- HELD-OUT SPLIT (ต่อผู้ใช้) ----------
+def _split_user_holdout(events_df: pd.DataFrame, train_ratio: float = 0.8, seed: int = 42):
+    """
+    แยก interaction ต่อ user เป็น train/test แบบสุ่ม (ไม่อิงเวลา)
+    คืน (train_df, test_df)
+    """
+    rng = np.random.default_rng(seed)
+    trains, tests = [], []
+
+    for uid, g in events_df.groupby("user_id"):
+        g = g.sample(frac=1.0, random_state=int(rng.integers(0, 1_000_000)))
+        n = len(g)
+        n_tr = max(1, int(n * train_ratio))
+        trains.append(g.iloc[:n_tr])
+        tests.append(g.iloc[n_tr:])
+    train_df = pd.concat(trains, ignore_index=True) if trains else pd.DataFrame(columns=events_df.columns)
+    test_df  = pd.concat(tests,  ignore_index=True) if tests  else pd.DataFrame(columns=events_df.columns)
+    return train_df, test_df
+
+
+def _labels_from_events(events_df: pd.DataFrame, view_pos_min: int = 3):
+    """
+    แปลงเหตุการณ์เป็น label ต่อ (user_id, post_id):
+      y=1 ถ้าเจอ action ใน POS_ACTIONS หรือ view >= view_pos_min
+      y=0 ถ้าเจอ NEG_ACTIONS (เช่น unlike) จะตัดออกจาก positive
+    """
+    if events_df.empty:
+        return pd.DataFrame(columns=["user_id","post_id","y"])
+    t = events_df.groupby(["user_id","post_id","action_type"]).size().reset_index(name="cnt")
+    pvt = t.pivot_table(index=["user_id","post_id"], columns="action_type",
+                        values="cnt", fill_value=0, aggfunc="sum").reset_index()
+    pvt.columns = [str(c).lower() for c in pvt.columns]
+    pos = np.zeros(len(pvt), dtype=bool)
+
+    for a in POS_ACTIONS:
+        if a in pvt.columns:
+            pos |= (pvt[a].to_numpy(dtype=float) > 0)
+    if "view" in pvt.columns:
+        pos |= (pvt["view"].to_numpy(dtype=float) >= view_pos_min)
+
+    if NEG_ACTIONS:
+        neg = np.zeros(len(pvt), dtype=bool)
+        for a in NEG_ACTIONS:
+            if a in pvt.columns:
+                neg |= (pvt[a].to_numpy(dtype=float) > 0)
+        pos = np.where(neg, False, pos)
+
+    pvt["y"] = pos.astype(int)
+    return pvt[["user_id","post_id","y"]]
 
 # -------------------------- Build sets --------------------------
 def _build_positive_sets(events_all: pd.DataFrame) -> dict:
@@ -2074,6 +2173,13 @@ def _neighbor_proxy_targets(user_pos: dict,
     return proxy
 
 # -------------------------- Core evaluation (Business-fair only) --------------------------
+# ---- Color palette per K (fixed across all charts) ----
+_K_COLORS = {
+    5:  "#1f77b4",  # blue
+    10: "#ff7f0e",  # orange
+    20: "#2ca02c",  # green
+}
+
 def evaluate_recommender_presentation(
     ks=(5,10,20),
     jaccard_min=0.1,
@@ -2121,10 +2227,10 @@ def evaluate_recommender_presentation(
     _log("4/8", "Users with targets", count=len(users))
 
     if not users:
-        ts = _ts_for_dir_local()
-        out_base = _ensure_dir(os.path.join(out_root, f"eval_{ts}"))
-        pd.DataFrame([], columns=["k","users","precision","recall","f1","map","ndcg"])\
-          .to_csv(os.path.join(out_base,"summary_metrics.csv"), index=False, encoding="utf-8")
+        ts = _ts_for_dir_local()  # ใช้เวลาประเทศไทย +07:00 อยู่แล้ว
+        out_base = _ensure_dir(os.path.join(script_dir, f"Rec_Eval_{ts}"))
+        pd.DataFrame([], columns=["k","users","precision","recall","f1","map","ndcg","accuracy"])\
+            .to_csv(os.path.join(out_base,"summary_metrics.csv"), index=False, encoding="utf-8")
         with open(os.path.join(out_base,"run_info.json"),"w",encoding="utf-8") as f:
             json.dump({"reason":"no users with proxy targets", "timezone":"Asia/Bangkok"}, f, ensure_ascii=False, indent=2)
         _log("DONE","No users with proxy targets.", path=out_base)
@@ -2133,7 +2239,9 @@ def evaluate_recommender_presentation(
     # 5) eval loop
     _log("5/8", "Evaluating users (fair)...")
     rng = np.random.default_rng(seed)
-    agg = {k: {"precision": [], "recall": [], "f1": [], "map": [], "ndcg": []} for k in ks}
+    agg = {k: {"precision": [], "recall": [], "f1": [], "map": [], "ndcg": [], "accuracy": []}
+       for k in ks}
+
     per_user_rows = []
     N = len(users)
     for idx, uid in enumerate(users, start=1):
@@ -2154,33 +2262,42 @@ def evaluate_recommender_presentation(
 
         for k in ks:
             rec_k = rec_ids[:k]
-            rels = [1 if pid in targets else 0 for pid in rec_k]
-            tp = int(sum(rels))
+            rels  = [1 if pid in targets else 0 for pid in rec_k]
+            tp_atk = int(sum(rels))
 
-            prec = tp / float(max(1, k))
-            rec  = tp / float(max(1, len(targets)))
+            prec = tp_atk / float(max(1, k))
+            rec  = tp_atk / float(max(1, len(targets)))
             f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) > 1e-12 else 0.0
             mapk = _ap_at_k(rels, k)
             ndcg = _ndcg_at_k(rels, k)
+
+            # >>> NEW: Accuracy@K (จาก confusion บน universe = รายการจัดอันดับหลังตัด seen)
+            tp, fp, fn, tn, acc = _confusion_and_accuracy_at_k(rec_ids, targets, k)
 
             agg[k]["precision"].append(prec)
             agg[k]["recall"].append(rec)
             agg[k]["f1"].append(f1)
             agg[k]["map"].append(mapk)
             agg[k]["ndcg"].append(ndcg)
+            agg[k]["accuracy"].append(acc)
 
             if save_per_user:
                 per_user_rows.append({
-                    "user_id": int(uid), "k": int(k), "targets": int(len(targets)),
+                    "user_id": int(uid), "k": int(k),
+                    "targets": int(len(targets)),
                     "precision": float(prec), "recall": float(rec), "f1": float(f1),
-                    "map": float(mapk), "ndcg": float(ndcg)
+                    "map": float(mapk), "ndcg": float(ndcg),
+                    # >>> NEW: รายงานเพิ่ม
+                    "accuracy": float(acc),
+                    "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
+                    "candidates": int(len(rec_ids))
                 })
 
         _progress_bar(idx, N)
 
     # 6) สรุป
-    ts = _ts_for_dir_local()
-    out_base = _ensure_dir(os.path.join(out_root, f"eval_{ts}"))
+    ts = _ts_for_dir_local()  # ใช้เวลาประเทศไทย +07:00 อยู่แล้ว
+    out_base = _ensure_dir(os.path.join(script_dir, f"Rec_Eval_{ts}"))
 
     summary_rows = []
     for k in ks:
@@ -2193,6 +2310,7 @@ def evaluate_recommender_presentation(
             "f1":        float(np.mean(agg[k]["f1"]))        if n else 0.0,
             "map":       float(np.mean(agg[k]["map"]))       if n else 0.0,
             "ndcg":      float(np.mean(agg[k]["ndcg"]))      if n else 0.0,
+            "accuracy":  float(np.mean(agg[k]["accuracy"]))  if n else 0.0,   # <<< NEW
         })
 
     # 7) บันทึกไฟล์ (minimal set)
@@ -2200,7 +2318,12 @@ def evaluate_recommender_presentation(
     if save_per_user and per_user_rows:
         pd.DataFrame(per_user_rows).to_csv(os.path.join(out_base, "per_user_metrics.csv"), index=False, encoding="utf-8")
 
-    for m, ttl in [("precision","PRECISION@K"), ("recall","RECALL@K"), ("ndcg","NDCG@K")]:
+    for m, ttl in [
+        ("precision","PRECISION@K"),
+        ("recall","RECALL@K"),
+        ("ndcg","NDCG@K"),
+        ("accuracy","ACCURACY@K"),   # <<< NEW
+    ]:
         _plot_bar_at_k(summary_rows, list(ks), m, out_base, title=ttl, ylabel=m)
 
     # 8) run_info.json
@@ -2227,6 +2350,128 @@ def evaluate_recommender_presentation(
     print(json.dumps({"summary": summary_rows, "out_dir": out_base}, ensure_ascii=False, indent=2))
     return {"out_dir": out_base}
 
+# ---------- EVALUATION: HELD-OUT (จริง) ----------
+def evaluate_recommender_heldout(engine, ks=(5,10,20), save_per_user=True, seed=42):
+    """
+    ใช้ข้อมูลจริงจาก DB:
+      - split ต่อ user => train/test
+      - target = positive ที่อยู่ใน test ของ user นั้นจริง
+      - candidate = ทุกโพสต์ที่ user ยังไม่เห็นใน train (fair)
+      - วัด precision/recall/F1/MAP/NDCG@K
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 1) โหลดข้อมูล content + events (คอลัมน์ table/view ตาม config ส่วนต้นไฟล์)
+    e = create_engine(DB_URI, pool_pre_ping=True, pool_recycle=1800)
+    content_df = pd.read_sql(f"SELECT * FROM {CONTENT_VIEW}", e)
+    if "post_id" not in content_df.columns and "id" in content_df.columns:
+        content_df = content_df.rename(columns={"id":"post_id"})
+    content_df["post_id"] = pd.to_numeric(content_df["post_id"], errors="coerce").dropna().astype(int)
+
+    events_all = pd.read_sql(f"SELECT user_id, post_id, action_type FROM {EVENT_TABLE}", e)
+    events_all = events_all.dropna(subset=["user_id","post_id"])
+    events_all["user_id"] = pd.to_numeric(events_all["user_id"], errors="coerce").dropna().astype(int)
+    events_all["post_id"] = pd.to_numeric(events_all["post_id"], errors="coerce").dropna().astype(int)
+    events_all["action_type"] = events_all["action_type"].astype(str).str.lower()
+
+    # 2) split train/test ต่อผู้ใช้
+    train_ev, test_ev = _split_user_holdout(events_all, train_ratio=0.8, seed=seed)
+
+    # 3) ทำ label ชุด train/test
+    lab_train = _labels_from_events(train_ev)
+    lab_test  = _labels_from_events(test_ev)
+
+    # map ช่วยใช้เร็ว
+    train_seen = lab_train.groupby("user_id")["post_id"].apply(set).to_dict()
+    test_pos   = lab_test[lab_test["y"]==1].groupby("user_id")["post_id"].apply(set).to_dict()
+
+    users = sorted(test_pos.keys())
+    if not users:
+        raise RuntimeError("No positives in TEST split -> heldout mode cannot run.")
+
+    agg = {k: {"precision": [], "recall": [], "f1": [], "map": [], "ndcg": [], "accuracy": []}
+       for k in ks}
+
+    per_user_rows = []
+
+    # 4) เรียกระบบจริงให้จัดอันดับ (ตามโค้ดใน RecommendAI) แล้วตัดโพสต์ train-seen ออก = fair
+    for idx, uid in enumerate(users, start=1):
+        targets = test_pos.get(uid, set())
+        if not targets:
+            continue
+
+        try:
+            rec_ids = get_hybridrecommendation_order(int(uid), use_cache=True)
+            rec_ids = [int(x) for x in rec_ids]
+        except Exception as ex:
+            print(f"[WARN] Recommend failed for user {uid}, skip. err={ex}")
+            continue
+
+        seen = train_seen.get(uid, set())
+        rec_ids = [pid for pid in rec_ids if pid not in seen]
+
+        for k in ks:
+            cut = rec_ids[:k]
+            rels = [1 if pid in targets else 0 for pid in cut]
+            tp = int(sum(rels))
+
+            prec = tp / float(max(1, k))
+            rec  = tp / float(max(1, len(targets)))
+            f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) > 1e-12 else 0.0
+            mapk = _ap_at_k(rels, k)
+            ndcg = _ndcg_at_k(rels, k)
+
+            agg[k]["precision"].append(prec)
+            agg[k]["recall"].append(rec)
+            agg[k]["f1"].append(f1)
+            agg[k]["map"].append(mapk)
+            agg[k]["ndcg"].append(ndcg)
+
+            if save_per_user:
+                per_user_rows.append({
+                    "user_id": int(uid), "k": int(k), "targets": int(len(targets)),
+                    "precision": float(prec), "recall": float(rec), "f1": float(f1),
+                    "map": float(mapk), "ndcg": float(ndcg)
+                })
+
+        _progress_bar(idx, len(users))
+
+    # 5) บันทึกผล (ชื่อโฟลเดอร์ตามที่สั่ง: Rec_Eval_วันที่เวลาไทย)
+    ts = _ts_for_dir_local()
+    # เซฟเป็น Rec_Eval_<timestamp-ไทย> ใต้โฟลเดอร์สคริปต์
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_base = _ensure_dir(os.path.join(script_dir, f"Rec_Eval_{ts}"))
+
+    summary_rows = []
+    for k in ks:
+        n = len(agg[k]["precision"])
+        summary_rows.append({
+            "k": int(k),
+            "users": int(n),
+            "precision": float(np.mean(agg[k]["precision"])) if n else 0.0,
+            "recall":    float(np.mean(agg[k]["recall"]))    if n else 0.0,
+            "f1":        float(np.mean(agg[k]["f1"]))        if n else 0.0,
+            "map":       float(np.mean(agg[k]["map"]))       if n else 0.0,
+            "ndcg":      float(np.mean(agg[k]["ndcg"]))      if n else 0.0,
+        })
+
+    pd.DataFrame(summary_rows).to_csv(os.path.join(out_base, "summary_metrics.csv"), index=False, encoding="utf-8")
+    if save_per_user and per_user_rows:
+        pd.DataFrame(per_user_rows).to_csv(os.path.join(out_base, "per_user_metrics.csv"), index=False, encoding="utf-8")
+
+    run_info = {
+        "mode": "heldout",
+        "K": list(ks),
+        "train_ratio": 0.8,
+        "view_pos_min": 3,
+        "ts": ts
+    }
+    with open(os.path.join(out_base, "run_info.json"), "w", encoding="utf-8") as f:
+        json.dump(run_info, f, ensure_ascii=False, indent=2)
+
+    _log("8/8", "Saved results", path=out_base)
+    return {"out_dir": out_base}
+
 # -------------------------- ENTRY: run by default --------------------------
 def _run_eval_presentation_main():
     try:
@@ -2248,4 +2493,21 @@ def _run_eval_presentation_main():
         raise
 
 if __name__ == "__main__":
-    _run_eval_presentation_main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--k", nargs="+", type=int, default=[5,10,20])
+    parser.add_argument("--jaccard-min", type=float, default=0.1)
+    parser.add_argument("--min-overlap", type=int, default=1)
+    parser.add_argument("--top-m-neighbors", type=int, default=50)
+    parser.add_argument("--save-per-user", type=int, default=1)
+    args = parser.parse_args()
+
+    # ❌ ห้ามส่ง engine เข้าไป ฟังก์ชันไปเปิด DB เองอยู่แล้ว
+    # ✅ ส่งแบบ keyword ตรงกับ signature
+    evaluate_recommender_presentation(
+        ks=tuple(args.k),
+        jaccard_min=args.jaccard_min,
+        min_overlap=args.min_overlap,
+        top_m_neighbors=args.top_m_neighbors,
+        save_per_user=bool(args.save_per_user),
+    )
