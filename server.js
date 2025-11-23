@@ -390,15 +390,18 @@ app.post("/api/register/set-password", async (req, res) => {
 
 
 // ======================================================
-// Auth: Resend OTP (registration)
+// Auth: Resend OTP (Registration) - Always Generate New
 // ======================================================
 app.post("/api/resend-otp/register", async (req, res) => {
   try {
     const { email } = req.body;
-    const findOtpSql = "SELECT otp, expires_at FROM otps WHERE email = ?";
+
+    // 1. เช็คว่ามี record ในตาราง otps หรือไม่
+    const findOtpSql = "SELECT * FROM otps WHERE email = ?";
 
     pool.query(findOtpSql, [email], (err, results) => {
       if (err) throw new Error("Database error during OTP lookup");
+
       if (results.length === 0)
         return res
           .status(400)
@@ -406,37 +409,29 @@ app.post("/api/resend-otp/register", async (req, res) => {
             error: "No OTP found for this email. Please register first.",
           });
 
-      const { otp, expires_at } = results[0];
-      const now = new Date();
+      // 2. GENERATE NEW OTP: สร้างใหม่ทันที (ไม่สนของเก่า)
+      const newOtp = generateOtp();
+      const newExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 นาที
 
-      if (now > new Date(expires_at)) {
-        // ISSUE: expired -> generate new OTP
-        const newOtp = generateOtp();
-        const newExpiresAt = new Date(now.getTime() + 10 * 60 * 1000);
-        const updateOtpSql =
-          "UPDATE otps SET otp = ?, expires_at = ? WHERE email = ?";
-        pool.query(updateOtpSql, [newOtp, newExpiresAt, email], (err) => {
-          if (err) throw new Error("Database error during OTP update");
-          sendOtpEmail(email, newOtp, (error) => {
-            if (error) throw new Error("Error sending OTP email");
-            res.status(200).json({ message: "New OTP sent to email" });
-          });
+      // 3. UPDATE: บันทึกเลขใหม่ทับลงไปใน DB
+      const updateOtpSql =
+        "UPDATE otps SET otp = ?, expires_at = ? WHERE email = ?";
+
+      pool.query(updateOtpSql, [newOtp, newExpiresAt, email], (err) => {
+        if (err) throw new Error("Database error during OTP update");
+
+        // 4. SEND EMAIL: ส่งเลขใหม่ไปที่เมล
+        sendOtpEmail(email, newOtp, (error) => {
+          if (error) throw new Error("Error sending OTP email");
+          res.status(200).json({ message: "New OTP sent to email" });
         });
-      } else {
-        // REUSE: still valid -> resend same OTP
-        sendOtpEmail(email, otp, (error) => {
-          if (error) throw new Error("Error resending OTP email");
-          res.status(200).json({ message: "OTP resent to email" });
-        });
-      }
+      });
     });
   } catch (error) {
-    // ERROR: fallback
     console.error(error.message);
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
 
 // ======================================================
 // Auth: Forgot password (issue reset OTP)
